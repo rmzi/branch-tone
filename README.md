@@ -7,9 +7,9 @@ Generate unique musical tones from git branch names. Each branch gets its own so
 
 ## Why?
 
-Ever lose track of which terminal is on which branch? Now you can *hear* it. Same branch always produces the same tone, so your ears learn to recognize your context.
+Ever lose track of which terminal is on which branch? Now you can *hear* it. Same branch always produces the same musical phrase, so your ears learn to recognize your context.
 
-Uses a **pentatonic scale** (C, D, E, G, A) so every branch sounds pleasant — no dissonance.
+Each branch gets a unique **3-note arpeggio** using the pentatonic scale (C, D, E, G, A) — always pleasant, never harsh.
 
 ## Install
 
@@ -42,13 +42,13 @@ branch-tone feature/auth --dry-run
 
 1. **Hash** the branch name with SHA-256
 2. **Map** hash bytes to musical parameters:
-   - Note from pentatonic scale (C, D, E, G, A)
+   - Root note from pentatonic scale (C, D, E, G, A)
    - Octave (3, 4, or 5)
-   - Attack/decay envelope shape
-3. **Synthesize** a sine wave with those parameters
+   - Arpeggio pattern (rising, falling, stepwise, or playful)
+3. **Synthesize** a 3-note phrase with soft attack/decay
 4. **Play** via your system's audio output
 
-Same branch name → same hash → same tone. Every time.
+Same branch name → same hash → same melody. Every time.
 
 ## Integration
 
