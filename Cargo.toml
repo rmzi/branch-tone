@@ -1,0 +1,65 @@
+# =============================================================================
+# branch-tone: A CLI synthesizer that generates unique tones from branch names
+# =============================================================================
+
+[package]
+name = "branch-tone"
+version = "0.1.0"
+edition = "2024"
+authors = ["Ramzi Abdoch"]
+description = "Generate unique musical tones from git branch names"
+license = "MIT"
+repository = "https://github.com/rmzi/branch-tone"
+keywords = ["cli", "audio", "git", "synthesizer"]
+categories = ["command-line-utilities", "multimedia::audio"]
+
+# This tells Cargo to build a binary (executable), not a library
+[[bin]]
+name = "branch-tone"
+path = "src/main.rs"
+
+# =============================================================================
+# Dependencies - these are "crates" (Rust packages) from crates.io
+# =============================================================================
+
+[dependencies]
+# -----------------------------------------------------------------------------
+# CPAL - Cross-Platform Audio Library
+# The foundation for all audio I/O in Rust. Handles talking to your sound card.
+# Think of it like the Web Audio API but for native apps.
+# -----------------------------------------------------------------------------
+cpal = "0.16"
+
+# -----------------------------------------------------------------------------
+# Clap - Command Line Argument Parser
+# The gold standard for building CLIs in Rust. Handles --help, --version,
+# argument parsing, validation, and generates beautiful help text.
+# "derive" feature lets us use Rust attributes instead of builder pattern.
+# -----------------------------------------------------------------------------
+clap = { version = "4.5", features = ["derive"] }
+
+# -----------------------------------------------------------------------------
+# SHA2 - Cryptographic hash functions
+# We'll hash the branch name to get deterministic "random" values.
+# Same branch name = same hash = same tone, every time.
+# -----------------------------------------------------------------------------
+sha2 = "0.10"
+
+# -----------------------------------------------------------------------------
+# Anyhow - Simplified error handling
+# Rust's error handling is powerful but verbose. Anyhow makes it easier
+# to propagate errors without defining custom error types.
+# -----------------------------------------------------------------------------
+anyhow = "1.0"
+
+# =============================================================================
+# Build configuration
+# =============================================================================
+
+[profile.release]
+# Optimize for size - we want a small, fast binary
+opt-level = "z"     # Optimize for size
+lto = true          # Link-time optimization (slower build, faster/smaller binary)
+codegen-units = 1   # Better optimization (slower build)
+panic = "abort"     # Don't include unwinding code (smaller binary)
+strip = true        # Strip symbols from binary
