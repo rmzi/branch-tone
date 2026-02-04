@@ -4,7 +4,7 @@
 
 [package]
 name = "branch-tone"
-version = "0.1.0"
+version = "0.4.0"
 edition = "2024"
 authors = ["Ramzi Abdoch"]
 description = "Generate unique musical tones from git branch names"
