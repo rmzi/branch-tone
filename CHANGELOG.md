@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.7.0] - 2026-02-16
+
+### Added
+- **Low-pass filter**: 24dB/oct Butterworth biquad LPF on pad output for warm, subtractive synthesis
+- **Reverb**: Schroeder reverb (4 comb + 2 allpass filters) adds depth and space
+- **Stereo chorus**: BBD-style chorus with phase-inverted LFO for L/R width
+- **Bulldozer mode**: Layered pad (70%) + arp (30%) played simultaneously (`--bulldozer`)
+- **Filter envelope**: LPF cutoff sweeps with pad shape for evolving character
+- **6 pad shapes**: Swell, Cascade, Bloom, Pulse, Drift, Stab — hashed per-repo for true uniqueness
+- **Staggered note entries**: Notes fade in at branch-derived offsets instead of all at once
+- **Per-note envelopes**: Each note in a pad chord has its own amplitude shape
+- `scripts/demo.sh`: Discover and play tones from repos in a directory (`--all` for worktrees)
+- 5 hook format validation tests (init idempotency, old format migration, hook.sh cleanup, unrelated hook preservation)
+
+### Changed
+- Hook default: bulldozer mode, 5 steps, 3s duration, 0.35 volume
+- `init` registers hooks for SessionStart, Stop, and PermissionRequest
+- Pad oscillators now use saw waves (subtractive) instead of pure additive synthesis
+- Repo hash determines pad shape (voice identity); branch hash determines timing/stagger (melody identity)
+- Octave drop reduced (0.65x) and filter range raised (400–2200 Hz) for better audibility
+- `docs/sound-design.md` expanded with hardware references, Camelot keys, and implementation notes
+
+### Fixed
+- `init` migrates old flat hook format `{type, command}` to new matcher-group format `{hooks: [{type, command}]}`
+- `init` cleans up stale `hook.sh` references in settings.json
+
 ## [0.6.0] - 2026-02-16
 
 ### Added

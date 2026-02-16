@@ -377,26 +377,86 @@ fn lerp_buffer(buf: &[f32], pos: f32) -> f32 {
     buf[idx0] * (1.0 - frac) + buf[idx1] * frac
 }
 
-/// Compute pad filter cutoff that follows the envelope shape
-fn pad_filter_cutoff(progress: f32) -> f32 {
-    let attack = 0.45;
-    let release = 0.45;
-    let env = if progress < attack {
-        (progress / attack * PI / 2.0).sin()
-    } else if progress > (1.0 - release) {
-        ((1.0 - progress) / release * PI / 2.0).sin()
-    } else {
-        1.0
+/// Compute pad filter cutoff — shape-dependent, with LFO movement.
+fn pad_filter_cutoff(progress: f32, time: f32, shape: PadShape) -> f32 {
+    let lfo = (2.0 * PI * 0.3 * time).sin() * 200.0;
+
+    let base = match shape {
+        PadShape::Swell => {
+            // Opens with swell, closes with release
+            let env = if progress < 0.40 {
+                (progress / 0.40 * PI / 2.0).sin()
+            } else if progress > 0.65 {
+                ((1.0 - progress) / 0.35 * PI / 2.0).sin()
+            } else {
+                1.0
+            };
+            400.0 + env * 2000.0
+        }
+        PadShape::Cascade => {
+            // Starts wide open, slowly closes
+            let env = (-2.0 * progress).exp();
+            600.0 + env * 2400.0
+        }
+        PadShape::Bloom => {
+            // Starts dark, opens progressively to peak, then closes
+            let env = if progress < 0.70 {
+                let t = progress / 0.70;
+                t * t // quadratic opening
+            } else {
+                ((1.0 - progress) / 0.30 * PI / 2.0).sin()
+            };
+            300.0 + env * 2200.0
+        }
+        PadShape::Pulse => {
+            // Filter pulses in sync with amplitude
+            let pulse = (progress * 2.0 * PI).sin().abs();
+            500.0 + pulse * 1500.0
+        }
+        PadShape::Drift => {
+            // Filter wanders
+            let lfo2 = (progress * 3.7 * PI).sin() * 600.0;
+            1200.0 + lfo2
+        }
+        PadShape::Stab => {
+            // Opens on hit, slowly closes over the tail
+            if progress < 0.05 {
+                600.0 + (progress / 0.05) * 2400.0
+            } else {
+                let t = (progress - 0.05) / 0.95;
+                3000.0 * (-2.5 * t).exp() + 400.0
+            }
+        }
     };
-    // Sweep from 200 Hz (dark, closed) to 1400 Hz (warm, open)
-    200.0 + env * 1200.0
+
+    (base + lfo).max(200.0)
 }
 
 // -----------------------------------------------------------------------------
 // VOICE & MELODY (two-layer hashing)
 // -----------------------------------------------------------------------------
 
-/// Repo determines harmonic identity: key, scale, timbre
+/// Pad envelope shapes — each gives a fundamentally different character
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PadShape {
+    Swell,    // Gentle fade in → sustain → fade out (classic ambient)
+    Cascade,  // Full chord hit → long exponential decay (striking a chord)
+    Bloom,    // Quiet start → accelerating build → peak → quick release
+    Pulse,    // 2–3 rhythmic volume swells (breathing)
+    Drift,    // Starts mid, wanders via LFO, gentle ending
+    Stab,     // Fast attack → drop to sustain → long filtered tail
+}
+
+const PAD_SHAPES: [PadShape; 6] = [
+    PadShape::Swell, PadShape::Cascade, PadShape::Bloom,
+    PadShape::Pulse, PadShape::Drift, PadShape::Stab,
+];
+
+const PAD_SHAPE_NAMES: [&str; 6] = [
+    "Swell", "Cascade", "Bloom", "Pulse", "Drift", "Stab",
+];
+
+/// Repo determines harmonic identity: key, scale, timbre, note pattern, pad shape
 #[derive(Debug, Clone)]
 struct RepoVoice {
     root_name: String,
@@ -405,6 +465,8 @@ struct RepoVoice {
     octave: f32,
     harmonic_blend: f32,  // 0.05–0.35 (warmth of 2nd harmonic)
     third_harmonic: f32,  // 0.0–0.15 (brightness from 3rd harmonic)
+    pattern_idx: usize,   // which arp pattern (repo's melodic signature)
+    pad_shape: PadShape,  // envelope character
 }
 
 impl RepoVoice {
@@ -436,6 +498,12 @@ impl RepoVoice {
         // Third harmonic 0.0–0.15
         let third_harmonic = (hash[4] as f32 / 255.0) * 0.15;
 
+        // Pattern: repo's melodic signature (same notes every time)
+        let pattern_idx = (hash[5] as usize) % 8;
+
+        // Pad shape: repo's envelope character
+        let pad_shape = PAD_SHAPES[(hash[6] as usize) % PAD_SHAPES.len()];
+
         Self {
             root_name,
             scale_name,
@@ -443,57 +511,78 @@ impl RepoVoice {
             octave,
             harmonic_blend,
             third_harmonic,
+            pattern_idx,
+            pad_shape,
         }
     }
 }
 
-/// Branch determines melodic identity: pattern, rhythm, modulation
+/// Branch determines timing/rhythm: how notes enter, swing, modulation
 #[derive(Debug, Clone)]
 struct BranchMelody {
-    pattern_idx: usize,
-    swing: f32,            // 0.0–0.3
-    envelope_shape: usize, // index into ENVELOPE_SHAPES
-    chorus_detune: f32,    // 4.0–16.0 cents
-    tremolo_rate: f32,     // 3.0–9.0 Hz
-    tremolo_depth: f32,    // 0.15–0.45
-    interval_spread: f32,  // 0.8–1.4 multiplier on scale degree offsets
+    swing: f32,              // 0.0–0.3
+    envelope_shape: usize,   // index into ENVELOPE_SHAPES
+    chorus_detune: f32,      // 4.0–16.0 cents
+    tremolo_rate: f32,       // 3.0–9.0 Hz
+    tremolo_depth: f32,      // 0.15–0.45
+    interval_spread: f32,    // 0.8–1.4 multiplier on scale degree offsets
+    stagger_offsets: [f32; 5], // per-note entry times (0.0–1.0, normalized)
+    attack_variation: f32,   // 0.0–0.15 per-note attack time spread
 }
 
 impl BranchMelody {
-    fn from_branch(branch: &str, steps: u8) -> Self {
+    fn from_branch(branch: &str, _steps: u8) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(branch.as_bytes());
         let hash = hasher.finalize();
 
-        let pattern_idx = (hash[0] as usize) % 8;
-
         // Swing: 0.0–0.3
-        let swing = (hash[1] as f32 / 255.0) * 0.3;
+        let swing = (hash[0] as f32 / 255.0) * 0.3;
 
-        let envelope_shape = (hash[2] as usize) % ENVELOPE_SHAPES.len();
+        let envelope_shape = (hash[1] as usize) % ENVELOPE_SHAPES.len();
 
         // Chorus detune: 4.0–16.0 cents
-        let chorus_detune = 4.0 + (hash[3] as f32 / 255.0) * 12.0;
+        let chorus_detune = 4.0 + (hash[2] as f32 / 255.0) * 12.0;
 
         // Tremolo rate: 3.0–9.0 Hz
-        let tremolo_rate = 3.0 + (hash[4] as f32 / 255.0) * 6.0;
+        let tremolo_rate = 3.0 + (hash[3] as f32 / 255.0) * 6.0;
 
         // Tremolo depth: 0.15–0.45
-        let tremolo_depth = 0.15 + (hash[4] as f32 / 255.0) * 0.30;
+        let tremolo_depth = 0.15 + (hash[3] as f32 / 255.0) * 0.30;
 
         // Interval spread: 0.8–1.4
-        let interval_spread = 0.8 + (hash[5] as f32 / 255.0) * 0.6;
+        let interval_spread = 0.8 + (hash[4] as f32 / 255.0) * 0.6;
 
-        let _ = steps; // pattern_idx selects from the right array at note-building time
+        // Per-note stagger: hash bytes 5–9 give non-uniform entry offsets.
+        // Sorted so notes still enter in order, but gaps between them vary.
+        let mut raw_offsets: Vec<f32> = (0..5)
+            .map(|i| hash[5 + i] as f32 / 255.0)
+            .collect();
+        raw_offsets.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // First note always at 0, rest spread across 0.0–0.35 of phrase
+        let stagger_span = 0.12 + (hash[10] as f32 / 255.0) * 0.23; // 0.12–0.35
+        let mut stagger_offsets = [0.0f32; 5];
+        for i in 0..5 {
+            stagger_offsets[i] = raw_offsets[i] * stagger_span;
+        }
+        // Normalize: first note at 0
+        let min = stagger_offsets[0];
+        for offset in &mut stagger_offsets {
+            *offset -= min;
+        }
+
+        // Attack variation: 0.0–0.15 (how much attack time differs per note)
+        let attack_variation = (hash[11] as f32 / 255.0) * 0.15;
 
         Self {
-            pattern_idx,
             swing,
             envelope_shape,
             chorus_detune,
             tremolo_rate,
             tremolo_depth,
             interval_spread,
+            stagger_offsets,
+            attack_variation,
         }
     }
 }
@@ -517,16 +606,17 @@ impl PhraseParams {
         let voice = RepoVoice::from_repo(repo);
         let melody = BranchMelody::from_branch(branch, steps);
 
-        // Build notes from repo's scale + branch's pattern and interval spread
+        // Notes from repo's pattern + scale (repo = identity),
+        // interval_spread from branch adds subtle reharmonization
         let notes: Vec<f32> = if steps >= 5 {
-            let pattern = PATTERNS_5[melody.pattern_idx];
+            let pattern = PATTERNS_5[voice.pattern_idx];
             pattern.iter().map(|&offset| {
                 let spread_offset = (offset as f32 * melody.interval_spread).round() as i32;
                 let idx = spread_offset.rem_euclid(5) as usize;
                 voice.scale_freqs[idx]
             }).collect()
         } else {
-            let pattern = PATTERNS_3[melody.pattern_idx];
+            let pattern = PATTERNS_3[voice.pattern_idx];
             pattern.iter().map(|&offset| {
                 let spread_offset = (offset as f32 * melody.interval_spread).round() as i32;
                 let idx = spread_offset.rem_euclid(5) as usize;
@@ -598,11 +688,16 @@ fn run_play(args: PlayArgs) -> Result<()> {
             else { " [arpeggio]" };
         let envelope_names = ["Punchy", "Soft", "Pluck", "Swell"];
         println!("🎵 Repo: {} | Branch: {}{}", repo, branch, mode);
-        println!("   Key: {} {} | Octave: {}x", params.voice.root_name, params.voice.scale_name, params.voice.octave);
+        let shape_name = PAD_SHAPE_NAMES[PAD_SHAPES.iter().position(|s| *s == params.voice.pad_shape).unwrap_or(0)];
+        println!("   Key: {} {} | Octave: {}x | Shape: {}", params.voice.root_name, params.voice.scale_name, params.voice.octave, shape_name);
         println!("   Timbre: harmonic={:.2}, 3rd={:.2}", params.voice.harmonic_blend, params.voice.third_harmonic);
         println!("   Notes: {:?}", params.notes.iter().map(|f| format!("{:.0}Hz", f)).collect::<Vec<_>>());
         println!("   Pattern: #{} | Envelope: {} | Swing: {:.0}%",
-            params.melody.pattern_idx, envelope_names[params.melody.envelope_shape], params.melody.swing * 100.0);
+            params.voice.pattern_idx, envelope_names[params.melody.envelope_shape], params.melody.swing * 100.0);
+        println!("   Stagger: [{:.2}, {:.2}, {:.2}, {:.2}, {:.2}]",
+            params.melody.stagger_offsets[0], params.melody.stagger_offsets[1],
+            params.melody.stagger_offsets[2], params.melody.stagger_offsets[3],
+            params.melody.stagger_offsets[4]);
         println!("   Spread: {:.2} | Duration: {}ms", params.melody.interval_spread, params.total_duration);
         if chorus { println!("   + Chorus (detune: {:.1} cents)", params.melody.chorus_detune); }
         if tremolo { println!("   + Tremolo ({:.1}Hz, {:.0}% depth)", params.melody.tremolo_rate, params.melody.tremolo_depth * 100.0); }
@@ -639,13 +734,13 @@ fn run_hook() -> Result<()> {
     let args = PlayArgs {
         branch: Some(branch),
         repo: Some(repo),
-        duration: 1500,
-        volume: 0.25,
+        duration: 3000,
+        volume: 0.35,
         pad: false,
         chorus: false,
         tremolo: false,
         bulldozer: true,
-        steps: 3,
+        steps: 5,
         dry_run: false,
         quiet: true,
     };
@@ -913,7 +1008,7 @@ where
 
                 // Low-pass filter with envelope (pad/bulldozer modes)
                 let filtered = if effects.pad {
-                    let cutoff = pad_filter_cutoff(progress);
+                    let cutoff = pad_filter_cutoff(progress, time, voice.pad_shape);
                     pad_lpf.set_cutoff(cutoff, sample_rate);
                     pad_lpf.process(raw)
                 } else {
@@ -959,59 +1054,154 @@ where
 // SOUND GENERATORS
 // -----------------------------------------------------------------------------
 
-fn generate_pad(notes: &[f32], time: f32, progress: f32, volume: f32, _effects: Effects, _voice: &RepoVoice, melody: &BranchMelody) -> f32 {
-    // Jungle-style pad: lush, dark, heavily filtered chord
-    // Inspired by Blue Mar Ten aesthetic — warm and pillowy, not sharp
+/// Per-note amplitude envelope based on the repo's pad shape
+fn pad_note_envelope(shape: PadShape, progress: f32, note_idx: usize, melody: &BranchMelody) -> f32 {
+    match shape {
+        PadShape::Swell => {
+            // Gentle fade in → sustain → fade out
+            let attack = 0.35;
+            let release = 0.40;
+            if progress < attack {
+                (progress / attack * PI / 2.0).sin()
+            } else if progress > (1.0 - release) {
+                ((1.0 - progress) / release * PI / 2.0).sin()
+            } else {
+                1.0
+            }
+        }
+        PadShape::Cascade => {
+            // Full hit → long exponential decay (like striking a chord)
+            let attack = 0.03 + note_idx as f32 * 0.02; // notes hit in quick succession
+            if progress < attack {
+                (progress / attack * PI / 2.0).sin()
+            } else {
+                // Exponential decay from 1.0 toward 0.15 over remaining time
+                let decay_progress = (progress - attack) / (1.0 - attack);
+                0.15 + 0.85 * (-3.0 * decay_progress).exp()
+            }
+        }
+        PadShape::Bloom => {
+            // Quiet start → accelerating build → peak at 70% → quick release
+            let peak = 0.70;
+            let release = 0.25;
+            if progress < peak {
+                // Quadratic curve — slow at first, accelerates
+                let t = progress / peak;
+                t * t
+            } else if progress > (1.0 - release) {
+                ((1.0 - progress) / release * PI / 2.0).sin()
+            } else {
+                1.0
+            }
+        }
+        PadShape::Pulse => {
+            // 2–3 rhythmic swells — like the pad is breathing
+            let num_pulses = 2.0 + (melody.swing * 3.3).floor(); // 2 or 3 based on swing
+            let pulse = (progress * num_pulses * PI).sin().abs();
+            // Gentle overall fade at the very end
+            let fade = if progress > 0.85 {
+                ((1.0 - progress) / 0.15 * PI / 2.0).sin()
+            } else {
+                1.0
+            };
+            pulse * fade
+        }
+        PadShape::Drift => {
+            // Starts at ~60%, wanders up/down via LFO, gentle ending
+            let base = 0.6;
+            // Two LFOs at different rates for complex wandering
+            let lfo1 = (progress * 2.5 * PI).sin() * 0.3;
+            let lfo2 = (progress * 4.1 * PI + note_idx as f32).sin() * 0.15;
+            let drift = (base + lfo1 + lfo2).clamp(0.1, 1.0);
+            // Fade at start and end
+            let fade_in = (progress * 8.0).min(1.0);
+            let fade_out = if progress > 0.80 {
+                ((1.0 - progress) / 0.20 * PI / 2.0).sin()
+            } else {
+                1.0
+            };
+            drift * fade_in * fade_out
+        }
+        PadShape::Stab => {
+            // Fast attack → quick drop to 35% → long sustain tail
+            let attack = 0.04;
+            let drop_end = 0.15;
+            let sustain = 0.35;
+            let release = 0.30;
+            if progress < attack {
+                progress / attack
+            } else if progress < drop_end {
+                let t = (progress - attack) / (drop_end - attack);
+                1.0 - t * (1.0 - sustain)
+            } else if progress > (1.0 - release) {
+                sustain * ((1.0 - progress) / release * PI / 2.0).sin()
+            } else {
+                sustain
+            }
+        }
+    }
+}
 
-    // Very slow envelope — materializes and dissolves gently
-    let attack = 0.45;
-    let release = 0.45;
-
-    let envelope = if progress < attack {
-        // Sine curve for smooth fade-in
-        (progress / attack * PI / 2.0).sin()
-    } else if progress > (1.0 - release) {
-        // Sine curve for smooth fade-out
-        ((1.0 - progress) / release * PI / 2.0).sin()
-    } else {
-        1.0
-    };
-
+fn generate_pad(notes: &[f32], time: f32, progress: f32, volume: f32, _effects: Effects, voice: &RepoVoice, melody: &BranchMelody) -> f32 {
     let mut sample = 0.0;
 
     for (i, &freq) in notes.iter().enumerate() {
-        // Drop an octave for depth
-        let base_freq = freq * 0.5;
+        // Branch-derived stagger: each note enters at its own time
+        let entry_point = if i < melody.stagger_offsets.len() {
+            melody.stagger_offsets[i]
+        } else {
+            0.0
+        };
 
-        // Tight detuning: 3 saw voices per note — the LPF in run_audio
-        // shapes these harmonically rich waves into warm, filtered tones
-        let detune_cents = melody.chorus_detune * 0.15; // scale down to 0.6-2.4 cents
+        if progress < entry_point {
+            continue;
+        }
+
+        // Per-note progress relative to its entry
+        let note_progress = (progress - entry_point) / (1.0 - entry_point);
+
+        // Shape-driven envelope with branch attack variation
+        let base_env = pad_note_envelope(voice.pad_shape, note_progress, i, melody);
+        // Branch adds subtle per-note attack variation
+        let variation = melody.attack_variation * (i as f32 - 2.0).abs() * 0.5;
+        let note_env = if note_progress < variation {
+            base_env * (note_progress / variation).min(1.0)
+        } else {
+            base_env
+        };
+
+        // Drop less aggressively — warmth without muddiness
+        let base_freq = freq * 0.65;
+
+        // Tight detuning: 3 saw voices per note
+        let detune_cents = melody.chorus_detune * 0.15;
         let detune_offsets = [-detune_cents, 0.0, detune_cents];
 
         for (j, &cents) in detune_offsets.iter().enumerate() {
             let f = base_freq * 2.0_f32.powf(cents / 1200.0);
-            let phase_offset = (i as f32 + j as f32) * 0.7; // spread phases
+            let phase_offset = (i as f32 + j as f32) * 0.7;
 
-            // Naive saw wave — rich in all harmonics, shaped by downstream LPF
             let saw_phase = f * time + phase_offset;
             let saw = 2.0 * (saw_phase - saw_phase.floor()) - 1.0;
 
-            sample += saw / 3.0;
+            sample += saw * note_env / 3.0;
         }
 
-        // Sub layer — an octave below, pure sine for weight
-        let sub = (2.0 * PI * base_freq * 0.5 * time).sin() * 0.25;
-        sample += sub;
+        // Sub layer — only on the first note for clean low end
+        if i == 0 {
+            let sub = (2.0 * PI * base_freq * 0.5 * time).sin() * 0.15 * note_env;
+            sample += sub;
+        }
     }
 
     sample /= notes.len() as f32;
 
-    // Very slow, subtle movement — not tremolo, just gentle breathing
-    let breath_rate = 0.03 + (melody.tremolo_rate - 3.0) * 0.003; // 0.03-0.05 Hz
+    // Gentle breathing
+    let breath_rate = 0.03 + (melody.tremolo_rate - 3.0) * 0.003;
     let breath = 1.0 - 0.08 * (0.5 + 0.5 * (2.0 * PI * breath_rate * time).sin());
     sample *= breath;
 
-    sample * envelope * volume
+    sample * volume
 }
 
 fn generate_arpeggio(notes: &[f32], time: f32, current_sample: usize, total_samples: usize, volume: f32, effects: Effects, voice: &RepoVoice, melody: &BranchMelody) -> f32 {
@@ -1185,9 +1375,9 @@ mod tests {
     fn same_branch_shares_melody() {
         let a = PhraseParams::from_identity("repo-a", "main", 400, 0.25, default_effects(), 3);
         let b = PhraseParams::from_identity("repo-b", "main", 400, 0.25, default_effects(), 3);
-        assert_eq!(a.melody.pattern_idx, b.melody.pattern_idx);
         assert_eq!(a.melody.swing, b.melody.swing);
         assert_eq!(a.melody.envelope_shape, b.melody.envelope_shape);
+        assert_eq!(a.melody.stagger_offsets, b.melody.stagger_offsets);
     }
 
     // -- Note count matches step parameter --
@@ -1272,5 +1462,154 @@ mod tests {
 
         assert!(mid > start, "pad should be louder in middle than at start");
         assert!(mid > end, "pad should be louder in middle than at end");
+    }
+
+    // -- Hook format validation (Claude Code settings.json) --
+
+    /// Helper: simulate run_init logic on an in-memory settings value
+    fn apply_hook_init(settings: &mut serde_json::Value) {
+        let hooks = settings
+            .as_object_mut().unwrap()
+            .entry("hooks")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut().unwrap();
+
+        let hook_command = "branch-tone hook";
+        let new_hook_entry = serde_json::json!({
+            "hooks": [{"type": "command", "command": hook_command}]
+        });
+
+        for event in ["SessionStart", "Stop", "PermissionRequest"] {
+            let event_hooks = hooks
+                .entry(event)
+                .or_insert_with(|| serde_json::json!([]))
+                .as_array_mut().unwrap();
+
+            // Migrate old format
+            event_hooks.retain(|entry| {
+                let is_old = entry.get("type").is_some() && entry.get("hooks").is_none();
+                if is_old {
+                    let cmd = entry.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                    if cmd.contains("branch-tone") || cmd.contains("hook.sh") {
+                        return false;
+                    }
+                }
+                if let Some(inner_hooks) = entry.get("hooks").and_then(|h| h.as_array()) {
+                    let has_old_ref = inner_hooks.iter().any(|h| {
+                        h.get("command").and_then(|c| c.as_str()).unwrap_or("").contains("hook.sh")
+                    });
+                    if has_old_ref { return false; }
+                }
+                true
+            });
+
+            let already_present = event_hooks.iter().any(|entry| {
+                entry.get("hooks").and_then(|h| h.as_array()).map_or(false, |arr| {
+                    arr.iter().any(|h| {
+                        h.get("command").and_then(|c| c.as_str()) == Some(hook_command)
+                    })
+                })
+            });
+
+            if !already_present {
+                event_hooks.push(new_hook_entry.clone());
+            }
+        }
+    }
+
+    #[test]
+    fn hook_init_writes_new_format() {
+        let mut settings = serde_json::json!({});
+        apply_hook_init(&mut settings);
+
+        for event in ["SessionStart", "Stop", "PermissionRequest"] {
+            let event_hooks = settings["hooks"][event].as_array()
+                .unwrap_or_else(|| panic!("hooks.{} should be an array", event));
+            assert_eq!(event_hooks.len(), 1, "{} should have exactly one matcher group", event);
+
+            let group = &event_hooks[0];
+            let inner = group["hooks"].as_array()
+                .unwrap_or_else(|| panic!("{} matcher group should have hooks array", event));
+            assert_eq!(inner.len(), 1);
+            assert_eq!(inner[0]["type"], "command");
+            assert_eq!(inner[0]["command"], "branch-tone hook");
+        }
+    }
+
+    #[test]
+    fn hook_init_is_idempotent() {
+        let mut settings = serde_json::json!({});
+        apply_hook_init(&mut settings);
+        apply_hook_init(&mut settings); // run twice
+
+        for event in ["SessionStart", "Stop", "PermissionRequest"] {
+            let event_hooks = settings["hooks"][event].as_array().unwrap();
+            assert_eq!(event_hooks.len(), 1, "{} should not duplicate on re-init", event);
+        }
+    }
+
+    #[test]
+    fn hook_init_migrates_old_format() {
+        // Old format: flat entries with type+command at top level
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "Stop": [
+                    {"type": "command", "command": "branch-tone hook"}
+                ],
+                "PermissionRequest": [
+                    {"type": "command", "command": "branch-tone hook"}
+                ]
+            }
+        });
+        apply_hook_init(&mut settings);
+
+        for event in ["SessionStart", "Stop", "PermissionRequest"] {
+            let event_hooks = settings["hooks"][event].as_array().unwrap();
+            assert_eq!(event_hooks.len(), 1, "{} should have one entry after migration", event);
+            // Verify it's new format (has "hooks" key, not flat "type")
+            assert!(event_hooks[0].get("hooks").is_some(),
+                "{} entry should be new format with 'hooks' key", event);
+            assert!(event_hooks[0].get("type").is_none(),
+                "{} entry should not have top-level 'type' (old format)", event);
+        }
+    }
+
+    #[test]
+    fn hook_init_removes_old_hook_sh_refs() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "Stop": [
+                    {"hooks": [{"type": "command", "command": "/Users/me/.config/branch-tone/hook.sh"}]}
+                ]
+            }
+        });
+        apply_hook_init(&mut settings);
+
+        let stop_hooks = settings["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop_hooks.len(), 1);
+        assert_eq!(stop_hooks[0]["hooks"][0]["command"], "branch-tone hook");
+    }
+
+    #[test]
+    fn hook_init_preserves_unrelated_hooks() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "Stop": [
+                    {"hooks": [{"type": "command", "command": "some-other-tool"}]}
+                ]
+            }
+        });
+        apply_hook_init(&mut settings);
+
+        let stop_hooks = settings["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop_hooks.len(), 2, "should preserve existing hook and add ours");
+        // Verify the other tool is still there
+        let commands: Vec<&str> = stop_hooks.iter().flat_map(|entry| {
+            entry["hooks"].as_array().unwrap().iter().filter_map(|h| {
+                h["command"].as_str()
+            })
+        }).collect();
+        assert!(commands.contains(&"some-other-tool"));
+        assert!(commands.contains(&"branch-tone hook"));
     }
 }
