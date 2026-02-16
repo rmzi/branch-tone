@@ -16,7 +16,7 @@ use sha2::{Sha256, Digest};
 
 #[derive(Parser, Debug)]
 #[command(name = "branch-tone")]
-#[command(version = "0.4.0")]
+#[command(version = "0.5.0")]
 #[command(about = "Generate unique musical phrases from git branch names")]
 struct Args {
     /// The branch name to generate a tone for
@@ -60,26 +60,65 @@ struct Args {
 // MUSICAL CONSTANTS
 // -----------------------------------------------------------------------------
 
-/// Pentatonic scale frequencies (C, D, E, G, A) - always sounds good together
-const PENTATONIC: [f32; 5] = [261.63, 293.66, 329.63, 392.00, 440.00];
+/// Chromatic root frequencies (C4 through B4)
+const CHROMATIC_ROOTS: [f32; 12] = [
+    261.63, 277.18, 293.66, 311.13, 329.63, 349.23,
+    369.99, 392.00, 415.30, 440.00, 466.16, 493.88,
+];
 
-/// Octave options
-const OCTAVES: [f32; 3] = [0.5, 1.0, 2.0];
+/// Note names for display
+const NOTE_NAMES: [&str; 12] = [
+    "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+];
+
+/// Scale intervals in semitones from root (5 notes each, pentatonic-safe)
+const SCALES: [[u8; 5]; 6] = [
+    [0, 2, 4, 7, 9],    // Major pentatonic
+    [0, 3, 5, 7, 10],   // Minor pentatonic
+    [0, 2, 3, 7, 9],    // Dorian (penta subset)
+    [0, 2, 4, 6, 9],    // Lydian (penta subset)
+    [0, 2, 4, 7, 10],   // Mixolydian (penta subset)
+    [0, 3, 5, 8, 10],   // Minor (penta subset)
+];
+
+/// Scale names for display
+const SCALE_NAMES: [&str; 6] = [
+    "Major Pentatonic", "Minor Pentatonic", "Dorian", "Lydian", "Mixolydian", "Minor",
+];
+
+/// Octave multipliers (more spread than before)
+const OCTAVES: [f32; 5] = [0.5, 0.75, 1.0, 1.5, 2.0];
 
 /// Arpeggio patterns - 3 note (intervals from root in scale degrees)
-const PATTERNS_3: [[i32; 3]; 4] = [
+const PATTERNS_3: [[i32; 3]; 8] = [
     [0, 2, 4],   // Rising third (hopeful)
     [0, 1, 2],   // Rising step (gentle)
     [2, 1, 0],   // Falling (calming)
     [0, 2, 0],   // Up and back (playful)
+    [0, 4, 2],   // Leap then settle
+    [4, 0, 2],   // Drop then rise
+    [1, 3, 0],   // Offset start
+    [0, 3, 1],   // Wide then narrow
 ];
 
 /// Arpeggio patterns - 5 note (more melodic)
-const PATTERNS_5: [[i32; 5]; 4] = [
+const PATTERNS_5: [[i32; 5]; 8] = [
     [0, 2, 4, 2, 0],   // Up and down (resolved)
     [0, 1, 2, 3, 4],   // Rising scale (ascending)
     [4, 3, 2, 1, 0],   // Falling scale (descending)
     [0, 2, 1, 3, 2],   // Winding (playful)
+    [0, 4, 1, 3, 2],   // Leap and weave
+    [2, 0, 4, 1, 3],   // Scattered
+    [0, 3, 1, 4, 0],   // Wide arc
+    [4, 2, 0, 3, 1],   // Descending weave
+];
+
+/// Envelope shapes: (attack_fraction, decay_fraction)
+const ENVELOPE_SHAPES: [(f32, f32); 4] = [
+    (0.05, 0.15),  // Punchy: fast attack, short decay
+    (0.25, 0.30),  // Soft: slow attack, long decay
+    (0.02, 0.20),  // Pluck: instant attack, medium decay
+    (0.40, 0.10),  // Swell: very slow attack, quick decay
 ];
 
 // -----------------------------------------------------------------------------
@@ -94,6 +133,112 @@ struct Effects {
 }
 
 // -----------------------------------------------------------------------------
+// VOICE & MELODY (two-layer hashing)
+// -----------------------------------------------------------------------------
+
+/// Repo determines harmonic identity: key, scale, timbre
+#[derive(Debug, Clone)]
+struct RepoVoice {
+    root_name: String,
+    scale_name: String,
+    scale_freqs: [f32; 5],
+    octave: f32,
+    harmonic_blend: f32,  // 0.05–0.35 (warmth of 2nd harmonic)
+    third_harmonic: f32,  // 0.0–0.15 (brightness from 3rd harmonic)
+}
+
+impl RepoVoice {
+    fn from_repo(repo: &str) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(repo.as_bytes());
+        let hash = hasher.finalize();
+
+        let root_idx = (hash[0] as usize) % 12;
+        let root_freq = CHROMATIC_ROOTS[root_idx];
+        let root_name = NOTE_NAMES[root_idx].to_string();
+
+        let scale_idx = (hash[1] as usize) % SCALES.len();
+        let scale_name = SCALE_NAMES[scale_idx].to_string();
+        let intervals = SCALES[scale_idx];
+
+        let octave_idx = (hash[2] as usize) % OCTAVES.len();
+        let octave = OCTAVES[octave_idx];
+
+        // Build 5 frequencies from root + scale intervals
+        let mut scale_freqs = [0.0f32; 5];
+        for (i, &semitones) in intervals.iter().enumerate() {
+            scale_freqs[i] = root_freq * 2.0_f32.powf(semitones as f32 / 12.0) * octave;
+        }
+
+        // Timbre: harmonic blend 0.05–0.35
+        let harmonic_blend = 0.05 + (hash[3] as f32 / 255.0) * 0.30;
+
+        // Third harmonic 0.0–0.15
+        let third_harmonic = (hash[4] as f32 / 255.0) * 0.15;
+
+        Self {
+            root_name,
+            scale_name,
+            scale_freqs,
+            octave,
+            harmonic_blend,
+            third_harmonic,
+        }
+    }
+}
+
+/// Branch determines melodic identity: pattern, rhythm, modulation
+#[derive(Debug, Clone)]
+struct BranchMelody {
+    pattern_idx: usize,
+    swing: f32,            // 0.0–0.3
+    envelope_shape: usize, // index into ENVELOPE_SHAPES
+    chorus_detune: f32,    // 4.0–16.0 cents
+    tremolo_rate: f32,     // 3.0–9.0 Hz
+    tremolo_depth: f32,    // 0.15–0.45
+    interval_spread: f32,  // 0.8–1.4 multiplier on scale degree offsets
+}
+
+impl BranchMelody {
+    fn from_branch(branch: &str, steps: u8) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(branch.as_bytes());
+        let hash = hasher.finalize();
+
+        let pattern_idx = (hash[0] as usize) % 8;
+
+        // Swing: 0.0–0.3
+        let swing = (hash[1] as f32 / 255.0) * 0.3;
+
+        let envelope_shape = (hash[2] as usize) % ENVELOPE_SHAPES.len();
+
+        // Chorus detune: 4.0–16.0 cents
+        let chorus_detune = 4.0 + (hash[3] as f32 / 255.0) * 12.0;
+
+        // Tremolo rate: 3.0–9.0 Hz
+        let tremolo_rate = 3.0 + (hash[4] as f32 / 255.0) * 6.0;
+
+        // Tremolo depth: 0.15–0.45
+        let tremolo_depth = 0.15 + (hash[4] as f32 / 255.0) * 0.30;
+
+        // Interval spread: 0.8–1.4
+        let interval_spread = 0.8 + (hash[5] as f32 / 255.0) * 0.6;
+
+        let _ = steps; // pattern_idx selects from the right array at note-building time
+
+        Self {
+            pattern_idx,
+            swing,
+            envelope_shape,
+            chorus_detune,
+            tremolo_rate,
+            tremolo_depth,
+            interval_spread,
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
 // PHRASE PARAMETERS
 // -----------------------------------------------------------------------------
 
@@ -103,35 +248,29 @@ struct PhraseParams {
     total_duration: u64,  // Total duration in ms
     volume: f32,
     effects: Effects,
+    voice: RepoVoice,
+    melody: BranchMelody,
 }
 
 impl PhraseParams {
     fn from_identity(repo: &str, branch: &str, total_duration: u64, volume: f32, effects: Effects, steps: u8) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(format!("{}:{}", repo, branch).as_bytes());
-        let hash = hasher.finalize();
+        let voice = RepoVoice::from_repo(repo);
+        let melody = BranchMelody::from_branch(branch, steps);
 
-        // Pick root note from pentatonic scale
-        let root_idx = (hash[0] as usize) % PENTATONIC.len();
-
-        // Pick octave
-        let octave_idx = (hash[1] as usize) % OCTAVES.len();
-        let octave = OCTAVES[octave_idx];
-
-        // Build the notes based on step count
+        // Build notes from repo's scale + branch's pattern and interval spread
         let notes: Vec<f32> = if steps >= 5 {
-            let pattern_idx = (hash[2] as usize) % PATTERNS_5.len();
-            let pattern = PATTERNS_5[pattern_idx];
+            let pattern = PATTERNS_5[melody.pattern_idx];
             pattern.iter().map(|&offset| {
-                let idx = ((root_idx as i32 + offset).rem_euclid(PENTATONIC.len() as i32)) as usize;
-                PENTATONIC[idx] * octave
+                let spread_offset = (offset as f32 * melody.interval_spread).round() as i32;
+                let idx = spread_offset.rem_euclid(5) as usize;
+                voice.scale_freqs[idx]
             }).collect()
         } else {
-            let pattern_idx = (hash[2] as usize) % PATTERNS_3.len();
-            let pattern = PATTERNS_3[pattern_idx];
+            let pattern = PATTERNS_3[melody.pattern_idx];
             pattern.iter().map(|&offset| {
-                let idx = ((root_idx as i32 + offset).rem_euclid(PENTATONIC.len() as i32)) as usize;
-                PENTATONIC[idx] * octave
+                let spread_offset = (offset as f32 * melody.interval_spread).round() as i32;
+                let idx = spread_offset.rem_euclid(5) as usize;
+                voice.scale_freqs[idx]
             }).collect()
         };
 
@@ -140,6 +279,8 @@ impl PhraseParams {
             total_duration,
             volume,
             effects,
+            voice,
+            melody,
         }
     }
 }
@@ -184,11 +325,16 @@ fn main() -> Result<()> {
         (_, _, true) => " [tremolo]",
         _ => " [arpeggio]",
     };
+    let envelope_names = ["Punchy", "Soft", "Pluck", "Swell"];
     println!("🎵 Repo: {} | Branch: {}{}", repo, branch, mode);
+    println!("   Key: {} {} | Octave: {}x", params.voice.root_name, params.voice.scale_name, params.voice.octave);
+    println!("   Timbre: harmonic={:.2}, 3rd={:.2}", params.voice.harmonic_blend, params.voice.third_harmonic);
     println!("   Notes: {:?}", params.notes.iter().map(|f| format!("{:.0}Hz", f)).collect::<Vec<_>>());
-    println!("   Duration: {}ms", params.total_duration);
-    if args.chorus { println!("   + Chorus (detuned layers)"); }
-    if args.tremolo { println!("   + Tremolo (6Hz wobble)"); }
+    println!("   Pattern: #{} | Envelope: {} | Swing: {:.0}%",
+        params.melody.pattern_idx, envelope_names[params.melody.envelope_shape], params.melody.swing * 100.0);
+    println!("   Spread: {:.2} | Duration: {}ms", params.melody.interval_spread, params.total_duration);
+    if args.chorus { println!("   + Chorus (detune: {:.1} cents)", params.melody.chorus_detune); }
+    if args.tremolo { println!("   + Tremolo ({:.1}Hz, {:.0}% depth)", params.melody.tremolo_rate, params.melody.tremolo_depth * 100.0); }
 
     if args.dry_run {
         return Ok(());
@@ -290,6 +436,8 @@ where
     let total_duration = params.total_duration;
     let volume = params.volume;
     let effects = params.effects;
+    let voice = params.voice.clone();
+    let melody = params.melody.clone();
 
     let total_samples = (sample_rate * total_duration as f32 / 1000.0) as usize;
 
@@ -319,11 +467,9 @@ where
                 let progress = current_sample as f32 / total_samples as f32;
 
                 let sample_value = if effects.pad {
-                    // PAD MODE: All notes as chord with long envelope
-                    generate_pad(&notes, time, progress, volume, effects)
+                    generate_pad(&notes, time, progress, volume, effects, &voice, &melody)
                 } else {
-                    // ARPEGGIO MODE: Sequential notes
-                    generate_arpeggio(&notes, time, current_sample, total_samples, volume, effects)
+                    generate_arpeggio(&notes, time, current_sample, total_samples, volume, effects, &voice, &melody)
                 };
 
                 let sample = T::from_sample(sample_value);
@@ -351,34 +497,29 @@ where
 // SOUND GENERATORS
 // -----------------------------------------------------------------------------
 
-fn generate_pad(notes: &[f32], time: f32, progress: f32, volume: f32, effects: Effects) -> f32 {
+fn generate_pad(notes: &[f32], time: f32, progress: f32, volume: f32, effects: Effects, voice: &RepoVoice, melody: &BranchMelody) -> f32 {
     // Long attack and release for pad sound
-    let attack = 0.3;  // 30% of duration
-    let release = 0.3; // 30% of duration
+    let attack = 0.3;
+    let release = 0.3;
 
     let envelope = if progress < attack {
-        // Smooth ease-in (sine curve)
         (progress / attack * PI / 2.0).sin()
     } else if progress > (1.0 - release) {
-        // Smooth ease-out
         ((1.0 - progress) / release * PI / 2.0).sin()
     } else {
         1.0
     };
 
-    // Generate chord (all notes together)
     let mut sample = 0.0;
     for (i, &freq) in notes.iter().enumerate() {
-        let osc = generate_oscillator(freq, time, effects.chorus, i);
+        let osc = generate_oscillator(freq, time, effects.chorus, i, voice, melody);
         sample += osc;
     }
 
-    // Normalize by number of notes
     sample /= notes.len() as f32;
 
-    // Apply tremolo if enabled
     let sample = if effects.tremolo {
-        apply_tremolo(sample, time)
+        apply_tremolo(sample, time, melody)
     } else {
         sample
     };
@@ -386,28 +527,54 @@ fn generate_pad(notes: &[f32], time: f32, progress: f32, volume: f32, effects: E
     sample * envelope * volume
 }
 
-fn generate_arpeggio(notes: &[f32], time: f32, current_sample: usize, total_samples: usize, volume: f32, effects: Effects) -> f32 {
-    let samples_per_note = total_samples / notes.len();
-    let note_idx = (current_sample / samples_per_note).min(notes.len() - 1);
-    let sample_in_note = current_sample % samples_per_note;
+fn generate_arpeggio(notes: &[f32], time: f32, current_sample: usize, total_samples: usize, volume: f32, effects: Effects, voice: &RepoVoice, melody: &BranchMelody) -> f32 {
+    let num_notes = notes.len();
+    let total_note_time = total_samples;
+
+    // Calculate swing-adjusted note boundaries
+    // Swing alternates long/short: even notes get (1+swing), odd notes get (1-swing)
+    let base_per_note = total_note_time as f32 / num_notes as f32;
+    let mut boundaries = Vec::with_capacity(num_notes + 1);
+    boundaries.push(0usize);
+    let mut accum = 0.0f32;
+    for i in 0..num_notes {
+        let factor = if i % 2 == 0 { 1.0 + melody.swing } else { 1.0 - melody.swing };
+        accum += base_per_note * factor;
+        boundaries.push(accum.round() as usize);
+    }
+    // Ensure last boundary matches total
+    *boundaries.last_mut().unwrap() = total_samples;
+
+    // Find which note we're in
+    let mut note_idx = 0;
+    for i in 0..num_notes {
+        if current_sample >= boundaries[i] && current_sample < boundaries[i + 1] {
+            note_idx = i;
+            break;
+        }
+    }
+    let note_start = boundaries[note_idx];
+    let note_len = boundaries[note_idx + 1] - boundaries[note_idx];
+    let sample_in_note = current_sample - note_start;
     let frequency = notes[note_idx];
 
-    // Quick attack/decay for arpeggio
-    let attack_samples = (samples_per_note as f32 * 0.1) as usize;
-    let decay_samples = (samples_per_note as f32 * 0.2) as usize;
+    // Envelope shape from branch melody
+    let (attack_frac, decay_frac) = ENVELOPE_SHAPES[melody.envelope_shape];
+    let attack_samples = (note_len as f32 * attack_frac) as usize;
+    let decay_samples = (note_len as f32 * decay_frac) as usize;
 
-    let envelope = if sample_in_note < attack_samples {
+    let envelope = if attack_samples > 0 && sample_in_note < attack_samples {
         sample_in_note as f32 / attack_samples as f32
-    } else if sample_in_note > samples_per_note - decay_samples {
-        (samples_per_note - sample_in_note) as f32 / decay_samples as f32
+    } else if decay_samples > 0 && sample_in_note > note_len - decay_samples {
+        (note_len - sample_in_note) as f32 / decay_samples as f32
     } else {
         1.0
     };
 
-    let osc = generate_oscillator(frequency, time, effects.chorus, 0);
+    let osc = generate_oscillator(frequency, time, effects.chorus, 0, voice, melody);
 
     let sample = if effects.tremolo {
-        apply_tremolo(osc, time)
+        apply_tremolo(osc, time, melody)
     } else {
         osc
     };
@@ -415,33 +582,30 @@ fn generate_arpeggio(notes: &[f32], time: f32, current_sample: usize, total_samp
     sample * envelope * volume
 }
 
-fn generate_oscillator(freq: f32, time: f32, chorus: bool, voice_idx: usize) -> f32 {
+fn generate_oscillator(freq: f32, time: f32, chorus: bool, voice_idx: usize, voice: &RepoVoice, melody: &BranchMelody) -> f32 {
     if chorus {
-        // Chorus: 3 detuned oscillators
-        let detune_cents = [0.0, -8.0, 8.0]; // cents
+        let detune = melody.chorus_detune;
+        let detune_cents = [0.0, -detune, detune];
         let mut sample = 0.0;
         for (i, &cents) in detune_cents.iter().enumerate() {
             let detune_factor = 2.0_f32.powf(cents / 1200.0);
             let f = freq * detune_factor;
-            // Slight phase offset per voice for richness
             let phase_offset = (voice_idx as f32 + i as f32) * 0.1;
             let fundamental = (2.0 * PI * f * time + phase_offset).sin();
-            let harmonic = (2.0 * PI * f * 2.0 * time + phase_offset).sin() * 0.15;
-            sample += (fundamental + harmonic) / 3.0;
+            let h2 = (2.0 * PI * f * 2.0 * time + phase_offset).sin() * voice.harmonic_blend;
+            let h3 = (2.0 * PI * f * 3.0 * time + phase_offset).sin() * voice.third_harmonic;
+            sample += (fundamental + h2 + h3) / 3.0;
         }
         sample
     } else {
-        // Simple oscillator with slight warmth
         let fundamental = (2.0 * PI * freq * time).sin();
-        let harmonic = (2.0 * PI * freq * 2.0 * time).sin() * 0.1;
-        fundamental + harmonic
+        let h2 = (2.0 * PI * freq * 2.0 * time).sin() * voice.harmonic_blend;
+        let h3 = (2.0 * PI * freq * 3.0 * time).sin() * voice.third_harmonic;
+        fundamental + h2 + h3
     }
 }
 
-fn apply_tremolo(sample: f32, time: f32) -> f32 {
-    // 6Hz tremolo with 30% depth
-    let tremolo_freq = 6.0;
-    let tremolo_depth = 0.3;
-    let tremolo = 1.0 - tremolo_depth * (0.5 + 0.5 * (2.0 * PI * tremolo_freq * time).sin());
+fn apply_tremolo(sample: f32, time: f32, melody: &BranchMelody) -> f32 {
+    let tremolo = 1.0 - melody.tremolo_depth * (0.5 + 0.5 * (2.0 * PI * melody.tremolo_rate * time).sin());
     sample * tremolo
 }
