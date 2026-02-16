@@ -4,7 +4,7 @@
 
 [package]
 name = "branch-tone"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 authors = ["Ramzi Abdoch"]
 description = "Generate unique musical tones from git branch names"
@@ -51,6 +51,16 @@ sha2 = "0.10"
 # to propagate errors without defining custom error types.
 # -----------------------------------------------------------------------------
 anyhow = "1.0"
+
+# -----------------------------------------------------------------------------
+# Serde JSON - JSON parsing/writing for settings.json manipulation
+# -----------------------------------------------------------------------------
+serde_json = "1.0"
+
+# -----------------------------------------------------------------------------
+# Dirs - Cross-platform standard directory paths (~/.config, home, etc.)
+# -----------------------------------------------------------------------------
+dirs = "5.0"
 
 # =============================================================================
 # Build configuration

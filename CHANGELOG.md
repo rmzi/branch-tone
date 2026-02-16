@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.6.0] - 2026-02-16
+
+### Added
+- `hook` subcommand: reads Claude Code hook JSON from stdin, detects branch/repo, plays tone
+- `--quiet` flag on play to suppress informational output
+
+### Changed
+- `init` now writes `branch-tone hook` directly to settings.json (no bash wrapper)
+- `init` cleans up old `hook.sh` entries from settings.json and deletes `~/.config/branch-tone/hook.sh`
+
+### Removed
+- `HOOK_SCRIPT` bash/jq wrapper — no longer depends on bash or jq at runtime
+- `~/.config/branch-tone/` directory creation and hook.sh file management
+
 ## [0.5.0] - 2026-02-16
 
 ### Added

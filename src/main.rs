@@ -3,10 +3,11 @@
 // =============================================================================
 
 use std::f32::consts::PI;
+use std::io::Read;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use sha2::{Sha256, Digest};
 
@@ -16,9 +17,20 @@ use sha2::{Sha256, Digest};
 
 #[derive(Parser, Debug)]
 #[command(name = "branch-tone")]
-#[command(version = "0.5.0")]
+#[command(version)]
 #[command(about = "Generate unique musical phrases from git branch names")]
-struct Args {
+#[command(args_conflicts_with_subcommands = true)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    // Top-level flags for backwards compatibility (bare `branch-tone [BRANCH] [flags]`)
+    #[command(flatten)]
+    play_args: PlayArgs,
+}
+
+#[derive(clap::Args, Debug)]
+struct PlayArgs {
     /// The branch name to generate a tone for
     #[arg(value_name = "BRANCH")]
     branch: Option<String>,
@@ -54,6 +66,22 @@ struct Args {
     /// Just print the parameters without playing
     #[arg(long)]
     dry_run: bool,
+
+    /// Suppress informational output (used by hook)
+    #[arg(long, hide = true)]
+    quiet: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Play a tone for a branch (default behavior)
+    Play(PlayArgs),
+
+    /// Read Claude Code hook JSON from stdin, detect branch, play tone
+    Hook,
+
+    /// Wire up Claude Code hooks (updates settings.json)
+    Init,
 }
 
 // -----------------------------------------------------------------------------
@@ -290,57 +318,182 @@ impl PhraseParams {
 // -----------------------------------------------------------------------------
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let cli = Cli::parse();
 
-    let branch = match args.branch {
+    match cli.command {
+        Some(Command::Hook) => run_hook(),
+        Some(Command::Init) => run_init(),
+        Some(Command::Play(args)) => run_play(args),
+        None => run_play(cli.play_args),
+    }
+}
+
+fn run_play(args: PlayArgs) -> Result<()> {
+    let PlayArgs { branch, repo, duration, volume, pad, chorus, tremolo, steps, dry_run, quiet } = args;
+    let branch = match branch {
         Some(b) => b,
         None => get_current_branch()
             .context("No branch specified and couldn't detect current git branch")?,
     };
 
-    let repo = match args.repo {
+    let repo = match repo {
         Some(r) => r,
         None => get_repo_name().unwrap_or_else(|_| "unknown".to_string()),
     };
 
-    let effects = Effects {
-        pad: args.pad,
-        chorus: args.chorus,
-        tremolo: args.tremolo,
-    };
+    let effects = Effects { pad, chorus, tremolo };
 
     // Pad mode benefits from longer duration
-    let duration = if args.pad && args.duration == 600 {
+    let duration = if pad && duration == 600 {
         1000  // Default to 1000ms for pad
     } else {
-        args.duration
+        duration
     };
 
-    let params = PhraseParams::from_identity(&repo, &branch, duration, args.volume, effects, args.steps);
+    let params = PhraseParams::from_identity(&repo, &branch, duration, volume, effects, steps);
 
     // Print info
-    let mode = match (args.pad, args.chorus, args.tremolo) {
-        (true, _, _) => " [pad]",
-        (_, true, _) => " [chorus]",
-        (_, _, true) => " [tremolo]",
-        _ => " [arpeggio]",
-    };
-    let envelope_names = ["Punchy", "Soft", "Pluck", "Swell"];
-    println!("🎵 Repo: {} | Branch: {}{}", repo, branch, mode);
-    println!("   Key: {} {} | Octave: {}x", params.voice.root_name, params.voice.scale_name, params.voice.octave);
-    println!("   Timbre: harmonic={:.2}, 3rd={:.2}", params.voice.harmonic_blend, params.voice.third_harmonic);
-    println!("   Notes: {:?}", params.notes.iter().map(|f| format!("{:.0}Hz", f)).collect::<Vec<_>>());
-    println!("   Pattern: #{} | Envelope: {} | Swing: {:.0}%",
-        params.melody.pattern_idx, envelope_names[params.melody.envelope_shape], params.melody.swing * 100.0);
-    println!("   Spread: {:.2} | Duration: {}ms", params.melody.interval_spread, params.total_duration);
-    if args.chorus { println!("   + Chorus (detune: {:.1} cents)", params.melody.chorus_detune); }
-    if args.tremolo { println!("   + Tremolo ({:.1}Hz, {:.0}% depth)", params.melody.tremolo_rate, params.melody.tremolo_depth * 100.0); }
+    if !quiet {
+        let mode = match (pad, chorus, tremolo) {
+            (true, _, _) => " [pad]",
+            (_, true, _) => " [chorus]",
+            (_, _, true) => " [tremolo]",
+            _ => " [arpeggio]",
+        };
+        let envelope_names = ["Punchy", "Soft", "Pluck", "Swell"];
+        println!("🎵 Repo: {} | Branch: {}{}", repo, branch, mode);
+        println!("   Key: {} {} | Octave: {}x", params.voice.root_name, params.voice.scale_name, params.voice.octave);
+        println!("   Timbre: harmonic={:.2}, 3rd={:.2}", params.voice.harmonic_blend, params.voice.third_harmonic);
+        println!("   Notes: {:?}", params.notes.iter().map(|f| format!("{:.0}Hz", f)).collect::<Vec<_>>());
+        println!("   Pattern: #{} | Envelope: {} | Swing: {:.0}%",
+            params.melody.pattern_idx, envelope_names[params.melody.envelope_shape], params.melody.swing * 100.0);
+        println!("   Spread: {:.2} | Duration: {}ms", params.melody.interval_spread, params.total_duration);
+        if chorus { println!("   + Chorus (detune: {:.1} cents)", params.melody.chorus_detune); }
+        if tremolo { println!("   + Tremolo ({:.1}Hz, {:.0}% depth)", params.melody.tremolo_rate, params.melody.tremolo_depth * 100.0); }
+    }
 
-    if args.dry_run {
+    if dry_run {
         return Ok(());
     }
 
     play_phrase(&params)?;
+
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// HOOK SUBCOMMAND
+// -----------------------------------------------------------------------------
+
+fn run_hook() -> Result<()> {
+    // Read stdin JSON from Claude Code hook, extract cwd, detect branch/repo, play tone.
+    // Never fails — every fallible op is silently absorbed so we never block Claude Code.
+
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input).ok();
+
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&input) {
+        let cwd = json.get("cwd").and_then(|v| v.as_str()).unwrap_or(".");
+        let _ = std::env::set_current_dir(cwd);
+    }
+
+    let branch = get_current_branch().unwrap_or_else(|_| "claude".to_string());
+    let repo = get_repo_name().unwrap_or_else(|_| "unknown".to_string());
+
+    let args = PlayArgs {
+        branch: Some(branch),
+        repo: Some(repo),
+        duration: 800,
+        volume: 0.2,
+        pad: true,
+        chorus: true,
+        tremolo: false,
+        steps: 5,
+        dry_run: false,
+        quiet: true,
+    };
+
+    let _ = run_play(args);
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// INIT SUBCOMMAND
+// -----------------------------------------------------------------------------
+
+fn run_init() -> Result<()> {
+    let home = dirs::home_dir().context("Could not determine home directory")?;
+
+    // Clean up old hook.sh if it exists
+    let old_hook = home.join(".config").join("branch-tone").join("hook.sh");
+    if old_hook.exists() {
+        let _ = std::fs::remove_file(&old_hook);
+    }
+
+    // Read/create ~/.claude/settings.json and merge hooks
+    let claude_dir = home.join(".claude");
+    std::fs::create_dir_all(&claude_dir)
+        .with_context(|| format!("Failed to create {}", claude_dir.display()))?;
+
+    let settings_path = claude_dir.join("settings.json");
+    let mut settings: serde_json::Value = if settings_path.exists() {
+        let content = std::fs::read_to_string(&settings_path)
+            .with_context(|| format!("Failed to read {}", settings_path.display()))?;
+        serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse {}", settings_path.display()))?
+    } else {
+        serde_json::json!({})
+    };
+
+    let hooks = settings
+        .as_object_mut()
+        .context("settings.json is not an object")?
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("hooks is not an object")?;
+
+    let hook_command = "branch-tone hook";
+    let mut hooks_added = 0;
+
+    for event in ["Stop", "PermissionRequest"] {
+        let event_hooks = hooks
+            .entry(event)
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .with_context(|| format!("hooks.{} is not an array", event))?;
+
+        // Remove old entries that reference hook.sh
+        event_hooks.retain(|entry| {
+            let cmd = entry.get("command").and_then(|c| c.as_str()).unwrap_or("");
+            !cmd.contains("hook.sh")
+        });
+
+        let already_present = event_hooks.iter().any(|entry| {
+            entry.get("command").and_then(|c| c.as_str()) == Some(hook_command)
+        });
+
+        if !already_present {
+            event_hooks.push(serde_json::json!({
+                "type": "command",
+                "command": hook_command
+            }));
+            hooks_added += 1;
+        }
+    }
+
+    let json_str = serde_json::to_string_pretty(&settings)
+        .context("Failed to serialize settings.json")?;
+    std::fs::write(&settings_path, format!("{}\n", json_str))
+        .with_context(|| format!("Failed to write {}", settings_path.display()))?;
+
+    if hooks_added > 0 {
+        println!("✓ Added hooks to {}", settings_path.display());
+    } else {
+        println!("✓ Hooks already present in {}", settings_path.display());
+    }
+
+    println!("\nbranch-tone is ready! Claude Code will play tones on Stop and PermissionRequest events.");
 
     Ok(())
 }
