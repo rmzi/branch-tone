@@ -28,7 +28,7 @@ struct Args {
     repo: Option<String>,
 
     /// Duration of the phrase in milliseconds
-    #[arg(short, long, default_value = "400")]
+    #[arg(short, long, default_value = "600")]
     duration: u64,
 
     /// Volume level (0.0 to 1.0)
@@ -310,8 +310,8 @@ fn main() -> Result<()> {
     };
 
     // Pad mode benefits from longer duration
-    let duration = if args.pad && args.duration == 400 {
-        800  // Default to 800ms for pad
+    let duration = if args.pad && args.duration == 600 {
+        1000  // Default to 1000ms for pad
     } else {
         args.duration
     };
@@ -529,11 +529,9 @@ fn generate_pad(notes: &[f32], time: f32, progress: f32, volume: f32, effects: E
 
 fn generate_arpeggio(notes: &[f32], time: f32, current_sample: usize, total_samples: usize, volume: f32, effects: Effects, voice: &RepoVoice, melody: &BranchMelody) -> f32 {
     let num_notes = notes.len();
-    let total_note_time = total_samples;
 
     // Calculate swing-adjusted note boundaries
-    // Swing alternates long/short: even notes get (1+swing), odd notes get (1-swing)
-    let base_per_note = total_note_time as f32 / num_notes as f32;
+    let base_per_note = total_samples as f32 / num_notes as f32;
     let mut boundaries = Vec::with_capacity(num_notes + 1);
     boundaries.push(0usize);
     let mut accum = 0.0f32;
@@ -542,50 +540,81 @@ fn generate_arpeggio(notes: &[f32], time: f32, current_sample: usize, total_samp
         accum += base_per_note * factor;
         boundaries.push(accum.round() as usize);
     }
-    // Ensure last boundary matches total
     *boundaries.last_mut().unwrap() = total_samples;
 
-    // Find which note we're in
-    let mut note_idx = 0;
+    // Ethereal arpeggio: notes ring out and overlap rather than cutting off.
+    // Each note triggers at its boundary and decays exponentially over remaining time.
+    let mut sample = 0.0f32;
+    let (attack_frac, _) = ENVELOPE_SHAPES[melody.envelope_shape];
+
     for i in 0..num_notes {
-        if current_sample >= boundaries[i] && current_sample < boundaries[i + 1] {
-            note_idx = i;
-            break;
+        let note_start = boundaries[i];
+        if current_sample < note_start {
+            continue; // Note hasn't triggered yet
         }
+
+        let samples_since_trigger = current_sample - note_start;
+        let note_slot_len = boundaries[i + 1] - boundaries[i];
+        let frequency = notes[i];
+
+        // Attack: ramp up at the start of each note
+        let attack_samples = (note_slot_len as f32 * attack_frac) as usize;
+        let attack_env = if attack_samples > 0 && samples_since_trigger < attack_samples {
+            samples_since_trigger as f32 / attack_samples as f32
+        } else {
+            1.0
+        };
+
+        // Exponential decay — notes ring out well past their slot boundary
+        // Decay rate: reaches ~5% amplitude after 2x the note slot length
+        let decay_time = samples_since_trigger as f32 / note_slot_len as f32;
+        let ring_env = (-1.5 * decay_time).exp();
+
+        let env = attack_env * ring_env;
+
+        // Skip notes that have decayed to inaudible
+        if env < 0.005 {
+            continue;
+        }
+
+        let osc = generate_oscillator(frequency, time, effects.chorus, i, voice, melody);
+        sample += osc * env;
     }
-    let note_start = boundaries[note_idx];
-    let note_len = boundaries[note_idx + 1] - boundaries[note_idx];
-    let sample_in_note = current_sample - note_start;
-    let frequency = notes[note_idx];
 
-    // Envelope shape from branch melody
-    let (attack_frac, decay_frac) = ENVELOPE_SHAPES[melody.envelope_shape];
-    let attack_samples = (note_len as f32 * attack_frac) as usize;
-    let decay_samples = (note_len as f32 * decay_frac) as usize;
+    // Normalize to prevent clipping from overlapping notes
+    sample *= 0.7;
 
-    let envelope = if attack_samples > 0 && sample_in_note < attack_samples {
-        sample_in_note as f32 / attack_samples as f32
-    } else if decay_samples > 0 && sample_in_note > note_len - decay_samples {
-        (note_len - sample_in_note) as f32 / decay_samples as f32
+    let sample = if effects.tremolo {
+        apply_tremolo(sample, time, melody)
+    } else {
+        sample
+    };
+
+    // Global fade-out over last 15% for smooth ending
+    let fade_start = 0.85;
+    let progress = current_sample as f32 / total_samples as f32;
+    let global_fade = if progress > fade_start {
+        ((1.0 - progress) / (1.0 - fade_start)).sqrt()
     } else {
         1.0
     };
 
-    let osc = generate_oscillator(frequency, time, effects.chorus, 0, voice, melody);
-
-    let sample = if effects.tremolo {
-        apply_tremolo(osc, time, melody)
-    } else {
-        osc
-    };
-
-    sample * envelope * volume
+    sample * global_fade * volume
 }
 
 fn generate_oscillator(freq: f32, time: f32, chorus: bool, voice_idx: usize, voice: &RepoVoice, melody: &BranchMelody) -> f32 {
+    // Sub-octave layer for warmth and depth (always present)
+    let sub = (2.0 * PI * freq * 0.5 * time).sin() * 0.15;
+
+    // Slow shimmer: gentle pitch wobble for ethereal quality
+    let shimmer_rate = 2.5 + voice_idx as f32 * 0.3;
+    let shimmer = 1.0 + 0.003 * (2.0 * PI * shimmer_rate * time).sin();
+    let freq = freq * shimmer;
+
     if chorus {
         let detune = melody.chorus_detune;
-        let detune_cents = [0.0, -detune, detune];
+        let detune_cents = [0.0, -detune, detune, -detune * 0.5, detune * 0.5];
+        let num_voices = detune_cents.len() as f32;
         let mut sample = 0.0;
         for (i, &cents) in detune_cents.iter().enumerate() {
             let detune_factor = 2.0_f32.powf(cents / 1200.0);
@@ -594,18 +623,167 @@ fn generate_oscillator(freq: f32, time: f32, chorus: bool, voice_idx: usize, voi
             let fundamental = (2.0 * PI * f * time + phase_offset).sin();
             let h2 = (2.0 * PI * f * 2.0 * time + phase_offset).sin() * voice.harmonic_blend;
             let h3 = (2.0 * PI * f * 3.0 * time + phase_offset).sin() * voice.third_harmonic;
-            sample += (fundamental + h2 + h3) / 3.0;
+            sample += (fundamental + h2 + h3) / num_voices;
         }
-        sample
+        sample + sub
     } else {
-        let fundamental = (2.0 * PI * freq * time).sin();
-        let h2 = (2.0 * PI * freq * 2.0 * time).sin() * voice.harmonic_blend;
-        let h3 = (2.0 * PI * freq * 3.0 * time).sin() * voice.third_harmonic;
-        fundamental + h2 + h3
+        // Even without chorus flag, use a light 2-voice detune for spaciousness
+        let light_detune = melody.chorus_detune * 0.3;
+        let f1 = freq * 2.0_f32.powf(-light_detune / 1200.0);
+        let f2 = freq * 2.0_f32.powf(light_detune / 1200.0);
+
+        let s1 = (2.0 * PI * f1 * time).sin()
+            + (2.0 * PI * f1 * 2.0 * time).sin() * voice.harmonic_blend
+            + (2.0 * PI * f1 * 3.0 * time).sin() * voice.third_harmonic;
+        let s2 = (2.0 * PI * f2 * time).sin()
+            + (2.0 * PI * f2 * 2.0 * time).sin() * voice.harmonic_blend
+            + (2.0 * PI * f2 * 3.0 * time).sin() * voice.third_harmonic;
+
+        (s1 + s2) * 0.5 + sub
     }
 }
 
 fn apply_tremolo(sample: f32, time: f32, melody: &BranchMelody) -> f32 {
     let tremolo = 1.0 - melody.tremolo_depth * (0.5 + 0.5 * (2.0 * PI * melody.tremolo_rate * time).sin());
     sample * tremolo
+}
+
+// -----------------------------------------------------------------------------
+// TESTS
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_effects() -> Effects {
+        Effects { pad: false, chorus: false, tremolo: false }
+    }
+
+    // -- Determinism: same input always produces same output --
+
+    #[test]
+    fn same_identity_same_notes() {
+        let a = PhraseParams::from_identity("myrepo", "main", 400, 0.25, default_effects(), 3);
+        let b = PhraseParams::from_identity("myrepo", "main", 400, 0.25, default_effects(), 3);
+        assert_eq!(a.notes, b.notes);
+    }
+
+    #[test]
+    fn different_branch_different_notes() {
+        let a = PhraseParams::from_identity("myrepo", "main", 400, 0.25, default_effects(), 3);
+        let b = PhraseParams::from_identity("myrepo", "feature/auth", 400, 0.25, default_effects(), 3);
+        assert_ne!(a.notes, b.notes);
+    }
+
+    #[test]
+    fn different_repo_different_notes() {
+        let a = PhraseParams::from_identity("repo-a", "main", 400, 0.25, default_effects(), 3);
+        let b = PhraseParams::from_identity("repo-b", "main", 400, 0.25, default_effects(), 3);
+        assert_ne!(a.notes, b.notes);
+    }
+
+    // -- Two-layer hashing: repo controls voice, branch controls melody --
+
+    #[test]
+    fn same_repo_shares_voice() {
+        let a = PhraseParams::from_identity("myrepo", "main", 400, 0.25, default_effects(), 3);
+        let b = PhraseParams::from_identity("myrepo", "feature/x", 400, 0.25, default_effects(), 3);
+        assert_eq!(a.voice.scale_freqs, b.voice.scale_freqs);
+        assert_eq!(a.voice.octave, b.voice.octave);
+        assert_eq!(a.voice.harmonic_blend, b.voice.harmonic_blend);
+    }
+
+    #[test]
+    fn same_branch_shares_melody() {
+        let a = PhraseParams::from_identity("repo-a", "main", 400, 0.25, default_effects(), 3);
+        let b = PhraseParams::from_identity("repo-b", "main", 400, 0.25, default_effects(), 3);
+        assert_eq!(a.melody.pattern_idx, b.melody.pattern_idx);
+        assert_eq!(a.melody.swing, b.melody.swing);
+        assert_eq!(a.melody.envelope_shape, b.melody.envelope_shape);
+    }
+
+    // -- Note count matches step parameter --
+
+    #[test]
+    fn three_steps_produces_three_notes() {
+        let p = PhraseParams::from_identity("r", "b", 400, 0.25, default_effects(), 3);
+        assert_eq!(p.notes.len(), 3);
+    }
+
+    #[test]
+    fn five_steps_produces_five_notes() {
+        let p = PhraseParams::from_identity("r", "b", 400, 0.25, default_effects(), 5);
+        assert_eq!(p.notes.len(), 5);
+    }
+
+    // -- All notes land on valid scale frequencies --
+
+    #[test]
+    fn notes_are_valid_scale_frequencies() {
+        for branch in ["main", "develop", "feature/x", "fix/bug-123", "release/v2"] {
+            let p = PhraseParams::from_identity("repo", branch, 400, 0.25, default_effects(), 5);
+            for note in &p.notes {
+                assert!(
+                    p.voice.scale_freqs.iter().any(|v| (v - note).abs() < 0.01),
+                    "Note {:.2}Hz is not in the repo's scale {:?}",
+                    note, p.voice.scale_freqs
+                );
+            }
+        }
+    }
+
+    // -- Oscillator produces signal in reasonable range --
+
+    #[test]
+    fn oscillator_output_in_range() {
+        let voice = RepoVoice::from_repo("test");
+        let melody = BranchMelody::from_branch("test", 3);
+        for t in 0..1000 {
+            let time = t as f32 / 44100.0;
+            let sample = generate_oscillator(440.0, time, false, 0, &voice, &melody);
+            assert!(sample >= -1.5 && sample <= 1.5, "sample out of range: {}", sample);
+        }
+    }
+
+    #[test]
+    fn chorus_oscillator_output_in_range() {
+        let voice = RepoVoice::from_repo("test");
+        let melody = BranchMelody::from_branch("test", 3);
+        for t in 0..1000 {
+            let time = t as f32 / 44100.0;
+            let sample = generate_oscillator(440.0, time, true, 0, &voice, &melody);
+            assert!(sample >= -1.5 && sample <= 1.5, "chorus sample out of range: {}", sample);
+        }
+    }
+
+    // -- Tremolo modulates but doesn't invert --
+
+    #[test]
+    fn tremolo_stays_positive_for_positive_input() {
+        let melody = BranchMelody::from_branch("test", 3);
+        for t in 0..44100 {
+            let time = t as f32 / 44100.0;
+            let result = apply_tremolo(1.0, time, &melody);
+            assert!(result > 0.0, "tremolo went negative at t={}: {}", time, result);
+            assert!(result <= 1.0, "tremolo exceeded input at t={}: {}", time, result);
+        }
+    }
+
+    // -- Pad envelope shape --
+
+    #[test]
+    fn pad_envelope_rises_and_falls() {
+        let notes = vec![440.0];
+        let effects = Effects { pad: true, chorus: false, tremolo: false };
+        let voice = RepoVoice::from_repo("test");
+        let melody = BranchMelody::from_branch("test", 3);
+
+        let start = generate_pad(&notes, 0.0, 0.01, 1.0, effects, &voice, &melody).abs();
+        let mid = generate_pad(&notes, 0.5, 0.5, 1.0, effects, &voice, &melody).abs();
+        let end = generate_pad(&notes, 1.0, 0.99, 1.0, effects, &voice, &melody).abs();
+
+        assert!(mid > start, "pad should be louder in middle than at start");
+        assert!(mid > end, "pad should be louder in middle than at end");
+    }
 }
