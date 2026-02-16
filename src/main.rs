@@ -455,29 +455,57 @@ fn run_init() -> Result<()> {
 
     let hook_command = "branch-tone hook";
     let mut hooks_added = 0;
+    let mut hooks_migrated = 0;
 
-    for event in ["Stop", "PermissionRequest"] {
+    // New format: each event is an array of matcher groups, each with a "hooks" array
+    // e.g. {"Stop": [{"hooks": [{"type": "command", "command": "branch-tone hook"}]}]}
+    let new_hook_entry = serde_json::json!({
+        "hooks": [{"type": "command", "command": hook_command}]
+    });
+
+    for event in ["SessionStart", "Stop", "PermissionRequest"] {
         let event_hooks = hooks
             .entry(event)
             .or_insert_with(|| serde_json::json!([]))
             .as_array_mut()
             .with_context(|| format!("hooks.{} is not an array", event))?;
 
-        // Remove old entries that reference hook.sh
+        // Migrate old-format entries (flat {type, command}) to new format ({hooks: [{type, command}]})
+        let mut had_old_format = false;
         event_hooks.retain(|entry| {
-            let cmd = entry.get("command").and_then(|c| c.as_str()).unwrap_or("");
-            !cmd.contains("hook.sh")
+            // Old format: {"type": "command", "command": "..."} at top level
+            let is_old = entry.get("type").is_some() && entry.get("hooks").is_none();
+            if is_old {
+                let cmd = entry.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                if cmd.contains("branch-tone") || cmd.contains("hook.sh") {
+                    had_old_format = true;
+                    return false; // remove old format, we'll re-add in new format
+                }
+            }
+            // Also remove old hook.sh references in new format
+            if let Some(inner_hooks) = entry.get("hooks").and_then(|h| h.as_array()) {
+                let has_old_ref = inner_hooks.iter().any(|h| {
+                    h.get("command").and_then(|c| c.as_str()).unwrap_or("").contains("hook.sh")
+                });
+                if has_old_ref { return false; }
+            }
+            true
         });
+        if had_old_format {
+            hooks_migrated += 1;
+        }
 
+        // Check if already present in new format
         let already_present = event_hooks.iter().any(|entry| {
-            entry.get("command").and_then(|c| c.as_str()) == Some(hook_command)
+            entry.get("hooks").and_then(|h| h.as_array()).map_or(false, |arr| {
+                arr.iter().any(|h| {
+                    h.get("command").and_then(|c| c.as_str()) == Some(hook_command)
+                })
+            })
         });
 
         if !already_present {
-            event_hooks.push(serde_json::json!({
-                "type": "command",
-                "command": hook_command
-            }));
+            event_hooks.push(new_hook_entry.clone());
             hooks_added += 1;
         }
     }
@@ -487,13 +515,19 @@ fn run_init() -> Result<()> {
     std::fs::write(&settings_path, format!("{}\n", json_str))
         .with_context(|| format!("Failed to write {}", settings_path.display()))?;
 
+    if hooks_migrated > 0 {
+        println!("✓ Migrated {} hook(s) to new format", hooks_migrated);
+    }
     if hooks_added > 0 {
-        println!("✓ Added hooks to {}", settings_path.display());
-    } else {
+        println!("✓ Added {} hook(s) to {}", hooks_added, settings_path.display());
+    } else if hooks_migrated == 0 {
         println!("✓ Hooks already present in {}", settings_path.display());
     }
 
-    println!("\nbranch-tone is ready! Claude Code will play tones on Stop and PermissionRequest events.");
+    println!("\nbranch-tone is ready! Claude Code will play tones on:");
+    println!("  • SessionStart    — when you open a session");
+    println!("  • Stop            — when Claude finishes responding");
+    println!("  • PermissionRequest — when a permission dialog appears");
 
     Ok(())
 }
