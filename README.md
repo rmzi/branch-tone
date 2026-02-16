@@ -1,12 +1,12 @@
 # branch-tone
 
-Generate unique musical tones from git branch names. Each branch gets its own sonic identity — different repos with the same branch name produce different sounds.
+Generate unique musical tones from git branch names. Each repo gets its own harmonic identity (key, scale, timbre) while each branch gets its own melodic identity (pattern, rhythm, envelope) — so you can *hear* your context.
 
 ## Why?
 
-Ever lose track of which terminal is on which branch? Now you can *hear* it. Same branch + repo always produces the same musical phrase, so your ears learn to recognize your context.
+Ever lose track of which terminal is on which branch? Now you can hear it. Same branch + repo always produces the same musical phrase, so your ears learn to recognize your context.
 
-Each branch gets a unique **3-note arpeggio** using the pentatonic scale (C, D, E, G, A) — always pleasant, never harsh.
+Each repo sounds fundamentally different — one might be in C# Minor Pentatonic while another is in A# Lydian. Branches within a repo share that harmonic character but vary in melody, rhythm, and envelope shape. The result is ethereal, spaceship-like tones that ring out and overlap.
 
 ## Install
 
@@ -34,12 +34,12 @@ branch-tone main --repo my-project
 
 # Sound options
 branch-tone --pad              # Warm chord instead of arpeggio
-branch-tone --chorus           # Detuned layers for richness
+branch-tone --chorus           # Extra detuned layers for richness
 branch-tone --tremolo          # Volume wobble
 branch-tone --steps 5          # 5-note phrase instead of 3
 
 # Adjust duration (ms) and volume (0.0-1.0)
-branch-tone main -d 500 -v 0.5
+branch-tone main -d 800 -v 0.5
 
 # Just show parameters, don't play
 branch-tone feature/auth --dry-run
@@ -47,15 +47,21 @@ branch-tone feature/auth --dry-run
 
 ## How It Works
 
-1. **Hash** the `repo:branch` combination with SHA-256
-2. **Map** hash bytes to musical parameters:
-   - Root note from pentatonic scale (C, D, E, G, A)
-   - Octave (low, mid, or high)
-   - Arpeggio pattern (rising, falling, stepwise, or playful)
-3. **Synthesize** a 3 or 5-note phrase with soft attack/decay
-4. **Play** via your system's audio output
+Repo and branch are hashed **separately** with SHA-256 so they contribute independently:
 
-Same repo + branch → same hash → same melody. Every time.
+**Repo hash → harmonic identity:**
+- Root note from all 12 chromatic pitches (C through B)
+- Scale type (major pentatonic, minor pentatonic, dorian, lydian, mixolydian, minor)
+- Octave register and harmonic timbre blend
+
+**Branch hash → melodic identity:**
+- Arpeggio pattern (8 per step count)
+- Swing timing, envelope shape, chorus detune
+- Tremolo rate/depth, interval spread
+
+Same repo + branch → same hashes → same sound. Every time.
+
+Notes ring out with exponential decay and overlap for an ethereal quality, with a sub-octave layer and subtle pitch shimmer always present.
 
 ## Integration
 
@@ -105,9 +111,10 @@ This plays a warm 5-note chord when Claude finishes responding — each repo/bra
 ## Technical Details
 
 - **Audio**: CPAL (Cross-Platform Audio Library)
-- **Hashing**: SHA-256 for deterministic randomness
+- **Hashing**: SHA-256, two-layer (repo + branch hashed independently)
 - **CLI**: clap with derive macros
-- **Synthesis**: Sine wave with harmonics, ADSR envelope, optional chorus/tremolo
+- **Synthesis**: Sine waves with configurable harmonics, sub-octave layer, shimmer, exponential decay envelopes, optional chorus/tremolo
+- **Scales**: 6 pentatonic-safe scale types across all 12 chromatic roots
 
 ## Development
 
@@ -115,7 +122,7 @@ This plays a warm 5-note chord when Claude finishes responding — each repo/bra
 cargo build           # Debug build
 cargo run -- main     # Run with args
 cargo build --release # Optimized build
-cargo test            # Run tests
+cargo test            # Run tests (12 tests)
 ```
 
 ## License
