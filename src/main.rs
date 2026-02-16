@@ -59,6 +59,10 @@ struct PlayArgs {
     #[arg(long)]
     tremolo: bool,
 
+    /// Bulldozer mode: pad + arpeggiated shimmer layer
+    #[arg(long)]
+    bulldozer: bool,
+
     /// Number of notes in sequence (3 or 5)
     #[arg(long, default_value = "3")]
     steps: u8,
@@ -155,9 +159,237 @@ const ENVELOPE_SHAPES: [(f32, f32); 4] = [
 
 #[derive(Debug, Clone, Copy)]
 struct Effects {
-    pad: bool,      // Chord mode with long envelope
-    chorus: bool,   // Detuned layers
-    tremolo: bool,  // Volume modulation
+    pad: bool,       // Chord mode with long envelope
+    chorus: bool,    // Detuned layers
+    tremolo: bool,   // Volume modulation
+    bulldozer: bool, // Pad + arp shimmer layer
+}
+
+// -----------------------------------------------------------------------------
+// DSP PRIMITIVES
+// -----------------------------------------------------------------------------
+
+/// Biquad IIR filter (12 dB/oct per stage)
+#[derive(Clone)]
+struct Biquad {
+    b0: f32, b1: f32, b2: f32,
+    a1: f32, a2: f32,
+    x1: f32, x2: f32,
+    y1: f32, y2: f32,
+}
+
+impl Biquad {
+    fn new() -> Self {
+        Self { b0: 1.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0,
+               x1: 0.0, x2: 0.0, y1: 0.0, y2: 0.0 }
+    }
+
+    fn set_lowpass(&mut self, cutoff: f32, q: f32, sample_rate: f32) {
+        let w0 = 2.0 * PI * (cutoff / sample_rate).min(0.49);
+        let alpha = w0.sin() / (2.0 * q);
+        let cos_w0 = w0.cos();
+        let a0 = 1.0 + alpha;
+        self.b0 = ((1.0 - cos_w0) / 2.0) / a0;
+        self.b1 = (1.0 - cos_w0) / a0;
+        self.b2 = self.b0;
+        self.a1 = (-2.0 * cos_w0) / a0;
+        self.a2 = (1.0 - alpha) / a0;
+    }
+
+    fn process(&mut self, x: f32) -> f32 {
+        let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
+              - self.a1 * self.y1 - self.a2 * self.y2;
+        self.x2 = self.x1;
+        self.x1 = x;
+        self.y2 = self.y1;
+        self.y1 = y;
+        y
+    }
+}
+
+/// 24 dB/oct low-pass filter (two cascaded biquads, Butterworth alignment)
+struct LowPass24 {
+    stages: [Biquad; 2],
+}
+
+impl LowPass24 {
+    fn new() -> Self {
+        Self { stages: [Biquad::new(), Biquad::new()] }
+    }
+
+    fn set_cutoff(&mut self, cutoff: f32, sample_rate: f32) {
+        for stage in &mut self.stages {
+            stage.set_lowpass(cutoff, 0.707, sample_rate);
+        }
+    }
+
+    fn process(&mut self, x: f32) -> f32 {
+        let y = self.stages[0].process(x);
+        self.stages[1].process(y)
+    }
+}
+
+/// Comb filter for Schroeder reverb
+struct CombFilter {
+    buffer: Vec<f32>,
+    index: usize,
+    feedback: f32,
+    damp1: f32,
+    damp2: f32,
+    prev: f32,
+}
+
+impl CombFilter {
+    fn new(size: usize, feedback: f32, damping: f32) -> Self {
+        Self {
+            buffer: vec![0.0; size.max(1)],
+            index: 0,
+            feedback,
+            damp1: damping,
+            damp2: 1.0 - damping,
+            prev: 0.0,
+        }
+    }
+
+    fn process(&mut self, input: f32) -> f32 {
+        let output = self.buffer[self.index];
+        self.prev = output * self.damp2 + self.prev * self.damp1;
+        self.buffer[self.index] = input + self.prev * self.feedback;
+        self.index = (self.index + 1) % self.buffer.len();
+        output
+    }
+}
+
+/// Allpass filter for Schroeder reverb
+struct AllpassFilter {
+    buffer: Vec<f32>,
+    index: usize,
+    feedback: f32,
+}
+
+impl AllpassFilter {
+    fn new(size: usize, feedback: f32) -> Self {
+        Self {
+            buffer: vec![0.0; size.max(1)],
+            index: 0,
+            feedback,
+        }
+    }
+
+    fn process(&mut self, input: f32) -> f32 {
+        let buffered = self.buffer[self.index];
+        let output = buffered - input;
+        self.buffer[self.index] = input + buffered * self.feedback;
+        self.index = (self.index + 1) % self.buffer.len();
+        output
+    }
+}
+
+/// Schroeder reverb: 4 parallel comb filters → 2 series allpass filters
+struct SimpleReverb {
+    combs: Vec<CombFilter>,
+    allpasses: Vec<AllpassFilter>,
+}
+
+impl SimpleReverb {
+    fn new(sample_rate: f32) -> Self {
+        let scale = sample_rate / 44100.0;
+        // ~35ms comb delays (prime-ish for reduced coloration)
+        let comb_delays = [1557, 1617, 1491, 1422];
+        let allpass_delays = [225, 556];
+
+        let combs = comb_delays.iter()
+            .map(|&d| CombFilter::new((d as f32 * scale) as usize, 0.84, 0.4))
+            .collect();
+        let allpasses = allpass_delays.iter()
+            .map(|&d| AllpassFilter::new((d as f32 * scale) as usize, 0.5))
+            .collect();
+
+        Self { combs, allpasses }
+    }
+
+    fn process(&mut self, input: f32) -> f32 {
+        let mut output = 0.0;
+        for comb in &mut self.combs {
+            output += comb.process(input);
+        }
+        output /= self.combs.len() as f32;
+        for ap in &mut self.allpasses {
+            output = ap.process(output);
+        }
+        output
+    }
+}
+
+/// Stereo chorus: two modulated delay lines with inverted LFO phase
+struct StereoChorus {
+    buffer_l: Vec<f32>,
+    buffer_r: Vec<f32>,
+    write_idx: usize,
+    base_delay: usize,
+    sample_rate: f32,
+}
+
+impl StereoChorus {
+    fn new(sample_rate: f32) -> Self {
+        let base_delay = (sample_rate * 0.003) as usize; // 3ms base delay
+        let buf_size = (sample_rate * 0.020) as usize;   // 20ms max
+        Self {
+            buffer_l: vec![0.0; buf_size.max(1)],
+            buffer_r: vec![0.0; buf_size.max(1)],
+            write_idx: 0,
+            base_delay,
+            sample_rate,
+        }
+    }
+
+    fn process(&mut self, input: f32, time: f32, rate: f32) -> (f32, f32) {
+        let buf_len = self.buffer_l.len();
+        self.buffer_l[self.write_idx] = input;
+        self.buffer_r[self.write_idx] = input;
+
+        // LFO: triangle wave, inverted phase for L/R
+        let lfo = (2.0 * PI * rate * time).sin();
+        let mod_samples = (self.sample_rate * 0.0015) as f32; // ±1.5ms depth
+
+        let delay_l = self.base_delay as f32 + lfo * mod_samples;
+        let delay_r = self.base_delay as f32 - lfo * mod_samples;
+
+        let read_l = (self.write_idx as f32 - delay_l + buf_len as f32) % buf_len as f32;
+        let read_r = (self.write_idx as f32 - delay_r + buf_len as f32) % buf_len as f32;
+
+        // Linear interpolation for fractional delay
+        let l = lerp_buffer(&self.buffer_l, read_l);
+        let r = lerp_buffer(&self.buffer_r, read_r);
+
+        self.write_idx = (self.write_idx + 1) % buf_len;
+
+        // 50/50 wet/dry
+        ((input + l) * 0.5, (input + r) * 0.5)
+    }
+}
+
+fn lerp_buffer(buf: &[f32], pos: f32) -> f32 {
+    let len = buf.len();
+    let idx0 = pos.floor() as usize % len;
+    let idx1 = (idx0 + 1) % len;
+    let frac = pos - pos.floor();
+    buf[idx0] * (1.0 - frac) + buf[idx1] * frac
+}
+
+/// Compute pad filter cutoff that follows the envelope shape
+fn pad_filter_cutoff(progress: f32) -> f32 {
+    let attack = 0.45;
+    let release = 0.45;
+    let env = if progress < attack {
+        (progress / attack * PI / 2.0).sin()
+    } else if progress > (1.0 - release) {
+        ((1.0 - progress) / release * PI / 2.0).sin()
+    } else {
+        1.0
+    };
+    // Sweep from 200 Hz (dark, closed) to 1400 Hz (warm, open)
+    200.0 + env * 1200.0
 }
 
 // -----------------------------------------------------------------------------
@@ -329,7 +561,7 @@ fn main() -> Result<()> {
 }
 
 fn run_play(args: PlayArgs) -> Result<()> {
-    let PlayArgs { branch, repo, duration, volume, pad, chorus, tremolo, steps, dry_run, quiet } = args;
+    let PlayArgs { branch, repo, duration, volume, pad, chorus, tremolo, bulldozer, steps, dry_run, quiet } = args;
     let branch = match branch {
         Some(b) => b,
         None => get_current_branch()
@@ -341,10 +573,15 @@ fn run_play(args: PlayArgs) -> Result<()> {
         None => get_repo_name().unwrap_or_else(|_| "unknown".to_string()),
     };
 
-    let effects = Effects { pad, chorus, tremolo };
+    let effects = Effects {
+        pad: pad || bulldozer,
+        chorus: chorus || bulldozer,
+        tremolo,
+        bulldozer,
+    };
 
-    // Pad mode benefits from longer duration
-    let duration = if pad && duration == 600 {
+    // Pad/bulldozer mode benefits from longer duration
+    let duration = if (pad || bulldozer) && duration == 600 {
         1000  // Default to 1000ms for pad
     } else {
         duration
@@ -354,12 +591,11 @@ fn run_play(args: PlayArgs) -> Result<()> {
 
     // Print info
     if !quiet {
-        let mode = match (pad, chorus, tremolo) {
-            (true, _, _) => " [pad]",
-            (_, true, _) => " [chorus]",
-            (_, _, true) => " [tremolo]",
-            _ => " [arpeggio]",
-        };
+        let mode = if bulldozer { " [bulldozer]" }
+            else if pad { " [pad]" }
+            else if chorus { " [chorus]" }
+            else if tremolo { " [tremolo]" }
+            else { " [arpeggio]" };
         let envelope_names = ["Punchy", "Soft", "Pluck", "Swell"];
         println!("🎵 Repo: {} | Branch: {}{}", repo, branch, mode);
         println!("   Key: {} {} | Octave: {}x", params.voice.root_name, params.voice.scale_name, params.voice.octave);
@@ -405,9 +641,10 @@ fn run_hook() -> Result<()> {
         repo: Some(repo),
         duration: 1500,
         volume: 0.25,
-        pad: true,
-        chorus: true,
+        pad: false,
+        chorus: false,
         tremolo: false,
+        bulldozer: true,
         steps: 3,
         dry_run: false,
         quiet: true,
@@ -634,6 +871,16 @@ where
     let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let finished_clone = finished.clone();
 
+    // DSP processing state
+    let mut pad_lpf = LowPass24::new();
+    let mut reverb = SimpleReverb::new(sample_rate);
+    let mut chorus = StereoChorus::new(sample_rate);
+    let chorus_rate = 0.6; // Hz — slow Juno-style modulation
+
+    // For bulldozer: arp uses same notes but doesn't drop an octave
+    // (the pad generator drops internally), so arp sits an octave above
+    let arp_effects = Effects { pad: false, chorus: true, tremolo: false, bulldozer: false };
+
     let err_fn = |err| eprintln!("Audio stream error: {}", err);
 
     let stream = device.build_output_stream(
@@ -653,15 +900,43 @@ where
                 let time = current_sample as f32 / sample_rate;
                 let progress = current_sample as f32 / total_samples as f32;
 
-                let sample_value = if effects.pad {
+                // Generate raw audio
+                let raw = if effects.bulldozer {
+                    let pad_out = generate_pad(&notes, time, progress, 1.0, effects, &voice, &melody);
+                    let arp_out = generate_arpeggio(&notes, time, current_sample, total_samples, 1.0, arp_effects, &voice, &melody);
+                    (pad_out * 0.7 + arp_out * 0.3) * volume
+                } else if effects.pad {
                     generate_pad(&notes, time, progress, volume, effects, &voice, &melody)
                 } else {
                     generate_arpeggio(&notes, time, current_sample, total_samples, volume, effects, &voice, &melody)
                 };
 
-                let sample = T::from_sample(sample_value);
-                for channel_sample in frame.iter_mut() {
-                    *channel_sample = sample;
+                // Low-pass filter with envelope (pad/bulldozer modes)
+                let filtered = if effects.pad {
+                    let cutoff = pad_filter_cutoff(progress);
+                    pad_lpf.set_cutoff(cutoff, sample_rate);
+                    pad_lpf.process(raw)
+                } else {
+                    raw
+                };
+
+                // Reverb (all modes — lighter for arpeggio)
+                let wet = reverb.process(filtered);
+                let reverb_mix = if effects.pad { 0.30 } else { 0.15 };
+                let with_reverb = filtered * (1.0 - reverb_mix) + wet * reverb_mix;
+
+                // Stereo chorus (pad/bulldozer modes get BBD-style stereo)
+                if channels >= 2 && effects.pad {
+                    let (left, right) = chorus.process(with_reverb, time, chorus_rate);
+                    for (ch, channel_sample) in frame.iter_mut().enumerate() {
+                        let s = if ch % 2 == 0 { left } else { right };
+                        *channel_sample = T::from_sample(s);
+                    }
+                } else {
+                    let sample = T::from_sample(with_reverb);
+                    for channel_sample in frame.iter_mut() {
+                        *channel_sample = sample;
+                    }
                 }
             }
         },
@@ -708,24 +983,20 @@ fn generate_pad(notes: &[f32], time: f32, progress: f32, volume: f32, _effects: 
         // Drop an octave for depth
         let base_freq = freq * 0.5;
 
-        // Tight detuning: 3 voices per note at ~1-2 cents apart for lush width
+        // Tight detuning: 3 saw voices per note — the LPF in run_audio
+        // shapes these harmonically rich waves into warm, filtered tones
         let detune_cents = melody.chorus_detune * 0.15; // scale down to 0.6-2.4 cents
         let detune_offsets = [-detune_cents, 0.0, detune_cents];
 
         for (j, &cents) in detune_offsets.iter().enumerate() {
             let f = base_freq * 2.0_f32.powf(cents / 1200.0);
-            let phase = (i as f32 + j as f32) * 0.7; // spread phases
+            let phase_offset = (i as f32 + j as f32) * 0.7; // spread phases
 
-            // Fundamental — dominant
-            let fundamental = (2.0 * PI * f * time + phase).sin();
+            // Naive saw wave — rich in all harmonics, shaped by downstream LPF
+            let saw_phase = f * time + phase_offset;
+            let saw = 2.0 * (saw_phase - saw_phase.floor()) - 1.0;
 
-            // 2nd harmonic (octave) — warm but quiet (steep rolloff)
-            let h2 = (2.0 * PI * f * 2.0 * time + phase).sin() * 0.2;
-
-            // 3rd harmonic — barely there, just adds slight character
-            let h3 = (2.0 * PI * f * 3.0 * time + phase).sin() * 0.06;
-
-            sample += (fundamental + h2 + h3) / 3.0;
+            sample += saw / 3.0;
         }
 
         // Sub layer — an octave below, pure sine for weight
@@ -873,7 +1144,7 @@ mod tests {
     use super::*;
 
     fn default_effects() -> Effects {
-        Effects { pad: false, chorus: false, tremolo: false }
+        Effects { pad: false, chorus: false, tremolo: false, bulldozer: false }
     }
 
     // -- Determinism: same input always produces same output --
@@ -991,7 +1262,7 @@ mod tests {
     #[test]
     fn pad_envelope_rises_and_falls() {
         let notes = vec![440.0];
-        let effects = Effects { pad: true, chorus: false, tremolo: false };
+        let effects = Effects { pad: true, chorus: false, tremolo: false, bulldozer: false };
         let voice = RepoVoice::from_repo("test");
         let melody = BranchMelody::from_branch("test", 3);
 

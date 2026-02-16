@@ -1,6 +1,58 @@
 # Sound Design Reference
 
 Synthesis research and parameter notes for `branch-tone`'s audio engine.
+Based on Blu Mar Ten's JungleJungle (1989–1999) sample pack and broader
+jungle/liquid DnB production techniques.
+
+## Source Material: Blu Mar Ten JungleJungle Pack
+
+650+ samples from vinyl/CD spanning 1989–1999. The pad samples that define
+our target aesthetic (with Camelot keys mapped to standard):
+
+| Pad | Camelot | Key | Notes |
+|-----|---------|-----|-------|
+| Bulldozer | — | — | Pad + arpeggiated layer, the target sound |
+| Reflections | 3B | Db major | Love — lush, evolving |
+| Ten Pad | 9B | G major | Amazing — full, warm |
+| Traenon | 12A | Db minor | Perfect ambience |
+| Sonic Pad 1 & 2 | 5A | C minor | |
+| Connected Modu | 6A | G minor | |
+| Groove Therapy Lo | 2A | Eb minor | |
+| Inner Pad | 11A | F# minor | |
+| Love Pad | 10A | B minor | |
+| Moomin Loop | 5A | C minor | |
+| Night Train Short | 8A | A minor | |
+| Portraits | 11A | F# minor | |
+| Revelation | 1B | B major | |
+| Drumz BassPad | 1B | B major | |
+| Shoes Pad | 5B | Eb major | |
+| Apollo | 11A | F# minor | |
+
+The heavy lean toward minor keys (Eb, C, G, F#, A, B, Db minor) is
+characteristic of jungle/liquid DnB — melancholic, atmospheric tonalities.
+
+## Classic Hardware Behind the Sound
+
+The pads in this era came from a specific set of instruments:
+
+- **Roland JD-800/JD-990** — LTJ Bukem's known synth. The "Iceman" patch
+  is one of the most iconic jungle pad sounds (PFM "Dreams", Bukem & Tayla
+  "Remnants").
+- **Roland JV-1080** — The workhorse ROMpler. Factory string/pad presets
+  were sampled and layered extensively.
+- **Korg M1** — PCM-based pads that defined late-80s/early-90s dance music.
+- **Korg Wavestation** — Vector synthesis and wave sequencing for complex,
+  evolving textures. Particularly popular with "intelligent" DnB.
+- **Roland Juno-106/Juno-60** — Analog saw/square through the BBD chorus
+  circuit. The "Juno pad" is synonymous with warm, wide analog pads.
+- **Roland JP-8000** — Introduced the Supersaw (1997): 7 detuned saw
+  oscillators in a single waveform.
+- **E-mu E4 / Akai S3000 samplers** — Many producers sampled pad chords
+  from film soundtracks and other records, then replayed single-key stabs.
+
+A critical insight: **hardware reverb was more important than the synth
+itself** for achieving authentic jungle pad sounds. The reverb tail and
+how it smeared harmonics was a defining characteristic.
 
 ## Frequency Ranges for Ambient Pads
 
@@ -12,28 +64,91 @@ Synthesis research and parameter notes for `branch-tone`'s audio engine.
 | Mid | 500–2000 | Presence, definition |
 | Upper-mid | 2000–5000 | Clarity, edge, harshness zone |
 
-For ambient pads, the sweet spot is **80–500 Hz** for fundamentals. Sub-bass layering (half the fundamental) adds weight without clutter. The pad generator drops notes one octave (`freq * 0.5`) to push everything into warmer territory, then adds a sub layer at `freq * 0.25`.
+Sweet spot for jungle pads: **80–500 Hz** fundamentals. The pad generator
+drops notes one octave (`freq * 0.5`) then adds a sub layer at `freq * 0.25`.
 
-## Harmonic Ratios
+For notification context (low volume playback), focus energy in **500 Hz–3 kHz**
+where human hearing is most sensitive (Fletcher-Munson). Sub-bass is inaudible
+at low volumes and wastes headroom.
 
-Harmonics above the fundamental define warmth vs eeriness:
+## Oscillator Architecture
+
+### Sawtooth Foundation
+Detuned sawtooth waves are the primary waveform — rich in harmonics, responds
+well to filtering. The classic approach:
+
+| Style | Oscillators | Detune | Character |
+|-------|-------------|--------|-----------|
+| Juno-style | 2 saws | 5–15 cents | Classic warm width |
+| Supersaw (JP-8000) | 7 saws | 0.89x–1.11x center | Massive, genre-defining |
+| branch-tone pad | 3 saws | 0.6–2.4 cents | Subtle, tight lushness |
+| branch-tone arp | 2–5 saws | 1.2–16 cents | Varies by chorus flag |
+
+### JP-8000 Supersaw Reference (Adam Szabo's reverse-engineering)
+
+At maximum detune, the 7 oscillators sit at:
+```
+0.8908x  0.9382x  0.9811x  1.0000x  1.0204x  1.0633x  1.1077x
+```
+The sweet spot for pads is 20–40% of max detune. At moderate settings the
+spread is much smaller, which is where the warm pad territory lives.
+
+For a Rust implementation, 3–5 detuned saws with the right spread produces
+a convincing pad. The center oscillator stays louder (~0.7 gain) while
+side oscillators range 0.0–1.0 depending on mix.
+
+### Harmonic Ratios
 
 | Harmonic | Ratio | Level | Effect |
 |----------|-------|-------|--------|
 | 2nd (octave) | 2:1 | 0.15–0.25 | Warmth, fullness |
-| 3rd (fifth) | 3:1 | 0.03–0.08 | Slight character, hollow at higher levels |
-| 4th (2 octaves) | 4:1 | avoid | Too bright for pads |
-| 5th (major 3rd) | 5:1 | avoid | Adds tension |
+| 3rd (fifth) | 3:1 | 0.03–0.08 | Slight character |
+| 4th+ | 4:1+ | avoid | Too bright for pads |
 
-The pad uses a steep harmonic rolloff: fundamental dominant, 2nd at 0.2, 3rd at 0.06. This keeps things warm without brightness creeping in. The arpeggio mode uses repo-hashed values (`harmonic_blend` 0.05–0.35, `third_harmonic` 0.0–0.15) for per-repo timbre variation.
+The pad uses steep rolloff: fundamental dominant, 2nd at 0.2, 3rd at 0.06.
+The arpeggio uses repo-hashed values (`harmonic_blend` 0.05–0.35,
+`third_harmonic` 0.0–0.15) for per-repo timbre variation.
+
+## Filter Design
+
+### Low-Pass Filter Settings
+
+| Parameter | Dark Pad | Warm Pad | Bright Pad |
+|-----------|----------|----------|------------|
+| Cutoff | ~60 Hz | 800–2000 Hz | 2000+ Hz |
+| Slope | 24 dB/oct | 24 dB/oct | 12 dB/oct |
+| Resonance | Low (0–10%) | Low-Med (10–20%) | Low (5–10%) |
+
+For the jungle pad target: 24 dB/oct LPF at 800–1800 Hz, resonance under
+20%. High resonance thins the sound — above 30% introduces nasal/acidic
+coloring.
+
+### Filter Envelope Modulation
+- Slow attack on filter envelope (200–500 ms) creates gentle "opening"
+- Moderate envelope amount (30–50% of range) with slow attack = classic
+  breathing pad
+- LFO to filter cutoff at 0.1–0.5 Hz, sweeping 200–500 Hz of range
+
+**Note**: `branch-tone` currently uses additive harmonics rather than
+subtractive filtering. A proper LPF would be a significant upgrade
+toward the authentic sound.
 
 ## Envelope Shaping
 
-### Pad Envelope
-Slow sine-curved attack and release (45% each) with a short sustain plateau. The sine curve (`sin(progress * pi/2)`) gives a natural-feeling fade rather than the mechanical feel of linear ramps.
+### Pad Envelope (current)
+Slow sine-curved attack and release (45% each) with short sustain plateau.
+The sine curve (`sin(progress * pi/2)`) gives a natural-feeling fade.
 
-### Arpeggio Envelope
-The arpeggio uses a "ringing notes" approach — each note triggers at its boundary and decays exponentially (`exp(-t)`) over the remaining phrase. Notes overlap and blend rather than cutting off, creating an ethereal, reverb-like quality without actual reverb processing. A global 15% fade-out at the end prevents hard cutoffs.
+### Classic ADSR for Jungle Pads
+- Attack: 200–400 ms (gentle fade in)
+- Decay: 200 ms
+- Sustain: 0.7 (keep level high for low-volume audibility)
+- Release: 400–600 ms
+
+### Arpeggio Envelope (current)
+"Ringing notes" approach — each note triggers at its boundary and decays
+exponentially (`exp(-t)`) over remaining phrase. Notes overlap and blend,
+creating ethereal reverb-like quality without actual reverb.
 
 ### Available Shapes (arpeggio mode)
 
@@ -44,32 +159,108 @@ The arpeggio uses a "ringing notes" approach — each note triggers at its bound
 | Pluck | 2% | 20% | Instant attack, medium ring |
 | Swell | 40% | 10% | Very slow bloom |
 
-## Detuning and Chorus
+## Chorus and Detuning
 
-Detuning multiple oscillators creates width and movement. Parameters:
+### Juno-106 BBD Chorus Reference
+The definitive chorus sound. Uses bucket-brigade device delay:
+- Mode I: LFO 0.5 Hz, triangle, 100% depth
+- Mode II: LFO 0.8 Hz, triangle, 100% depth
+- Mode I+II: LFO ~1 Hz, sine-like, 8% depth (subtle shimmer)
+- Stereo: left/right modulation 180° out of phase
+- Delay time: ~0.64–12.8 ms range
+
+### Implementation for Rust
+- Short delay line (~2–5 ms base)
+- Modulate with triangle LFO at 0.5–1.0 Hz
+- Create stereo by inverting LFO phase for L vs R channel
+- Mix: 40–50% wet
+
+### Current branch-tone Detuning
 
 | Context | Detune | Voices | Effect |
 |---------|--------|--------|--------|
 | Pad (tight) | 0.6–2.4 cents | 3 per note | Lush, subtle shimmer |
-| Chorus (explicit) | 4–16 cents | 5 per note | Wide, obvious movement |
+| Chorus (explicit) | 4–16 cents | 5 per note | Wide, movement |
 | Default arpeggio | 1.2–4.8 cents | 2 per note | Slight spaciousness |
 
-Cents-to-frequency: `f * 2^(cents/1200)`. At 440 Hz, 10 cents is only ~2.5 Hz of difference, but the phase interference creates audible width.
+Phase spreading (`(voice_idx + i) * offset`) prevents initial volume spikes.
 
-Phase spreading (`(voice_idx + i) * offset`) ensures detuned voices don't start aligned, which would cause initial volume spikes before the beating pattern develops.
+## Stereo Widening Techniques
 
-## Layered Drone Techniques
+### Oscillator Detuning + Panning (simplest)
+Pan detuned oscillators: sharp slightly left, flat slightly right, center
+stays center. Natural stereo spread from phase differences.
+
+### Chorus (most important for jungle pads)
+Left/right delay lines modulated with inverted LFO phase. Slightly different
+LFO rates for L/R (e.g., 0.5 Hz left, 0.6 Hz right) creates organic,
+evolving stereo image.
+
+### Haas Effect (micro-delay)
+Delay one channel by 5–15 ms. Creates width perception but can cause phase
+issues in mono — be careful with laptop speakers.
+
+**For branch-tone**: detuning + panning is most practical. Keep center
+oscillator strong for mono compatibility.
+
+## Reverb (Not Yet Implemented)
+
+Reverb is the single most important effect for authentic jungle pads.
+The hardware reverb defined the era more than the synth itself.
+
+### Target Settings
+- Type: Large hall or plate
+- Size: Medium-large (5–7/10)
+- Pre-delay: 20–40 ms (preserves attack clarity)
+- Damping: High-frequency rolloff at 4 kHz (keeps tail warm)
+- Width: 70–100%
+- Wet/dry: 30–40%
+
+### Simplified Options for Rust
+- Feedback delay network with diffusion
+- A few all-pass filters + comb filters (Schroeder reverb)
+- Even a simple filtered feedback delay adds significant depth
+
+## The Bulldozer Approach: Pad + Arp Layer
+
+The standout aesthetic from the sample set — two layers working together:
+
+### Layer 1: The Pad (harmonic bed)
+- Sustained chord, slow attack/release
+- Warm, filtered, wide stereo
+- Low-mid frequency range (200–2000 Hz)
+- Lower volume — provides the foundation
+
+### Layer 2: The Arp (rhythmic movement)
+- Same chord notes played as rhythmic sequence
+- Shorter envelope (fast attack, short decay, low sustain)
+- Brighter filter (higher cutoff, ~3–5 kHz)
+- High-pass filtered to sit above the pad
+- Delay effect for rhythmic cascade
+- ~60% of pad volume, or 40/60 pad/arp mix
+
+### For branch-tone (1.5s notification)
+- Play pad chord sustained
+- Simultaneously play same notes as rapid short pulses (every 100–150 ms)
+  at a higher octave
+- Arp layer: faster attack (10–20 ms), shorter release (100 ms)
+- More delay/echo on arp layer
+
+## Layered Drone Techniques (Current Implementation)
 
 The pad generator layers three elements per note:
 
-1. **Detuned triad** — 3 voices at [-detune, center, +detune] cents with fundamental + 2 harmonics each. This is the main body.
-2. **Sub layer** — Pure sine one octave below the (already-dropped) base frequency. Adds weight without harmonic complexity.
-3. **Breath modulation** — Very slow amplitude wobble (0.03–0.05 Hz) at 8% depth. Not tremolo — more like the pad is "breathing." Keeps static drones from feeling dead.
+1. **Detuned triad** — 3 voices at [-detune, center, +detune] cents with
+   fundamental + 2 harmonics each. Main body of the sound.
+2. **Sub layer** — Pure sine one octave below the already-dropped base
+   frequency. Adds weight without harmonic complexity.
+3. **Breath modulation** — Very slow amplitude wobble (0.03–0.05 Hz) at
+   8% depth. Not tremolo — more like the pad is "breathing."
 
 ## Parameter Comparison
 
-| Parameter | Warm Pad | Halloween/Eerie |
-|-----------|----------|-----------------|
+| Parameter | Warm Pad (target) | Halloween/Eerie |
+|-----------|-------------------|-----------------|
 | Fundamental range | 80–300 Hz | 200–600 Hz |
 | 2nd harmonic | 0.15–0.25 | 0.3–0.5 |
 | 3rd harmonic | 0.03–0.08 | 0.15–0.3 |
@@ -79,21 +270,22 @@ The pad generator layers three elements per note:
 | Movement | Slow breath (0.03 Hz) | Tremolo (3–9 Hz) |
 | Octave | Drop 1 (-12 semitones) | Stay or raise |
 
-`branch-tone` aims for the warm column. The "eerie" column is useful reference for what to avoid — or for a future Halloween mode.
-
-## Blue Mar Ten / Jungle Pad Aesthetic
-
-The jungle pad sound (circa mid-90s liquid drum & bass) has specific qualities:
-
-- **Dark and pillowy** — fundamentals sit low, harmonics are heavily filtered
-- **Wide stereo** — achieved through tight detuning rather than hard panning
-- **Slow evolution** — parameters drift over time rather than staying static
-- **No sharp attacks** — everything materializes gradually
-- **Warm, not bright** — the 2nd harmonic adds fullness but the 3rd and above are nearly absent
-- **Sub weight** — a pure sub-bass layer grounds everything
-
-The `branch-tone` pad aims for this aesthetic in a 1.5-second window: slow fade in, brief sustain, slow fade out. The tight detuning (0.6–2.4 cents) and steep harmonic rolloff are key to the warm-not-harsh character. Wider detuning or stronger upper harmonics would push toward trance or ambient techno territory.
-
 ## Shimmer (Arpeggio Mode)
 
-A slow pitch wobble on each note (2.5 Hz + 0.3 Hz per voice index, at 0.3% depth) adds an ethereal, slightly unstable quality to arpeggiated notes. This is subtle enough to not sound like vibrato but adds life to sustained ringing tones. Each voice wobbles at a slightly different rate, preventing phase-lock between overlapping notes.
+Slow pitch wobble per note (2.5 Hz + 0.3 Hz per voice index, 0.3% depth).
+Subtle enough to not sound like vibrato but adds life. Each voice wobbles at
+a slightly different rate, preventing phase-lock between overlapping notes.
+
+## Potential Improvements (Prioritized)
+
+1. **Low-pass filter** — Move from additive harmonics to subtractive
+   synthesis (saw oscillator → LPF). Single biggest upgrade toward
+   authentic jungle pad sound.
+2. **Reverb** — Even a simple Schroeder reverb would add massive depth.
+   Hardware reverb defined the era.
+3. **Bulldozer mode** — Layered pad + arp playing simultaneously. Already
+   have both generators; need to combine them.
+4. **Stereo chorus** — Proper BBD-style chorus with L/R phase-inverted LFO
+   modulation. Currently detuning approximates this but isn't true chorus.
+5. **Filter envelope** — Slow sweep on LPF cutoff for evolving character
+   rather than static filtering.
