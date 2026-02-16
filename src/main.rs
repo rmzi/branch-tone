@@ -403,12 +403,12 @@ fn run_hook() -> Result<()> {
     let args = PlayArgs {
         branch: Some(branch),
         repo: Some(repo),
-        duration: 800,
-        volume: 0.2,
+        duration: 1500,
+        volume: 0.25,
         pad: true,
         chorus: true,
         tremolo: false,
-        steps: 5,
+        steps: 3,
         dry_run: false,
         quiet: true,
     };
@@ -650,32 +650,61 @@ where
 // SOUND GENERATORS
 // -----------------------------------------------------------------------------
 
-fn generate_pad(notes: &[f32], time: f32, progress: f32, volume: f32, effects: Effects, voice: &RepoVoice, melody: &BranchMelody) -> f32 {
-    // Long attack and release for pad sound
-    let attack = 0.3;
-    let release = 0.3;
+fn generate_pad(notes: &[f32], time: f32, progress: f32, volume: f32, _effects: Effects, _voice: &RepoVoice, melody: &BranchMelody) -> f32 {
+    // Jungle-style pad: lush, dark, heavily filtered chord
+    // Inspired by Blue Mar Ten aesthetic — warm and pillowy, not sharp
+
+    // Very slow envelope — materializes and dissolves gently
+    let attack = 0.45;
+    let release = 0.45;
 
     let envelope = if progress < attack {
+        // Sine curve for smooth fade-in
         (progress / attack * PI / 2.0).sin()
     } else if progress > (1.0 - release) {
+        // Sine curve for smooth fade-out
         ((1.0 - progress) / release * PI / 2.0).sin()
     } else {
         1.0
     };
 
     let mut sample = 0.0;
+
     for (i, &freq) in notes.iter().enumerate() {
-        let osc = generate_oscillator(freq, time, effects.chorus, i, voice, melody);
-        sample += osc;
+        // Drop an octave for depth
+        let base_freq = freq * 0.5;
+
+        // Tight detuning: 3 voices per note at ~1-2 cents apart for lush width
+        let detune_cents = melody.chorus_detune * 0.15; // scale down to 0.6-2.4 cents
+        let detune_offsets = [-detune_cents, 0.0, detune_cents];
+
+        for (j, &cents) in detune_offsets.iter().enumerate() {
+            let f = base_freq * 2.0_f32.powf(cents / 1200.0);
+            let phase = (i as f32 + j as f32) * 0.7; // spread phases
+
+            // Fundamental — dominant
+            let fundamental = (2.0 * PI * f * time + phase).sin();
+
+            // 2nd harmonic (octave) — warm but quiet (steep rolloff)
+            let h2 = (2.0 * PI * f * 2.0 * time + phase).sin() * 0.2;
+
+            // 3rd harmonic — barely there, just adds slight character
+            let h3 = (2.0 * PI * f * 3.0 * time + phase).sin() * 0.06;
+
+            sample += (fundamental + h2 + h3) / 3.0;
+        }
+
+        // Sub layer — an octave below, pure sine for weight
+        let sub = (2.0 * PI * base_freq * 0.5 * time).sin() * 0.25;
+        sample += sub;
     }
 
     sample /= notes.len() as f32;
 
-    let sample = if effects.tremolo {
-        apply_tremolo(sample, time, melody)
-    } else {
-        sample
-    };
+    // Very slow, subtle movement — not tremolo, just gentle breathing
+    let breath_rate = 0.03 + (melody.tremolo_rate - 3.0) * 0.003; // 0.03-0.05 Hz
+    let breath = 1.0 - 0.08 * (0.5 + 0.5 * (2.0 * PI * breath_rate * time).sin());
+    sample *= breath;
 
     sample * envelope * volume
 }
@@ -719,9 +748,9 @@ fn generate_arpeggio(notes: &[f32], time: f32, current_sample: usize, total_samp
         };
 
         // Exponential decay — notes ring out well past their slot boundary
-        // Decay rate: reaches ~5% amplitude after 2x the note slot length
+        // Decay rate: reaches ~5% amplitude after ~4x the note slot length
         let decay_time = samples_since_trigger as f32 / note_slot_len as f32;
-        let ring_env = (-1.5 * decay_time).exp();
+        let ring_env = (-1.0 * decay_time).exp();
 
         let env = attack_env * ring_env;
 
