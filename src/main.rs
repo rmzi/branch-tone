@@ -2302,7 +2302,31 @@ fn apply_tremolo(sample: f32, time: f32, melody: &BranchMelody) -> f32 {
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU8, Ordering::Relaxed};
 use std::sync::Arc;
 
-const WAVE_SHAPE_NAMES: [&str; 5] = ["Sine", "Saw", "Square", "Tri", "Pulse"];
+/// Synth preset: defines multi-voice detuned oscillator + filter parameters.
+struct SynthPreset {
+    name: &'static str,
+    num_voices: u8,       // 1-7 oscillator voices
+    detune_cents: f32,    // total spread in cents
+    saw_mix: f32,         // 0.0=pure sine, 1.0=pure saw
+    harmonic_2nd: f32,    // 2nd harmonic level
+    harmonic_3rd: f32,    // 3rd harmonic level
+    sub_level: f32,       // sub-oscillator level (0.5x freq)
+    filter_base: f32,     // base LPF cutoff Hz (0.0 = bypass)
+    filter_env_amount: f32, // how much pad-shape modulates filter
+    decay_rate: f32,      // envelope decay speed (higher = faster)
+    chorus_depth: f32,    // BBD chorus pitch mod depth
+    chorus_rate: f32,     // BBD chorus LFO rate Hz
+}
+
+const SYNTH_PRESETS: [SynthPreset; 7] = [
+    SynthPreset { name: "Juno",       num_voices: 3, detune_cents: 12.0, saw_mix: 0.85, harmonic_2nd: 0.15, harmonic_3rd: 0.05, sub_level: 0.20, filter_base: 2200.0, filter_env_amount: 0.6, decay_rate: 3.0, chorus_depth: 0.003, chorus_rate: 0.5 },
+    SynthPreset { name: "Supersaw",   num_voices: 7, detune_cents: 40.0, saw_mix: 1.00, harmonic_2nd: 0.10, harmonic_3rd: 0.08, sub_level: 0.10, filter_base: 3500.0, filter_env_amount: 0.3, decay_rate: 4.0, chorus_depth: 0.001, chorus_rate: 0.3 },
+    SynthPreset { name: "Iceman",     num_voices: 5, detune_cents:  8.0, saw_mix: 0.70, harmonic_2nd: 0.20, harmonic_3rd: 0.10, sub_level: 0.25, filter_base: 1800.0, filter_env_amount: 0.8, decay_rate: 2.5, chorus_depth: 0.002, chorus_rate: 0.4 },
+    SynthPreset { name: "M1",         num_voices: 3, detune_cents:  5.0, saw_mix: 0.40, harmonic_2nd: 0.08, harmonic_3rd: 0.03, sub_level: 0.15, filter_base: 4000.0, filter_env_amount: 0.2, decay_rate: 3.5, chorus_depth: 0.001, chorus_rate: 0.2 },
+    SynthPreset { name: "WaveStation", num_voices: 5, detune_cents: 18.0, saw_mix: 0.60, harmonic_2nd: 0.18, harmonic_3rd: 0.12, sub_level: 0.18, filter_base: 2000.0, filter_env_amount: 0.7, decay_rate: 2.0, chorus_depth: 0.004, chorus_rate: 0.6 },
+    SynthPreset { name: "Bulldozer",  num_voices: 5, detune_cents: 22.0, saw_mix: 0.95, harmonic_2nd: 0.22, harmonic_3rd: 0.10, sub_level: 0.30, filter_base: 1600.0, filter_env_amount: 0.9, decay_rate: 3.0, chorus_depth: 0.003, chorus_rate: 0.5 },
+    SynthPreset { name: "Raw",        num_voices: 1, detune_cents:  0.0, saw_mix: 1.00, harmonic_2nd: 0.00, harmonic_3rd: 0.00, sub_level: 0.00, filter_base:    0.0, filter_env_amount: 0.0, decay_rate: 5.0, chorus_depth: 0.000, chorus_rate: 0.0 },
+];
 
 struct PlayerState {
     steps: [AtomicU8; 16],
@@ -2315,8 +2339,9 @@ struct PlayerState {
     note_triggers: [AtomicU8; 16],  // chromatic piano: 16 semitones from root
     recording: AtomicBool,           // record mode: z/x/c/v writes drums at playhead
     octave_shift: AtomicI8,          // -3 to +3 (octave transpose for piano keys)
-    wave_shape: AtomicU8,            // 0=Sine, 1=Saw, 2=Square, 3=Tri, 4=Pulse
+    synth_preset: AtomicU8,          // 0-6 (index into SYNTH_PRESETS)
     pad_shape_idx: AtomicU8,         // 0-5 (index into PAD_SHAPES)
+    sustain: AtomicBool,             // hold notes without decay
 }
 
 impl PlayerState {
@@ -2341,8 +2366,9 @@ impl PlayerState {
             note_triggers: std::array::from_fn(|_| AtomicU8::new(0)),
             recording: AtomicBool::new(false),
             octave_shift: AtomicI8::new(0),
-            wave_shape: AtomicU8::new(1), // Saw (matches existing behavior)
+            synth_preset: AtomicU8::new(2), // Iceman (default)
             pad_shape_idx: AtomicU8::new(0),
+            sustain: AtomicBool::new(false),
         }
     }
 
@@ -2438,42 +2464,115 @@ fn start_player_audio(state: Arc<PlayerState>, voice: &RepoVoice) -> Result<cpal
     let mut step_time: f32 = 0.0;
     let mut reverb = SimpleReverb::new(sample_rate);
 
-    // Per-note keyboard synthesis state (lives in closure)
-    let mut key_phases: [f32; 16] = [0.0; 16];
+    // Per-note, per-voice keyboard synthesis state (lives in closure)
+    let mut key_phases: [[f32; 7]; 16] = [[0.0; 7]; 16];
     let mut key_amps: [f32; 16] = [0.0; 16];
-    // Decay rate: ~1s ring at 44100 Hz
-    let key_decay = (-5.0 / sample_rate).exp(); // e^(-5/sr) per sample ≈ 1s to -60dB
+    let mut key_times: [f32; 16] = [0.0; 16];
+    let mut key_filter = LowPass24::new();
+    let mut chorus_lfo_phase: f32 = 0.0;
 
     let stream = device.build_output_stream(
         &config,
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
             let oct_shift = state.octave_shift.load(Relaxed) as f32;
             let oct_mult = 2.0_f32.powf(oct_shift);
-            let shape = state.wave_shape.load(Relaxed);
+            let preset_idx = (state.synth_preset.load(Relaxed) as usize).min(SYNTH_PRESETS.len() - 1);
+            let preset = &SYNTH_PRESETS[preset_idx];
+            let pad_shape_idx = (state.pad_shape_idx.load(Relaxed) as usize).min(PAD_SHAPES.len() - 1);
+            let pad_shape = PAD_SHAPES[pad_shape_idx];
+            let sustain_on = state.sustain.load(Relaxed);
 
             for frame in data.chunks_mut(channels) {
+                // Advance chorus LFO
+                chorus_lfo_phase += preset.chorus_rate / sample_rate;
+                if chorus_lfo_phase >= 1.0 { chorus_lfo_phase -= 1.0; }
+                let chorus_mod = (chorus_lfo_phase * 2.0 * PI).sin() * preset.chorus_depth;
+
                 // Keyboard notes always ring (even when drums paused)
                 let mut keys_out = 0.0;
                 for i in 0..16 {
                     let trigger = state.note_triggers[i].swap(0, Relaxed);
                     if trigger > 0 {
                         key_amps[i] = trigger as f32 / 255.0;
+                        key_times[i] = 0.0;
                     }
                     if key_amps[i] > 0.001 {
-                        let freq = base_freq * 2.0_f32.powf(i as f32 / 12.0) * oct_mult;
-                        key_phases[i] += freq / sample_rate;
-                        if key_phases[i] >= 1.0 { key_phases[i] -= 1.0; }
-                        let phase = key_phases[i];
-                        let osc = match shape {
-                            0 => (phase * 2.0 * PI).sin(),               // Sine
-                            2 => if phase < 0.5 { 1.0 } else { -1.0 },  // Square
-                            3 => 4.0 * (phase - (phase + 0.5).floor()).abs() - 1.0, // Tri
-                            4 => if phase < 0.15 { 1.0 } else { -1.0 }, // Pulse
-                            _ => phase * 2.0 - 1.0,                      // Saw (default)
+                        let base_key_freq = base_freq * 2.0_f32.powf(i as f32 / 12.0) * oct_mult;
+                        let nv = preset.num_voices as usize;
+                        let mut note_out = 0.0;
+
+                        for v in 0..nv {
+                            // Spread voices evenly across detune range
+                            let detune_offset = if nv > 1 {
+                                let t = v as f32 / (nv - 1) as f32 - 0.5; // -0.5 to +0.5
+                                t * preset.detune_cents
+                            } else {
+                                0.0
+                            };
+                            let detune_ratio = 2.0_f32.powf(detune_offset / 1200.0);
+                            // BBD chorus: slow pitch modulation
+                            let freq = base_key_freq * detune_ratio * (1.0 + chorus_mod);
+
+                            key_phases[i][v] += freq / sample_rate;
+                            if key_phases[i][v] >= 1.0 { key_phases[i][v] -= 1.0; }
+                            let phase = key_phases[i][v];
+
+                            // Waveform: sine/saw blend per saw_mix
+                            let sine = (phase * 2.0 * PI).sin();
+                            let saw = phase * 2.0 - 1.0;
+                            let mut osc = sine * (1.0 - preset.saw_mix) + saw * preset.saw_mix;
+
+                            // Add harmonics
+                            let phase2 = (phase * 2.0) % 1.0;
+                            let phase3 = (phase * 3.0) % 1.0;
+                            osc += (phase2 * 2.0 * PI).sin() * preset.harmonic_2nd;
+                            osc += (phase3 * 2.0 * PI).sin() * preset.harmonic_3rd;
+
+                            // Center voice louder (supersaw-style weighting)
+                            let weight = if nv > 1 {
+                                let center = (nv - 1) as f32 / 2.0;
+                                let dist = ((v as f32 - center) / center).abs();
+                                1.0 - dist * 0.4
+                            } else {
+                                1.0
+                            };
+
+                            note_out += osc * weight;
+                        }
+
+                        // Normalize by voice count
+                        if nv > 1 { note_out /= nv as f32 * 0.6; }
+
+                        // Sub layer: sine at 0.5x freq
+                        if preset.sub_level > 0.0 {
+                            let sub_freq = base_key_freq * 0.5;
+                            // Reuse voice 0 phase scaled for sub
+                            let sub_phase = (key_phases[i][0] * 0.5) % 1.0;
+                            let _ = sub_freq; // freq used implicitly via phase relationship
+                            note_out += (sub_phase * 2.0 * PI).sin() * preset.sub_level;
+                        }
+
+                        // Apply envelope
+                        let decay = if sustain_on {
+                            (-0.1 / sample_rate).exp() // near-zero decay in sustain
+                        } else {
+                            (-preset.decay_rate / sample_rate).exp()
                         };
-                        keys_out += osc * key_amps[i];
-                        key_amps[i] *= key_decay;
+
+                        keys_out += note_out * key_amps[i];
+                        key_amps[i] *= decay;
+                        key_times[i] += 1.0 / sample_rate;
                     }
+                }
+
+                // Global filter on keys output (skip for Raw preset with filter_base == 0)
+                if preset.filter_base > 0.0 && keys_out.abs() > 0.0001 {
+                    // Shape-driven filter modulation
+                    let filter_mod = pad_filter_cutoff(0.5, chorus_lfo_phase * 3.0, pad_shape);
+                    let cutoff = preset.filter_base + (filter_mod - 1500.0) * preset.filter_env_amount;
+                    let cutoff = cutoff.clamp(200.0, 18000.0);
+                    key_filter.set_cutoff(cutoff, 0.707, sample_rate);
+                    keys_out = key_filter.process(keys_out);
                 }
 
                 if state.quit.load(Relaxed) {
@@ -2624,12 +2723,14 @@ fn render_grid(
     // Piano settings display
     let oct = state.octave_shift.load(Relaxed);
     let oct_str = if oct > 0 { format!("+{}", oct) } else { format!("{}", oct) };
-    let wave_idx = state.wave_shape.load(Relaxed) as usize;
-    let wave_name = WAVE_SHAPE_NAMES[wave_idx.min(WAVE_SHAPE_NAMES.len() - 1)];
+    let preset_idx = state.synth_preset.load(Relaxed) as usize;
+    let preset_name = SYNTH_PRESETS[preset_idx.min(SYNTH_PRESETS.len() - 1)].name;
     let pad_idx = state.pad_shape_idx.load(Relaxed) as usize;
     let pad_name = PAD_SHAPE_NAMES[pad_idx.min(PAD_SHAPE_NAMES.len() - 1)];
+    let sustain = state.sustain.load(Relaxed);
+    let sustain_str = if sustain { " | \x1b[33mSUSTAIN\x1b[0m" } else { "" };
 
-    write!(stdout, "\r\n Piano: Oct {} | Wave: {} | Shape: {}\r\n", oct_str, wave_name, pad_name)?;
+    write!(stdout, "\r\n Piano: Oct {} | Synth: {} | Shape: {}{}\r\n", oct_str, preset_name, pad_name, sustain_str)?;
 
     // Piano keyboard display
     write!(stdout, "\r\n    W E   T Y U   O P\r\n")?;
@@ -2639,7 +2740,7 @@ fn render_grid(
     write!(stdout, "\r\n [enter] toggle  [i] ghost  [</>] move  [^/v] row\r\n")?;
     write!(stdout, " [1-0] pattern   [+/-] BPM  [space] play/pause  [q] quit\r\n")?;
     write!(stdout, " [A-L] piano     [r] record  [z/x/c/v] rec K/S/H/O\r\n")?;
-    write!(stdout, " [\\[/\\]] octave  [,/.] wave  [;/'] pad shape\r\n")?;
+    write!(stdout, " [\\[/\\]] octave  [,/.] synth  [;/'] pad shape  [tab] sustain\r\n")?;
 
     stdout.flush()?;
     Ok(())
@@ -2782,15 +2883,19 @@ fn run_player(initial_pattern: usize, initial_bpm: Option<u16>) -> Result<()> {
                         if cur < 3 { state.octave_shift.store(cur + 1, Relaxed); }
                     }
                     KeyCode::Char(',') => {
-                        let cur = state.wave_shape.load(Relaxed);
-                        if cur > 0 { state.wave_shape.store(cur - 1, Relaxed); }
-                        else { state.wave_shape.store(WAVE_SHAPE_NAMES.len() as u8 - 1, Relaxed); }
+                        let cur = state.synth_preset.load(Relaxed);
+                        if cur > 0 { state.synth_preset.store(cur - 1, Relaxed); }
+                        else { state.synth_preset.store(SYNTH_PRESETS.len() as u8 - 1, Relaxed); }
                     }
                     KeyCode::Char('.') => {
-                        let cur = state.wave_shape.load(Relaxed);
+                        let cur = state.synth_preset.load(Relaxed);
                         let next = cur + 1;
-                        if (next as usize) < WAVE_SHAPE_NAMES.len() { state.wave_shape.store(next, Relaxed); }
-                        else { state.wave_shape.store(0, Relaxed); }
+                        if (next as usize) < SYNTH_PRESETS.len() { state.synth_preset.store(next, Relaxed); }
+                        else { state.synth_preset.store(0, Relaxed); }
+                    }
+                    KeyCode::Tab => {
+                        let was = state.sustain.load(Relaxed);
+                        state.sustain.store(!was, Relaxed);
                     }
                     KeyCode::Char(';') => {
                         let cur = state.pad_shape_idx.load(Relaxed);
@@ -3312,5 +3417,58 @@ mod tests {
         let state = PlayerState::new(0);
         let bpm = state.bpm.load(Relaxed);
         assert!(bpm >= 60);
+    }
+
+    // -- Synth preset tests --
+
+    #[test]
+    fn synth_presets_sane_ranges() {
+        for preset in &SYNTH_PRESETS {
+            assert!(preset.num_voices >= 1 && preset.num_voices <= 7,
+                "{}: voices {} out of 1-7", preset.name, preset.num_voices);
+            assert!(preset.detune_cents >= 0.0 && preset.detune_cents <= 60.0,
+                "{}: detune {} out of 0-60", preset.name, preset.detune_cents);
+            // filter_base 0.0 means bypass (Raw), otherwise >= 200
+            assert!(preset.filter_base == 0.0 || preset.filter_base >= 200.0,
+                "{}: filter_base {} invalid", preset.name, preset.filter_base);
+            assert!(preset.saw_mix >= 0.0 && preset.saw_mix <= 1.0,
+                "{}: saw_mix {} out of 0-1", preset.name, preset.saw_mix);
+        }
+    }
+
+    #[test]
+    fn raw_preset_is_single_voice_no_effects() {
+        let raw = &SYNTH_PRESETS[6];
+        assert_eq!(raw.name, "Raw");
+        assert_eq!(raw.num_voices, 1);
+        assert_eq!(raw.detune_cents, 0.0);
+        assert_eq!(raw.harmonic_2nd, 0.0);
+        assert_eq!(raw.harmonic_3rd, 0.0);
+        assert_eq!(raw.sub_level, 0.0);
+        assert_eq!(raw.filter_base, 0.0); // bypass
+        assert_eq!(raw.chorus_depth, 0.0);
+    }
+
+    #[test]
+    fn preset_count_matches() {
+        assert_eq!(SYNTH_PRESETS.len(), 7);
+    }
+
+    #[test]
+    fn default_preset_is_iceman() {
+        let state = PlayerState::new(0);
+        let idx = state.synth_preset.load(Relaxed) as usize;
+        assert_eq!(idx, 2);
+        assert_eq!(SYNTH_PRESETS[idx].name, "Iceman");
+    }
+
+    #[test]
+    fn sustain_toggle() {
+        let state = PlayerState::new(0);
+        assert!(!state.sustain.load(Relaxed), "sustain should start off");
+        state.sustain.store(true, Relaxed);
+        assert!(state.sustain.load(Relaxed));
+        state.sustain.store(false, Relaxed);
+        assert!(!state.sustain.load(Relaxed));
     }
 }
