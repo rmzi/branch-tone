@@ -1,5 +1,17 @@
 /target
 .claude/settings.local.json
+.claude/.pds-version
+test-tones.sh
+
+# PDS skills (keep only project-specific skills tracked)
+.claude/skills/commit.md
+.claude/skills/debug.md
+.claude/skills/design.md
+.claude/skills/ethos.md
+.claude/skills/quickref.md
+.claude/skills/review.md
+.claude/skills/test.md
+.claude/skills/worktree.md
 
 # Worktrees
 .worktrees/

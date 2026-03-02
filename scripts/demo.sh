@@ -2,7 +2,7 @@
 # demo.sh — Play branch-tone hook sound for repos in a directory
 #
 # Usage:
-#   ./scripts/demo.sh                  # scan ~/dev and ~/dev/personal
+#   ./scripts/demo.sh                  # scan current directory for git repos
 #   ./scripts/demo.sh /path/to/repos   # scan a specific directory
 #   ./scripts/demo.sh --all            # include worktrees too
 #
@@ -21,9 +21,9 @@ for arg in "$@"; do
     esac
 done
 
-# Default: scan ~/dev and ~/dev/personal
+# Default: scan current directory
 if [[ ${#DIRS[@]} -eq 0 ]]; then
-    DIRS=("$HOME/dev" "$HOME/dev/personal")
+    DIRS=(".")
 fi
 
 # Collect repos: any directory containing a .git dir/file

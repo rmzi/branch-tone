@@ -1,42 +1,23 @@
-# Portable Development System
+# branch-tone
 
-Terminal-first, AI-assisted dev methodology using worktrees for isolation.
+## Architecture
 
-## Skills System (MANDATORY)
+Single-file Rust application (`src/main.rs`, ~4000 lines). Everything — CLI, hashing, synthesis, audio output, step sequencer — lives in one file.
 
-**CRITICAL: Skills in `.claude/skills/` contain workflow patterns and requirements. Skipping relevant skills leads to inconsistent implementations and rework.**
+## Build & Test
 
-### Workflow
+```bash
+cargo test              # 57 tests, must pass with zero warnings
+cargo build --release   # Optimized binary
+cargo install --path .  # Install to ~/.cargo/bin/
+```
 
-1. **At session start**:
-   - Check `.claude/.pds-version` against https://raw.githubusercontent.com/rmzi/portable-dev-system/main/VERSION
-   - If outdated: run `pds-update`, commit the changes, and create a PR (or add to existing PR)
-   - Scan `.claude/skills/*.md` to understand available capabilities
-2. **Before any task**: Check if the task matches a skill (commit, review, debug, test, design, etc.)
-3. **During work**: Read and follow the skill documentation before performing the action
-4. **When stuck**: Read `/ethos` for principles, `/debug` for systematic troubleshooting
+## Key Concepts
 
-### Rule
+- **Two-layer hashing**: repo name → harmonic identity (key, scale, timbre, pad shape); branch name → melodic identity (pattern, rhythm, envelope)
+- **Event seeds**: each Claude Code hook event gets a unique seed that rotates pattern, pad shape, and drum hit type — same repo sounds different per event
+- **Deterministic**: same inputs always produce the same sound
 
-**Before performing ANY action, check if a skill exists for it. If a relevant skill exists, read it FIRST.**
+## After Code Changes
 
-### Available Skills
-
-| Skill | When to Use |
-|-------|-------------|
-| `/ethos` | Starting work, when stuck, need principles |
-| `/commit` | Before any git commit |
-| `/review` | Before submitting or reviewing PRs |
-| `/debug` | When troubleshooting issues |
-| `/test` | Writing or running tests |
-| `/design` | Architecture decisions, new features |
-| `/worktree` | Branch isolation, parallel work |
-| `/quickref` | Command reference |
-
----
-
-## Key Commands
-
-- `wty` - Open worktree in tmux layout
-- `wta -b feature/x` - Create new worktree + branch
-- `clauder` - Resume Claude session for current directory
+Run `/install` to build and install the latest binary. The Claude Code hooks call the installed binary, not the dev build — stale installs mean the user hears old sounds.

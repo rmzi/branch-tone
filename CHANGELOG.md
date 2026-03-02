@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.8.0] - 2026-03-02
+
+### Added
+- **Event categories**: `EventCategory` enum (SessionBoundary, Attention, DrumHit, Ambient) with per-category octave offset, transposition, and step count
+- **Single drum hits**: Short percussive events (Stop, UserPromptSubmit) play a single kick/snare/rimshot/hat (~125–300ms) instead of full melodies
+- **Rimshot synthesis**: New `synth_rimshot` — click transient + resonant ring + filtered noise
+- **Event seeds**: Each Claude Code hook event gets a unique seed (1–10) that rotates note pattern, pad shape, and drum hit type — you can tell which event fired by ear
+- **Per-event sound identity**: SessionStart/End play different pad shapes, Stop/UserPromptSubmit use different hit types, all while varying by repo+branch
+- **Dub delay effect**: Tape-style echo with wow/flutter, filtered feedback, gradual decay (`--dub`)
+- **Spooky mode**: Thin sines, dark filter, eerie resonance (`--spooky`)
+- **Interactive piano keyboard**: Chromatic keys (A–L naturals, W/E/T/Y/U/O/P accidentals) in the step sequencer
+- **7 synth presets**: Juno, Supersaw, Iceman, M1, Bulldozer, Raw — each with multi-voice architecture inspired by jungle/liquid DnB hardware
+- **Piano controls**: Octave shift (`[`/`]`), synth preset (`,`/`.`), pad shape (`;`/`'`), sustain (`Tab`)
+- **TeammateIdle hook**: Clean gentle ping for idle teammate notifications
+- 18 new tests (57 total) covering event categories, single hits, rimshot synthesis, drum hit determinism, event seed rotation
+
+### Changed
+- **Hook event remapping**: Sessions → pads with chorus/tremolo+dub; Stop/UserPromptSubmit → single drum hits; Alerts → pad+tremolo/chorus; hooks now cover 10 events
+- **Synth preset dominance**: Preset timbral weight increased from 70% to 85% over hash-derived values for more dramatic per-preset character
+- **SessionEnd** uses tremolo (not chorus) to differentiate from SessionStart
+- `scripts/demo.sh` defaults to current directory instead of hardcoded paths
+- Cleaned up PDS-specific files from tracked git files for public release
+
+### Fixed
+- Event seed collisions resolved (each of 10 events has a unique seed)
+
 ## [0.7.0] - 2026-02-16
 
 ### Added

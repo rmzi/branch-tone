@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "Notification": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "SubagentStart": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "SubagentStop": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "PreCompact": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "TeammateIdle": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }]
+  }
+}

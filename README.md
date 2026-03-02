@@ -6,7 +6,7 @@
   <p align="center">
     <a href="https://github.com/rmzi/branch-tone/releases"><img alt="Version" src="https://img.shields.io/badge/version-0.8.0-blue?style=flat-square"></a>
     <a href="https://www.rust-lang.org/"><img alt="Rust" src="https://img.shields.io/badge/rust-2024_edition-orange?style=flat-square&logo=rust"></a>
-    <a href="https://github.com/rmzi/branch-tone/blob/master/LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-green?style=flat-square"></a>
+    <a href="https://github.com/rmzi/branch-tone/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-green?style=flat-square"></a>
     <a href="#"><img alt="Platform" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey?style=flat-square"></a>
     <a href="#claude-code-hooks"><img alt="Claude Code" src="https://img.shields.io/badge/Claude_Code-hooks-blueviolet?style=flat-square"></a>
   </p>
@@ -29,15 +29,21 @@ The result is ethereal, spaceship-like tones that ring out and overlap — inspi
 ## Install
 
 ```bash
-cargo install --git https://github.com/rmzi/branch-tone
+curl -sSL https://raw.githubusercontent.com/rmzi/branch-tone/main/install.sh | sh
 ```
 
-Or build from source:
+Then register the Claude Code plugin:
 
 ```bash
-git clone https://github.com/rmzi/branch-tone
-cd branch-tone
-cargo install --path .
+branch-tone init                        # User scope (all projects)
+branch-tone init --scope project        # Project scope (team-shared)
+```
+
+Or manually:
+
+```bash
+cargo install --git https://github.com/rmzi/branch-tone
+branch-tone init
 ```
 
 ## Quick Start
@@ -229,7 +235,7 @@ function wt() {
 ### Demo: Hear All Your Repos
 
 ```bash
-./scripts/demo.sh                    # Scan ~/dev and ~/dev/personal
+./scripts/demo.sh                    # Scan current directory for git repos
 ./scripts/demo.sh /path/to/repos     # Scan a specific directory
 ./scripts/demo.sh --all              # Include worktrees
 ```

@@ -1,0 +1,12 @@
+{
+  "name": "branch-tone",
+  "version": "0.8.0",
+  "description": "Hear your git context. Every repo has a voice. Every branch has a melody.",
+  "author": {
+    "name": "Ramzi Abdoch",
+    "repository": "https://github.com/rmzi/branch-tone"
+  },
+  "homepage": "https://github.com/rmzi/branch-tone",
+  "hooks": "../hooks/hooks.json",
+  "settings": "../settings.json"
+}

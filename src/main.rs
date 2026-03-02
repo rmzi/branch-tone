@@ -136,11 +136,25 @@ enum Command {
     /// Read Claude Code hook JSON from stdin, detect branch, play tone
     Hook,
 
-    /// Wire up Claude Code hooks (updates settings.json)
-    Init,
+    /// Register Claude Code hooks
+    Init {
+        /// Installation scope: user (default), project, or local
+        #[arg(long, default_value = "user")]
+        scope: String,
+        /// Use legacy direct settings.json patching instead of plugin system
+        #[arg(long)]
+        legacy: bool,
+    },
 
     /// Alias for init — update hooks in settings.json
     Update,
+
+    /// Remove legacy hooks from settings.json and install the plugin
+    LegacyCleanup {
+        /// Installation scope: user (default), project, or local
+        #[arg(long, default_value = "user")]
+        scope: String,
+    },
 
     /// Test all hook sounds for a git repo
     Test(TestArgs),
@@ -1404,7 +1418,9 @@ fn main() -> Result<()> {
 
     match cli.command {
         Some(Command::Hook) => run_hook(),
-        Some(Command::Init) | Some(Command::Update) => run_init(),
+        Some(Command::Init { scope, legacy }) => run_init(&scope, legacy),
+        Some(Command::Update) => run_init("user", false),
+        Some(Command::LegacyCleanup { scope }) => run_legacy_cleanup(&scope),
         Some(Command::Play(args)) => run_play(args),
         Some(Command::Test(args)) => run_test(args),
         Some(Command::Player { pattern, bpm }) => run_player(pattern, bpm),
@@ -1846,7 +1862,75 @@ fn run_hook() -> Result<()> {
 // INIT SUBCOMMAND
 // -----------------------------------------------------------------------------
 
-fn run_init() -> Result<()> {
+fn run_init(scope: &str, legacy: bool) -> Result<()> {
+    if legacy {
+        return run_init_legacy();
+    }
+
+    // Validate scope
+    match scope {
+        "user" | "project" | "local" => {}
+        _ => anyhow::bail!("Invalid scope '{}'. Must be one of: user, project, local", scope),
+    }
+
+    // Check for claude CLI
+    let claude_path = which_in_path("claude");
+    if claude_path.is_none() {
+        println!("Claude CLI not found in PATH.");
+        println!("Install it from: https://docs.anthropic.com/en/docs/claude-code");
+        println!();
+        println!("Or use legacy mode to patch settings.json directly:");
+        println!("  branch-tone init --legacy");
+        return Ok(());
+    }
+
+    // Add marketplace
+    println!("Adding branch-tone marketplace...");
+    let marketplace_status = std::process::Command::new("claude")
+        .args(["plugin", "marketplace", "add", "rmzi/branch-tone"])
+        .status()
+        .context("Failed to run 'claude plugin marketplace add'")?;
+
+    if !marketplace_status.success() {
+        println!("Warning: marketplace add returned non-zero exit code.");
+        println!("The plugin system may not be available in your version of Claude Code.");
+        println!();
+        println!("Falling back to legacy mode...");
+        return run_init_legacy();
+    }
+
+    // Install plugin
+    println!("Installing branch-tone plugin ({} scope)...", scope);
+    let install_status = std::process::Command::new("claude")
+        .args(["plugin", "install", "branch-tone@branch-tone", "--scope", scope])
+        .status()
+        .context("Failed to run 'claude plugin install'")?;
+
+    if !install_status.success() {
+        println!("Warning: plugin install returned non-zero exit code.");
+        println!();
+        println!("Falling back to legacy mode...");
+        return run_init_legacy();
+    }
+
+    println!();
+    println!("✓ branch-tone plugin installed ({} scope)", scope);
+    print_init_summary();
+    Ok(())
+}
+
+/// Check if a command exists in PATH
+fn which_in_path(cmd: &str) -> Option<std::path::PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|dir| {
+            let full = dir.join(cmd);
+            if full.is_file() { Some(full) } else { None }
+        })
+    })
+}
+
+/// Legacy init: directly patch ~/.claude/settings.json
+fn run_init_legacy() -> Result<()> {
     let home = dirs::home_dir().context("Could not determine home directory")?;
 
     // Clean up old hook.sh if it exists
@@ -2009,6 +2093,11 @@ fn run_init() -> Result<()> {
         println!("✓ Added branch-tone to sandbox.excludedCommands");
     }
 
+    print_init_summary();
+    Ok(())
+}
+
+fn print_init_summary() {
     println!("\nbranch-tone is ready! Claude Code will play tones on:");
     println!("  Session:  SessionStart (2s pad+chorus+dub) · SessionEnd (2s pad+tremolo+dub)");
     println!("  Rhythm:   Stop (300ms hit) · UserPromptSubmit (250ms hit)");
@@ -2017,8 +2106,122 @@ fn run_init() -> Result<()> {
     println!("  Waiting:  TeammateIdle (600ms)");
     println!();
     println!("Interactive sequencer: branch-tone player");
+}
 
-    Ok(())
+// -----------------------------------------------------------------------------
+// LEGACY CLEANUP SUBCOMMAND
+// -----------------------------------------------------------------------------
+
+fn run_legacy_cleanup(scope: &str) -> Result<()> {
+    let home = dirs::home_dir().context("Could not determine home directory")?;
+    let settings_path = home.join(".claude").join("settings.json");
+
+    if !settings_path.exists() {
+        println!("No settings.json found at {}", settings_path.display());
+        println!("Nothing to clean up. Installing plugin...");
+        println!();
+        return run_init(scope, false);
+    }
+
+    let content = std::fs::read_to_string(&settings_path)
+        .with_context(|| format!("Failed to read {}", settings_path.display()))?;
+    let mut settings: serde_json::Value = serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse {}", settings_path.display()))?;
+
+    let mut hooks_removed = 0;
+
+    // Remove branch-tone hooks from each event
+    if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+        for event in HOOK_EVENTS {
+            if let Some(event_hooks) = hooks.get_mut(event).and_then(|e| e.as_array_mut()) {
+                let before = event_hooks.len();
+                event_hooks.retain(|entry| {
+                    // Old format: flat {type, command}
+                    if let Some(cmd) = entry.get("command").and_then(|c| c.as_str()) {
+                        if cmd.contains("branch-tone") { return false; }
+                    }
+                    // New format: {hooks: [{type, command}]}
+                    if let Some(inner) = entry.get("hooks").and_then(|h| h.as_array()) {
+                        let all_bt = inner.iter().all(|h| {
+                            h.get("command").and_then(|c| c.as_str())
+                                .map_or(false, |c| c.contains("branch-tone"))
+                        });
+                        if all_bt && !inner.is_empty() { return false; }
+                    }
+                    true
+                });
+                hooks_removed += before - event_hooks.len();
+            }
+        }
+        // Remove empty event arrays
+        let empty_events: Vec<String> = hooks.iter()
+            .filter(|(_, v)| v.as_array().map_or(false, |a| a.is_empty()))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in empty_events {
+            hooks.remove(&key);
+        }
+    }
+    // Remove hooks key if empty
+    if settings.get("hooks").and_then(|h| h.as_object()).map_or(false, |h| h.is_empty()) {
+        settings.as_object_mut().unwrap().remove("hooks");
+    }
+
+    // Remove Bash(branch-tone*) from permissions.allow
+    let mut permission_removed = false;
+    if let Some(allow) = settings.pointer_mut("/permissions/allow").and_then(|a| a.as_array_mut()) {
+        let before = allow.len();
+        allow.retain(|v| v.as_str() != Some("Bash(branch-tone*)"));
+        permission_removed = allow.len() < before;
+        // Clean up empty allow array → remove permissions object if empty
+        if allow.is_empty() {
+            if let Some(perms) = settings.get_mut("permissions").and_then(|p| p.as_object_mut()) {
+                perms.remove("allow");
+                if perms.is_empty() {
+                    settings.as_object_mut().unwrap().remove("permissions");
+                }
+            }
+        }
+    }
+
+    // Remove branch-tone from sandbox.excludedCommands
+    let mut sandbox_removed = false;
+    if let Some(excluded) = settings.pointer_mut("/sandbox/excludedCommands").and_then(|a| a.as_array_mut()) {
+        let before = excluded.len();
+        excluded.retain(|v| v.as_str() != Some("branch-tone"));
+        sandbox_removed = excluded.len() < before;
+        if excluded.is_empty() {
+            if let Some(sb) = settings.get_mut("sandbox").and_then(|s| s.as_object_mut()) {
+                sb.remove("excludedCommands");
+                if sb.is_empty() {
+                    settings.as_object_mut().unwrap().remove("sandbox");
+                }
+            }
+        }
+    }
+
+    // Write back
+    let json_str = serde_json::to_string_pretty(&settings)
+        .context("Failed to serialize settings.json")?;
+    std::fs::write(&settings_path, format!("{}\n", json_str))
+        .with_context(|| format!("Failed to write {}", settings_path.display()))?;
+
+    if hooks_removed > 0 {
+        println!("✓ Removed {} legacy hook(s) from {}", hooks_removed, settings_path.display());
+    } else {
+        println!("✓ No legacy hooks found in {}", settings_path.display());
+    }
+    if permission_removed {
+        println!("✓ Removed Bash(branch-tone*) from permissions.allow");
+    }
+    if sandbox_removed {
+        println!("✓ Removed branch-tone from sandbox.excludedCommands");
+    }
+    println!();
+
+    // Install via plugin system
+    println!("Installing plugin...");
+    run_init(scope, false)
 }
 
 // -----------------------------------------------------------------------------
@@ -4073,5 +4276,182 @@ mod tests {
                     HOOK_EVENTS[i], HOOK_EVENTS[j], seeds[i]);
             }
         }
+    }
+
+    // -- Init CLI arg tests --
+
+    #[test]
+    fn init_scope_default_is_user() {
+        let cli = Cli::try_parse_from(["branch-tone", "init"]).unwrap();
+        match cli.command {
+            Some(Command::Init { scope, legacy }) => {
+                assert_eq!(scope, "user", "default scope should be 'user'");
+                assert!(!legacy, "legacy should default to false");
+            }
+            other => panic!("expected Init, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn init_legacy_flag_exists() {
+        let cli = Cli::try_parse_from(["branch-tone", "init", "--legacy"]).unwrap();
+        match cli.command {
+            Some(Command::Init { scope, legacy }) => {
+                assert!(legacy, "--legacy flag should be true");
+                assert_eq!(scope, "user", "scope should still default to 'user'");
+            }
+            other => panic!("expected Init, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn init_scope_accepts_project() {
+        let cli = Cli::try_parse_from(["branch-tone", "init", "--scope", "project"]).unwrap();
+        match cli.command {
+            Some(Command::Init { scope, .. }) => {
+                assert_eq!(scope, "project");
+            }
+            other => panic!("expected Init, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn init_scope_accepts_local() {
+        let cli = Cli::try_parse_from(["branch-tone", "init", "--scope", "local"]).unwrap();
+        match cli.command {
+            Some(Command::Init { scope, .. }) => {
+                assert_eq!(scope, "local");
+            }
+            other => panic!("expected Init, got {:?}", other),
+        }
+    }
+
+    // -- Legacy cleanup tests --
+
+    #[test]
+    fn legacy_cleanup_cli_parses() {
+        let cli = Cli::try_parse_from(["branch-tone", "legacy-cleanup"]).unwrap();
+        match cli.command {
+            Some(Command::LegacyCleanup { scope }) => {
+                assert_eq!(scope, "user", "default scope should be 'user'");
+            }
+            other => panic!("expected LegacyCleanup, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn legacy_cleanup_cli_accepts_scope() {
+        let cli = Cli::try_parse_from(["branch-tone", "legacy-cleanup", "--scope", "project"]).unwrap();
+        match cli.command {
+            Some(Command::LegacyCleanup { scope }) => {
+                assert_eq!(scope, "project");
+            }
+            other => panic!("expected LegacyCleanup, got {:?}", other),
+        }
+    }
+
+    /// Helper: simulate the cleanup logic on an in-memory settings value
+    fn apply_legacy_cleanup(settings: &mut serde_json::Value) {
+        if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+            for event in HOOK_EVENTS {
+                if let Some(event_hooks) = hooks.get_mut(event).and_then(|e| e.as_array_mut()) {
+                    event_hooks.retain(|entry| {
+                        if let Some(cmd) = entry.get("command").and_then(|c| c.as_str()) {
+                            if cmd.contains("branch-tone") { return false; }
+                        }
+                        if let Some(inner) = entry.get("hooks").and_then(|h| h.as_array()) {
+                            let all_bt = inner.iter().all(|h| {
+                                h.get("command").and_then(|c| c.as_str())
+                                    .map_or(false, |c| c.contains("branch-tone"))
+                            });
+                            if all_bt && !inner.is_empty() { return false; }
+                        }
+                        true
+                    });
+                }
+            }
+            let empty_events: Vec<String> = hooks.iter()
+                .filter(|(_, v)| v.as_array().map_or(false, |a| a.is_empty()))
+                .map(|(k, _)| k.clone())
+                .collect();
+            for key in empty_events {
+                hooks.remove(&key);
+            }
+        }
+        if settings.get("hooks").and_then(|h| h.as_object()).map_or(false, |h| h.is_empty()) {
+            settings.as_object_mut().unwrap().remove("hooks");
+        }
+
+        if let Some(allow) = settings.pointer_mut("/permissions/allow").and_then(|a| a.as_array_mut()) {
+            allow.retain(|v| v.as_str() != Some("Bash(branch-tone*)"));
+        }
+        if let Some(excluded) = settings.pointer_mut("/sandbox/excludedCommands").and_then(|a| a.as_array_mut()) {
+            excluded.retain(|v| v.as_str() != Some("branch-tone"));
+        }
+    }
+
+    #[test]
+    fn legacy_cleanup_removes_branch_tone_hooks() {
+        let mut settings = serde_json::json!({});
+        apply_hook_init(&mut settings);
+
+        // Add an unrelated hook to Stop
+        settings["hooks"]["Stop"].as_array_mut().unwrap()
+            .push(serde_json::json!({"hooks": [{"type": "command", "command": "other-tool"}]}));
+
+        // Verify branch-tone hooks are present
+        assert_eq!(settings["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+        assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 2);
+
+        apply_legacy_cleanup(&mut settings);
+
+        // branch-tone hooks should be gone
+        // Stop should still have the other-tool hook
+        let stop = settings["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 1, "Stop should only have the unrelated hook");
+        assert_eq!(stop[0]["hooks"][0]["command"], "other-tool");
+
+        // Events that only had branch-tone hooks should be cleaned up
+        assert!(settings["hooks"].get("SessionStart").is_none()
+            || settings["hooks"]["SessionStart"].as_array().unwrap().is_empty()
+            || settings.get("hooks").is_none(),
+            "SessionStart should be empty or removed");
+    }
+
+    #[test]
+    fn legacy_cleanup_removes_permissions_and_sandbox() {
+        let mut settings = serde_json::json!({
+            "permissions": { "allow": ["Bash(branch-tone*)", "Bash(other-tool*)"] },
+            "sandbox": { "excludedCommands": ["branch-tone", "other-tool"] }
+        });
+
+        apply_legacy_cleanup(&mut settings);
+
+        let allow = settings["permissions"]["allow"].as_array().unwrap();
+        assert_eq!(allow.len(), 1);
+        assert_eq!(allow[0], "Bash(other-tool*)");
+
+        let excluded = settings["sandbox"]["excludedCommands"].as_array().unwrap();
+        assert_eq!(excluded.len(), 1);
+        assert_eq!(excluded[0], "other-tool");
+    }
+
+    #[test]
+    fn legacy_cleanup_preserves_unrelated_settings() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "Stop": [
+                    {"hooks": [{"type": "command", "command": "other-tool"}]}
+                ]
+            },
+            "someOtherKey": "preserved"
+        });
+
+        apply_legacy_cleanup(&mut settings);
+
+        assert_eq!(settings["someOtherKey"], "preserved");
+        let stop = settings["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 1);
+        assert_eq!(stop[0]["hooks"][0]["command"], "other-tool");
     }
 }
