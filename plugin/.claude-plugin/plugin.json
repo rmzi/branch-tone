@@ -7,6 +7,20 @@
     "repository": "https://github.com/rmzi/branch-tone"
   },
   "homepage": "https://github.com/rmzi/branch-tone",
-  "hooks": "../hooks/hooks.json",
-  "settings": "../settings.json"
+  "hooks": {
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "Notification": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "SubagentStart": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "SubagentStop": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "PreCompact": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "TeammateIdle": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }]
+  },
+  "settings": {
+    "permissions": { "allow": ["Bash(branch-tone*)"] },
+    "sandbox": { "excludedCommands": ["branch-tone"] }
+  }
 }
