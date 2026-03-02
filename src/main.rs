@@ -1820,7 +1820,10 @@ fn run_hook() -> Result<()> {
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&input) {
         let cwd = json.get("cwd").and_then(|v| v.as_str()).unwrap_or(".");
         let _ = std::env::set_current_dir(cwd);
-        if let Some(ht) = json.get("hook_type").and_then(|v| v.as_str()) {
+        // Plugin system sends "hook_event_name"; legacy sends "hook_type"
+        if let Some(ht) = json.get("hook_event_name").and_then(|v| v.as_str())
+            .or_else(|| json.get("hook_type").and_then(|v| v.as_str()))
+        {
             hook_type = ht.to_string();
         }
     }
