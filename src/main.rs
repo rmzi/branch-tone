@@ -91,6 +91,22 @@ struct PlayArgs {
     #[arg(long, hide = true)]
     dub_delay: bool,
 
+    /// Layer melody over drums (used by hook for hybrid events)
+    #[arg(long, hide = true)]
+    melody_over_drums: bool,
+
+    /// Single drum hit mode (used by hook for short percussive events)
+    #[arg(long, hide = true)]
+    single_hit: bool,
+
+    /// Event category for melodic variation (not a CLI arg)
+    #[arg(skip)]
+    event_category: EventCategory,
+
+    /// Per-event seed: rotates pattern/hit so each hook sounds distinct (not a CLI arg)
+    #[arg(skip)]
+    event_seed: u8,
+
     /// Override drum break pattern (0=Amen, 1=Think, 2=Funky Drummer, 3=Apache,
     /// 4=Skull Snaps, 5=One Drop, 6=Steppers, 7=Rockers, 8=Dancehall, 9=Two-Step)
     #[arg(long, hide = true)]
@@ -233,18 +249,66 @@ struct Effects {
     bulldozer: bool, // Pad + arp shimmer layer
     drums: bool,     // Drum break mode (SessionStart/End)
     dub_delay: bool, // Tape delay effect (dub echo)
+    melody_over_drums: bool, // Layer tonal generators over drums
+    single_hit: bool, // Single drum hit (short percussive events)
 }
 
 impl Effects {
     /// Get effects + steps for a repo's hashed mode index
     fn from_mode(mode_idx: usize) -> (Self, u8) {
         match mode_idx {
-            0 => (Effects { pad: false, chorus: false, tremolo: false, bulldozer: false, drums: false, dub_delay: false }, 3),
-            1 => (Effects { pad: false, chorus: true,  tremolo: false, bulldozer: false, drums: false, dub_delay: false }, 5),
-            2 => (Effects { pad: true,  chorus: true,  tremolo: false, bulldozer: false, drums: false, dub_delay: false }, 5),
-            3 => (Effects { pad: false, chorus: true,  tremolo: false, bulldozer: true,  drums: false, dub_delay: false }, 5),
-            4 => (Effects { pad: false, chorus: true,  tremolo: true,  bulldozer: false, drums: false, dub_delay: false }, 3),
-            _ => (Effects { pad: false, chorus: true,  tremolo: false, bulldozer: false, drums: false, dub_delay: false }, 3),
+            0 => (Effects { pad: false, chorus: false, tremolo: false, bulldozer: false, drums: false, dub_delay: false, melody_over_drums: false, single_hit: false }, 3),
+            1 => (Effects { pad: false, chorus: true,  tremolo: false, bulldozer: false, drums: false, dub_delay: false, melody_over_drums: false, single_hit: false }, 5),
+            2 => (Effects { pad: true,  chorus: true,  tremolo: false, bulldozer: false, drums: false, dub_delay: false, melody_over_drums: false, single_hit: false }, 5),
+            3 => (Effects { pad: false, chorus: true,  tremolo: false, bulldozer: true,  drums: false, dub_delay: false, melody_over_drums: false, single_hit: false }, 5),
+            4 => (Effects { pad: false, chorus: true,  tremolo: true,  bulldozer: false, drums: false, dub_delay: false, melody_over_drums: false, single_hit: false }, 3),
+            _ => (Effects { pad: false, chorus: true,  tremolo: false, bulldozer: false, drums: false, dub_delay: false, melody_over_drums: false, single_hit: false }, 3),
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// EVENT CATEGORIES — shape how hook events sound
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+enum EventCategory {
+    SessionBoundary, // SessionStart/End: long pads
+    Attention,       // PermissionRequest, Notification: alert pads
+    DrumHit,         // Stop, UserPromptSubmit: short percussive
+    Ambient,         // SubagentStart/Stop, PreCompact: soft background
+    #[default]
+    Default,         // CLI / unknown
+}
+
+impl EventCategory {
+    fn octave_offset(&self) -> f32 {
+        match self {
+            Self::SessionBoundary => 1.0,
+            Self::Attention => 1.5,
+            Self::DrumHit => 1.0,
+            Self::Ambient => 0.75,
+            Self::Default => 1.0,
+        }
+    }
+
+    fn transpose_semitones(&self) -> i32 {
+        match self {
+            Self::SessionBoundary => 0,
+            Self::Attention => 5,
+            Self::DrumHit => 0,
+            Self::Ambient => -3,
+            Self::Default => 0,
+        }
+    }
+
+    fn effective_steps(&self, base: u8) -> u8 {
+        match self {
+            Self::SessionBoundary => 5,
+            Self::Attention => base.max(3),
+            Self::DrumHit => 1,
+            Self::Ambient => base.min(3),
+            Self::Default => base,
         }
     }
 }
@@ -547,6 +611,44 @@ fn synth_hihat(time: f32, open: bool, noise_seed: f32) -> f32 {
               + (2.0 * PI * 10000.0 * time).sin() * 0.34;
 
     (noise * 0.5 + metal * 0.5) * amp
+}
+
+/// Rimshot: short pitched click + resonant ring.
+fn synth_rimshot(time: f32, noise_seed: f32) -> f32 {
+    if time < 0.0 { return 0.0; }
+
+    // Sharp click
+    let click = (2.0 * PI * 900.0 * time).sin() * (-80.0 * time).exp();
+
+    // Resonant ring (higher pitched than snare body)
+    let ring = (2.0 * PI * 420.0 * time).sin() * (-25.0 * time).exp();
+
+    // Light noise
+    let noise = pseudo_noise(time * 44100.0, noise_seed + 200.0) * (-60.0 * time).exp();
+
+    (click * 0.4 + ring * 0.45 + noise * 0.15) * 1.2
+}
+
+/// Drum hit types for single-hit events
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DrumHitType {
+    Kick,
+    Snare,
+    Rimshot,
+    ClosedHat,
+}
+
+/// Generate a single drum hit (~125ms decay) for short percussive events.
+fn generate_single_hit(time: f32, sample_rate: f32, voice: &RepoVoice) -> f32 {
+    let decay_env = (-8.0 * time).exp(); // ~125ms effective decay
+    let noise_seed = voice.snare_tone * 100.0;
+    let raw = match voice.drum_hit_type {
+        DrumHitType::Kick => synth_kick(time, sample_rate) * voice.kick_decay,
+        DrumHitType::Snare => synth_snare(time, noise_seed) * voice.snare_tone,
+        DrumHitType::Rimshot => synth_rimshot(time, noise_seed),
+        DrumHitType::ClosedHat => synth_hihat(time, false, noise_seed) * voice.hihat_brightness,
+    };
+    raw * decay_env
 }
 
 // -----------------------------------------------------------------------------
@@ -956,6 +1058,10 @@ struct RepoVoice {
     delay_feedback: f32,      // 0.30–0.60
     delay_filter_cutoff: f32, // 2000–3500Hz
     delay_wow_rate: f32,      // 0.5–2.0Hz
+    // Synth preset (hash byte 22)
+    synth_preset_idx: usize,  // index into SYNTH_PRESETS
+    // Single-hit drum type (hash byte 23)
+    drum_hit_type: DrumHitType,
 }
 
 impl RepoVoice {
@@ -1018,6 +1124,17 @@ impl RepoVoice {
         let delay_filter_cutoff = 2000.0 + (hash[20] as f32 / 255.0) * 1500.0;
         let delay_wow_rate = 0.5 + (hash[21] as f32 / 255.0) * 1.5;
 
+        // Synth preset: deterministic per-repo (hash byte 22)
+        let synth_preset_idx = (hash[22] as usize) % SYNTH_PRESETS.len();
+
+        // Single-hit drum type (hash byte 23)
+        let drum_hit_type = match hash[23] % 4 {
+            0 => DrumHitType::Kick,
+            1 => DrumHitType::Snare,
+            2 => DrumHitType::Rimshot,
+            _ => DrumHitType::ClosedHat,
+        };
+
         Self {
             root_name,
             scale_name,
@@ -1042,6 +1159,26 @@ impl RepoVoice {
             delay_feedback,
             delay_filter_cutoff,
             delay_wow_rate,
+            synth_preset_idx,
+            drum_hit_type,
+        }
+    }
+
+    /// Blend repo's synth preset (85%) with hash-derived values (15%)
+    fn effective_timbral(&self) -> EffectiveTimbral {
+        let preset = &SYNTH_PRESETS[self.synth_preset_idx.min(SYNTH_PRESETS.len() - 1)];
+        EffectiveTimbral {
+            saw_mix: preset.saw_mix * 0.85 + self.saw_mix * 0.15,
+            num_voices: preset.num_voices as usize,
+            sub_level: preset.sub_level * 0.85 + self.sub_level * 0.15,
+            harmonic_blend: preset.harmonic_2nd * 0.7 + self.harmonic_blend * 0.3,
+            third_harmonic: preset.harmonic_3rd * 0.7 + self.third_harmonic * 0.3,
+            filter_base: preset.filter_base,
+            filter_env_amount: preset.filter_env_amount,
+            detune_cents: preset.detune_cents,
+            chorus_depth: preset.chorus_depth,
+            chorus_rate: preset.chorus_rate,
+            decay_rate: preset.decay_rate,
         }
     }
 
@@ -1052,6 +1189,22 @@ impl RepoVoice {
         self.sub_level *= 0.5;
         self.reverb_mix = (self.reverb_mix + 0.15).min(0.50);
     }
+}
+
+/// Blended timbral parameters: synth preset (85%/70%) + hash-derived (15%/30%)
+#[derive(Debug, Clone)]
+struct EffectiveTimbral {
+    saw_mix: f32,
+    num_voices: usize,
+    sub_level: f32,
+    harmonic_blend: f32,
+    third_harmonic: f32,
+    filter_base: f32,
+    filter_env_amount: f32,
+    detune_cents: f32,
+    chorus_depth: f32,
+    chorus_rate: f32,
+    decay_rate: f32,
 }
 
 /// Branch determines timing/rhythm: how notes enter, swing, modulation
@@ -1161,17 +1314,59 @@ struct PhraseParams {
     voice: RepoVoice,
     melody: BranchMelody,
     spooky: bool,
+    #[allow(dead_code)]
+    event_category: EventCategory,
 }
 
 impl PhraseParams {
-    fn from_identity(repo: &str, branch: &str, total_duration: u64, volume: f32, effects: Effects, steps: u8, spooky: bool) -> Self {
+    fn from_identity(repo: &str, branch: &str, total_duration: u64, volume: f32, effects: Effects, steps: u8, spooky: bool, event_category: EventCategory, event_seed: u8) -> Self {
         let mut voice = RepoVoice::from_repo(repo);
         if spooky { voice.make_spooky(); }
-        let melody = BranchMelody::from_branch(branch, steps);
+
+        // Apply event category transformations
+        let effective_steps = event_category.effective_steps(steps);
+        let octave_mult = event_category.octave_offset();
+        let transpose = event_category.transpose_semitones();
+
+        // Transpose scale frequencies
+        let transpose_ratio = 2.0_f32.powf(transpose as f32 / 12.0) * octave_mult;
+        for freq in &mut voice.scale_freqs {
+            *freq *= transpose_ratio;
+        }
+
+        // Rotate pattern index by event_seed — each event gets a different melody
+        // while staying in the repo's key/scale
+        if event_seed > 0 {
+            voice.pattern_idx = (voice.pattern_idx + event_seed as usize) % 8;
+        }
+
+        // Rotate pad shape by event_seed — each pad event gets a different envelope/filter
+        if event_seed > 0 {
+            let shape_idx = PAD_SHAPES.iter().position(|s| *s == voice.pad_shape).unwrap_or(0);
+            voice.pad_shape = PAD_SHAPES[(shape_idx + event_seed as usize) % PAD_SHAPES.len()];
+        }
+
+        // Rotate drum hit type by event_seed — each single-hit event gets a different sound
+        if event_seed > 0 {
+            let hit_idx = match voice.drum_hit_type {
+                DrumHitType::Kick => 0,
+                DrumHitType::Snare => 1,
+                DrumHitType::Rimshot => 2,
+                DrumHitType::ClosedHat => 3,
+            };
+            voice.drum_hit_type = match (hit_idx + event_seed as usize) % 4 {
+                0 => DrumHitType::Kick,
+                1 => DrumHitType::Snare,
+                2 => DrumHitType::Rimshot,
+                _ => DrumHitType::ClosedHat,
+            };
+        }
+
+        let melody = BranchMelody::from_branch(branch, effective_steps);
 
         // Notes from repo's pattern + scale (repo = identity),
         // interval_spread from branch adds subtle reharmonization
-        let notes: Vec<f32> = if steps >= 5 {
+        let notes: Vec<f32> = if effective_steps >= 5 {
             let pattern = PATTERNS_5[voice.pattern_idx];
             pattern.iter().map(|&offset| {
                 let spread_offset = (offset as f32 * melody.interval_spread).round() as i32;
@@ -1180,7 +1375,7 @@ impl PhraseParams {
             }).collect()
         } else {
             let pattern = PATTERNS_3[voice.pattern_idx];
-            pattern.iter().map(|&offset| {
+            pattern.iter().take(effective_steps as usize).map(|&offset| {
                 let spread_offset = (offset as f32 * melody.interval_spread).round() as i32;
                 let idx = spread_offset.rem_euclid(5) as usize;
                 voice.scale_freqs[idx]
@@ -1195,6 +1390,7 @@ impl PhraseParams {
             voice,
             melody,
             spooky,
+            event_category,
         }
     }
 }
@@ -1217,7 +1413,7 @@ fn main() -> Result<()> {
 }
 
 fn run_play(args: PlayArgs) -> Result<()> {
-    let PlayArgs { branch, repo, duration, volume, pad, chorus, tremolo, bulldozer, steps, spooky, reverse, randomize, drums, dub_delay, break_pattern, dry_run, quiet } = args;
+    let PlayArgs { branch, repo, duration, volume, pad, chorus, tremolo, bulldozer, steps, spooky, reverse, randomize, drums, dub_delay, melody_over_drums, single_hit, event_category, event_seed, break_pattern, dry_run, quiet } = args;
 
     // BRANCH_TONE_VOLUME scales all volumes (default 1.0, e.g. 3.0 = triple)
     let master_vol = std::env::var("BRANCH_TONE_VOLUME")
@@ -1241,20 +1437,23 @@ fn run_play(args: PlayArgs) -> Result<()> {
     };
 
     // If no explicit mode flags set, use repo's hashed mode
-    let explicit_mode = pad || chorus || tremolo || bulldozer || drums;
+    let explicit_mode = pad || chorus || tremolo || bulldozer || drums || single_hit;
     let (effects, steps) = if explicit_mode {
         (Effects {
-            pad: pad || bulldozer,
+            pad: pad || bulldozer || melody_over_drums,
             chorus: chorus || bulldozer,
             tremolo,
             bulldozer,
             drums,
             dub_delay,
+            melody_over_drums,
+            single_hit,
         }, steps)
     } else {
         let voice = RepoVoice::from_repo(&repo);
         let (mut eff, steps) = Effects::from_mode(voice.mode_idx);
         eff.dub_delay = dub_delay;
+        eff.melody_over_drums = melody_over_drums;
         (eff, steps)
     };
 
@@ -1265,7 +1464,7 @@ fn run_play(args: PlayArgs) -> Result<()> {
         duration
     };
 
-    let mut params = PhraseParams::from_identity(&repo, &branch, duration, volume, effects, steps, spooky);
+    let mut params = PhraseParams::from_identity(&repo, &branch, duration, volume, effects, steps, spooky, event_category, event_seed);
     if let Some(bp) = break_pattern {
         params.voice.drum_pattern_idx = bp % CLASSIC_BREAKS.len();
     }
@@ -1287,7 +1486,9 @@ fn run_play(args: PlayArgs) -> Result<()> {
 
     // Print info
     if !quiet {
-        let mode_label = if explicit_mode {
+        let mode_label = if single_hit {
+            "single hit"
+        } else if explicit_mode {
             if bulldozer { "bulldozer" }
             else if pad { "pad" }
             else if chorus { "chorus" }
@@ -1297,21 +1498,34 @@ fn run_play(args: PlayArgs) -> Result<()> {
             MODE_NAMES[params.voice.mode_idx]
         };
         let spooky_tag = if spooky { " 🎃" } else { "" };
+        let preset_name = SYNTH_PRESETS[params.voice.synth_preset_idx.min(SYNTH_PRESETS.len() - 1)].name;
+        let hit_tag = if single_hit {
+            let hit_name = match params.voice.drum_hit_type {
+                DrumHitType::Kick => "Kick",
+                DrumHitType::Snare => "Snare",
+                DrumHitType::Rimshot => "Rimshot",
+                DrumHitType::ClosedHat => "ClosedHat",
+            };
+            format!(" [{}]", hit_name)
+        } else { String::new() };
+        let hybrid_tag = if melody_over_drums { " +hybrid" } else { "" };
         let envelope_names = ["Punchy", "Soft", "Pluck", "Swell"];
-        println!("🎵 Repo: {} | Branch: {} [{}]{}", repo, branch, mode_label, spooky_tag);
-        let shape_name = PAD_SHAPE_NAMES[PAD_SHAPES.iter().position(|s| *s == params.voice.pad_shape).unwrap_or(0)];
-        println!("   Key: {} {} | Octave: {}x | Shape: {}", params.voice.root_name, params.voice.scale_name, params.voice.octave, shape_name);
-        println!("   Timbre: harmonic={:.2}, 3rd={:.2}", params.voice.harmonic_blend, params.voice.third_harmonic);
-        println!("   Notes: {:?}", params.notes.iter().map(|f| format!("{:.0}Hz", f)).collect::<Vec<_>>());
-        println!("   Pattern: #{} | Envelope: {} | Swing: {:.0}%",
-            params.voice.pattern_idx, envelope_names[params.melody.envelope_shape], params.melody.swing * 100.0);
-        println!("   Stagger: [{:.2}, {:.2}, {:.2}, {:.2}, {:.2}]",
-            params.melody.stagger_offsets[0], params.melody.stagger_offsets[1],
-            params.melody.stagger_offsets[2], params.melody.stagger_offsets[3],
-            params.melody.stagger_offsets[4]);
-        println!("   Spread: {:.2} | Duration: {}ms", params.melody.interval_spread, params.total_duration);
-        if chorus { println!("   + Chorus (detune: {:.1} cents)", params.melody.chorus_detune); }
-        if tremolo { println!("   + Tremolo ({:.1}Hz, {:.0}% depth)", params.melody.tremolo_rate, params.melody.tremolo_depth * 100.0); }
+        println!("🎵 Repo: {} | Branch: {} [{}] ({}){}{}{}", repo, branch, mode_label, preset_name, hit_tag, hybrid_tag, spooky_tag);
+        if !single_hit {
+            let shape_name = PAD_SHAPE_NAMES[PAD_SHAPES.iter().position(|s| *s == params.voice.pad_shape).unwrap_or(0)];
+            println!("   Key: {} {} | Octave: {}x | Shape: {}", params.voice.root_name, params.voice.scale_name, params.voice.octave, shape_name);
+            println!("   Timbre: harmonic={:.2}, 3rd={:.2}", params.voice.harmonic_blend, params.voice.third_harmonic);
+            println!("   Notes: {:?}", params.notes.iter().map(|f| format!("{:.0}Hz", f)).collect::<Vec<_>>());
+            println!("   Pattern: #{} | Envelope: {} | Swing: {:.0}%",
+                params.voice.pattern_idx, envelope_names[params.melody.envelope_shape], params.melody.swing * 100.0);
+            println!("   Stagger: [{:.2}, {:.2}, {:.2}, {:.2}, {:.2}]",
+                params.melody.stagger_offsets[0], params.melody.stagger_offsets[1],
+                params.melody.stagger_offsets[2], params.melody.stagger_offsets[3],
+                params.melody.stagger_offsets[4]);
+            println!("   Spread: {:.2} | Duration: {}ms", params.melody.interval_spread, params.total_duration);
+            if chorus { println!("   + Chorus (detune: {:.1} cents)", params.melody.chorus_detune); }
+            if tremolo { println!("   + Tremolo ({:.1}Hz, {:.0}% depth)", params.melody.tremolo_rate, params.melody.tremolo_depth * 100.0); }
+        }
     }
 
     if dry_run {
@@ -1377,10 +1591,11 @@ fn run_test(args: TestArgs) -> Result<()> {
     let voice = RepoVoice::from_repo(&entry.repo_name);
     let shape_name = PAD_SHAPE_NAMES[PAD_SHAPES.iter().position(|s| *s == voice.pad_shape).unwrap_or(0)];
     let mode_name = MODE_NAMES[voice.mode_idx];
+    let preset_name = SYNTH_PRESETS[voice.synth_preset_idx.min(SYNTH_PRESETS.len() - 1)].name;
 
     println!("Repo: {} @ {}", entry.repo_name, entry.branch);
-    println!("  Key: {} {} | Mode: {} | Shape: {} | Voices: {}",
-        voice.root_name, voice.scale_name, mode_name, shape_name, voice.num_voices);
+    println!("  Key: {} {} | Mode: {} | Preset: {} | Shape: {} | Voices: {}",
+        voice.root_name, voice.scale_name, mode_name, preset_name, shape_name, voice.num_voices);
     println!("  Q={:.2} | Reverb={:.2} | Saw={:.2} | Chorus={:.1}Hz | Sub={:.2}",
         voice.filter_q, voice.reverb_mix, voice.saw_mix, voice.chorus_rate, voice.sub_level);
     println!();
@@ -1400,14 +1615,33 @@ fn run_test(args: TestArgs) -> Result<()> {
             let play_args = hook_play_args(event, entry.repo_name.clone(), entry.branch.clone(), args.spooky);
             let dur = play_args.duration;
             let vol = play_args.volume;
-            let break_name = BREAK_STYLE_NAMES[voice.drum_pattern_idx % CLASSIC_BREAKS.len()];
-            let fx: String = if play_args.drums {
+            let hit_name = match voice.drum_hit_type {
+                DrumHitType::Kick => "Kick",
+                DrumHitType::Snare => "Snare",
+                DrumHitType::Rimshot => "Rimshot",
+                DrumHitType::ClosedHat => "ClosedHat",
+            };
+            let fx: String = if play_args.single_hit {
+                format!("hit:{}", hit_name)
+            } else if play_args.melody_over_drums {
+                let break_name = BREAK_STYLE_NAMES[voice.drum_pattern_idx % CLASSIC_BREAKS.len()];
+                let base = format!("{} @ {}bpm", break_name, CLASSIC_BREAKS[voice.drum_pattern_idx % CLASSIC_BREAKS.len()].bpm as u32);
+                if play_args.dub_delay { format!("{}+melody+dub", base) }
+                else { format!("{}+melody", base) }
+            } else if play_args.drums {
+                let break_name = BREAK_STYLE_NAMES[voice.drum_pattern_idx % CLASSIC_BREAKS.len()];
                 format!("{} @ {}bpm", break_name, CLASSIC_BREAKS[voice.drum_pattern_idx % CLASSIC_BREAKS.len()].bpm as u32)
-            } else if play_args.dub_delay && play_args.bulldozer { "bulldozer+dub".into() }
+            } else if play_args.pad && play_args.dub_delay && play_args.chorus { format!("pad+chorus+dub ({})", preset_name) }
+                else if play_args.pad && play_args.tremolo && play_args.dub_delay { format!("pad+tremolo+dub ({})", preset_name) }
+                else if play_args.pad && play_args.chorus && play_args.tremolo { format!("pad+chorus+tremolo ({})", preset_name) }
+                else if play_args.dub_delay && play_args.bulldozer { "bulldozer+dub".into() }
+                else if play_args.pad && play_args.dub_delay { format!("pad+dub ({})", preset_name) }
+                else if play_args.pad && play_args.chorus { format!("pad+chorus ({})", preset_name) }
                 else if play_args.dub_delay { "dub delay".into() }
                 else if play_args.bulldozer { "bulldozer".into() }
                 else if play_args.tremolo { "tremolo".into() }
                 else if play_args.chorus { "chorus".into() }
+                else if play_args.pad { format!("pad ({})", preset_name) }
                 else { "clean".into() };
 
             print!("  {:20} {:>5}ms  vol={:.2}  [{}]", event, dur, vol, fx);
@@ -1435,91 +1669,113 @@ fn run_test(args: TestArgs) -> Result<()> {
 /// Sonic language: map hook event name → PlayArgs for a given repo/branch.
 /// Shared by run_hook (production) and run_test (demo).
 fn hook_play_args(event: &str, repo: String, branch: String, spooky: bool) -> PlayArgs {
+    // Each event gets a unique seed (1–10) so pattern/hit rotates per event.
+    // seed=0 means "no rotation" (CLI default).
     match event {
-        // ── Session boundaries (drum breaks) ────────────────────
+        // ── Session boundaries (pad + chorus + dub) ─────────────
         "SessionStart" => PlayArgs {
             branch: Some(branch), repo: Some(repo),
             duration: 2000, volume: 0.30,
-            pad: false, chorus: false, tremolo: false, bulldozer: false,
+            pad: true, chorus: true, tremolo: false, bulldozer: false,
             steps: 5, spooky, reverse: false, randomize: false,
-            drums: true, dub_delay: false,
+            drums: false, dub_delay: true, melody_over_drums: false,
+            single_hit: false, event_category: EventCategory::SessionBoundary,
+            event_seed: 1,
             break_pattern: None, dry_run: false, quiet: true,
         },
         "SessionEnd" => PlayArgs {
             branch: Some(branch), repo: Some(repo),
             duration: 2000, volume: 0.25,
-            pad: false, chorus: false, tremolo: false, bulldozer: false,
+            pad: true, chorus: false, tremolo: true, bulldozer: false,
             steps: 5, spooky, reverse: true, randomize: false,
-            drums: true, dub_delay: false,
+            drums: false, dub_delay: true, melody_over_drums: false,
+            single_hit: false, event_category: EventCategory::SessionBoundary,
+            event_seed: 4,  // seed=4 (vs start=1) → 3-step pad shape + pattern rotation
             break_pattern: None, dry_run: false, quiet: true,
         },
-        // ── Work rhythm (stabs + dub echo) ──────────────────────
+        // ── Frequent rhythm (single percussive hit) ─────────────
         "Stop" => PlayArgs {
             branch: Some(branch), repo: Some(repo),
-            duration: 1000, volume: 0.12,
-            pad: true, chorus: true, tremolo: false, bulldozer: false,
-            steps: 5, spooky, reverse: false, randomize: false,
-            drums: false, dub_delay: true,
+            duration: 300, volume: 0.12,
+            pad: false, chorus: false, tremolo: false, bulldozer: false,
+            steps: 1, spooky, reverse: false, randomize: false,
+            drums: false, dub_delay: false, melody_over_drums: false,
+            single_hit: true, event_category: EventCategory::DrumHit,
+            event_seed: 3,
             break_pattern: None, dry_run: false, quiet: true,
         },
         "UserPromptSubmit" => PlayArgs {
             branch: Some(branch), repo: Some(repo),
-            duration: 800, volume: 0.08,
-            pad: true, chorus: false, tremolo: false, bulldozer: false,
-            steps: 3, spooky, reverse: false, randomize: false,
-            drums: false, dub_delay: true,
+            duration: 250, volume: 0.08,
+            pad: false, chorus: false, tremolo: false, bulldozer: false,
+            steps: 1, spooky, reverse: false, randomize: false,
+            drums: false, dub_delay: false, melody_over_drums: false,
+            single_hit: true, event_category: EventCategory::DrumHit,
+            event_seed: 5,  // +2 offset from Stop → always a different hit type
             break_pattern: None, dry_run: false, quiet: true,
         },
-        // ── Attention required (stabs + dub echo) ───────────────
+        // ── Attention required (pad + tremolo + dub) ────────────
         "PermissionRequest" => PlayArgs {
             branch: Some(branch), repo: Some(repo),
-            duration: 1200, volume: 0.18,
-            pad: true, chorus: false, tremolo: false, bulldozer: false,
+            duration: 1500, volume: 0.18,
+            pad: true, chorus: false, tremolo: true, bulldozer: false,
             steps: 5, spooky, reverse: true, randomize: false,
-            drums: false, dub_delay: true,
+            drums: false, dub_delay: true, melody_over_drums: false,
+            single_hit: false, event_category: EventCategory::Attention,
+            event_seed: 2,
             break_pattern: None, dry_run: false, quiet: true,
         },
         "Notification" => PlayArgs {
             branch: Some(branch), repo: Some(repo),
-            duration: 1000, volume: 0.15,
-            pad: true, chorus: false, tremolo: true, bulldozer: false,
-            steps: 3, spooky, reverse: true, randomize: false,
-            drums: false, dub_delay: true,
+            duration: 1200, volume: 0.15,
+            pad: true, chorus: true, tremolo: true, bulldozer: false,
+            steps: 3, spooky, reverse: false, randomize: false,
+            drums: false, dub_delay: false, melody_over_drums: false,
+            single_hit: false, event_category: EventCategory::Attention,
+            event_seed: 6,
             break_pattern: None, dry_run: false, quiet: true,
         },
         // ── Background activity (randomized, no delay) ──────────
         "SubagentStart" => PlayArgs {
             branch: Some(branch), repo: Some(repo),
-            duration: 400, volume: 0.06,
+            duration: 500, volume: 0.06,
             pad: true, chorus: false, tremolo: false, bulldozer: false,
             steps: 3, spooky, reverse: false, randomize: true,
-            drums: false, dub_delay: false,
+            drums: false, dub_delay: false, melody_over_drums: false,
+            single_hit: false, event_category: EventCategory::Ambient,
+            event_seed: 7,
             break_pattern: None, dry_run: false, quiet: true,
         },
         "SubagentStop" => PlayArgs {
             branch: Some(branch), repo: Some(repo),
-            duration: 400, volume: 0.06,
+            duration: 500, volume: 0.06,
             pad: true, chorus: true, tremolo: false, bulldozer: false,
             steps: 3, spooky, reverse: true, randomize: true,
-            drums: false, dub_delay: false,
+            drums: false, dub_delay: false, melody_over_drums: false,
+            single_hit: false, event_category: EventCategory::Ambient,
+            event_seed: 8,
             break_pattern: None, dry_run: false, quiet: true,
         },
         // ── Ambient (soft stab + trailing echo) ─────────────────
         "PreCompact" => PlayArgs {
             branch: Some(branch), repo: Some(repo),
-            duration: 900, volume: 0.10,
+            duration: 1100, volume: 0.10,
             pad: true, chorus: true, tremolo: false, bulldozer: false,
             steps: 5, spooky, reverse: true, randomize: false,
-            drums: false, dub_delay: true,
+            drums: false, dub_delay: true, melody_over_drums: false,
+            single_hit: false, event_category: EventCategory::Ambient,
+            event_seed: 9,
             break_pattern: None, dry_run: false, quiet: true,
         },
         // ── Waiting state (clean gentle ping) ───────────────────
         "TeammateIdle" => PlayArgs {
             branch: Some(branch), repo: Some(repo),
-            duration: 500, volume: 0.08,
+            duration: 600, volume: 0.08,
             pad: true, chorus: false, tremolo: false, bulldozer: false,
             steps: 3, spooky, reverse: false, randomize: false,
-            drums: false, dub_delay: false,
+            drums: false, dub_delay: false, melody_over_drums: false,
+            single_hit: false, event_category: EventCategory::Ambient,
+            event_seed: 10,
             break_pattern: None, dry_run: false, quiet: true,
         },
         // ── Unknown events ──────────────────────────────────────
@@ -1528,7 +1784,9 @@ fn hook_play_args(event: &str, repo: String, branch: String, spooky: bool) -> Pl
             duration: 300, volume: 0.12,
             pad: true, chorus: false, tremolo: false, bulldozer: false,
             steps: 3, spooky, reverse: false, randomize: false,
-            drums: false, dub_delay: false,
+            drums: false, dub_delay: false, melody_over_drums: false,
+            single_hit: false, event_category: EventCategory::Default,
+            event_seed: 0,
             break_pattern: None, dry_run: false, quiet: true,
         },
     }
@@ -1671,7 +1929,21 @@ fn run_init() -> Result<()> {
             })
         });
 
-        if !already_present {
+        if already_present {
+            // Ensure existing entry has "async": true
+            for entry in event_hooks.iter_mut() {
+                if let Some(inner) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                    for h in inner.iter_mut() {
+                        if h.get("command").and_then(|c| c.as_str()) == Some(hook_command) {
+                            if h.get("async") != Some(&serde_json::json!(true)) {
+                                h.as_object_mut().unwrap().insert("async".into(), serde_json::json!(true));
+                                hooks_added += 1; // count as a change
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
             event_hooks.push(new_hook_entry.clone());
             hooks_added += 1;
         }
@@ -1738,11 +2010,11 @@ fn run_init() -> Result<()> {
     }
 
     println!("\nbranch-tone is ready! Claude Code will play tones on:");
-    println!("  Session:  SessionStart (2s drum break) · SessionEnd (2s drum break)");
-    println!("  Rhythm:   Stop (1s stab+echo) · UserPromptSubmit (800ms stab+echo)");
-    println!("  Alerts:   PermissionRequest (1.2s stab+echo) · Notification (1s stab+echo)");
-    println!("  Ambient:  SubagentStart (400ms) · SubagentStop (400ms) · PreCompact (900ms+echo)");
-    println!("  Waiting:  TeammateIdle (500ms)");
+    println!("  Session:  SessionStart (2s pad+chorus+dub) · SessionEnd (2s pad+tremolo+dub)");
+    println!("  Rhythm:   Stop (300ms hit) · UserPromptSubmit (250ms hit)");
+    println!("  Alerts:   PermissionRequest (1.5s pad+tremolo+dub) · Notification (1.2s pad+chorus+tremolo)");
+    println!("  Ambient:  SubagentStart (500ms) · SubagentStop (500ms) · PreCompact (1.1s+echo)");
+    println!("  Waiting:  TeammateIdle (600ms)");
     println!();
     println!("Interactive sequencer: branch-tone player");
 
@@ -1869,18 +2141,19 @@ where
         sample_rate,
     );
 
-    // Timbral values from repo voice hash
+    // Compute EffectiveTimbral from repo voice + synth preset
+    let timbral = voice.effective_timbral();
     let eff_reverb = voice.reverb_mix;
     let eff_filter_q = voice.filter_q;
-    let eff_chorus_rate = voice.chorus_rate;
-    let eff_sub_level = voice.sub_level;
-    let eff_saw_mix = voice.saw_mix;
-    let eff_num_voices = voice.num_voices;
+    let eff_chorus_rate = timbral.chorus_rate;
+    let eff_filter_env = timbral.filter_env_amount;
     let is_spooky = params.spooky;
 
     // For bulldozer: arp uses same notes but doesn't drop an octave
-    // (the pad generator drops internally), so arp sits an octave above
-    let arp_effects = Effects { pad: false, chorus: true, tremolo: false, bulldozer: false, drums: false, dub_delay: false };
+    let arp_effects = Effects { pad: false, chorus: true, tremolo: false, bulldozer: false, drums: false, dub_delay: false, melody_over_drums: false, single_hit: false };
+
+    // Single-hit reverb state (light 8% reverb for percussive events)
+    let mut hit_reverb = SimpleReverb::new(sample_rate);
 
     let err_fn = |err| eprintln!("Audio stream error: {}", err);
 
@@ -1909,24 +2182,55 @@ where
                     1.0
                 };
 
-                // Generate raw audio
-                let raw = if effects.drums {
-                    // DRUMS PATH: drum sequencer → fade → light reverb → mono
+                // ── SINGLE HIT PATH ──────────────────────────────
+                if effects.single_hit {
+                    let raw = generate_single_hit(time, sample_rate, &voice) * volume * global_fade;
+                    let hit_reverb_mix = 0.08;
+                    let wet = hit_reverb.process(raw);
+                    let with_reverb = raw * (1.0 - hit_reverb_mix) + wet * hit_reverb_mix;
+                    let sample = T::from_sample(with_reverb);
+                    for channel_sample in frame.iter_mut() {
+                        *channel_sample = sample;
+                    }
+                    continue;
+                }
+
+                // ── TWO-BUS ARCHITECTURE ──────────────────────────
+                // DRUM BUS: if drums enabled
+                let drum_bus = if effects.drums {
                     generate_drums(current_sample, total_samples, sample_rate, &voice, &melody) * volume
-                } else if effects.bulldozer {
-                    let pad_out = generate_pad(&notes, time, progress, 1.0, effects, &voice, &melody, eff_sub_level, eff_saw_mix, eff_num_voices);
-                    let arp_out = generate_arpeggio(&notes, time, current_sample, total_samples, 1.0, arp_effects, &voice, &melody, eff_sub_level, eff_saw_mix);
-                    (pad_out * 0.7 + arp_out * 0.3) * volume
-                } else if effects.pad {
-                    generate_pad(&notes, time, progress, volume, effects, &voice, &melody, eff_sub_level, eff_saw_mix, eff_num_voices)
                 } else {
-                    generate_arpeggio(&notes, time, current_sample, total_samples, volume, effects, &voice, &melody, eff_sub_level, eff_saw_mix)
+                    0.0
+                };
+
+                // TONAL BUS: if melody_over_drums, or non-drum mode
+                let tonal_bus = if effects.melody_over_drums || !effects.drums {
+                    if effects.bulldozer {
+                        let pad_out = generate_pad(&notes, time, progress, 1.0, effects, &voice, &melody, &timbral);
+                        let arp_out = generate_arpeggio(&notes, time, current_sample, total_samples, 1.0, arp_effects, &voice, &melody, &timbral);
+                        (pad_out * 0.7 + arp_out * 0.3) * volume
+                    } else if effects.pad {
+                        generate_pad(&notes, time, progress, volume, effects, &voice, &melody, &timbral)
+                    } else {
+                        generate_arpeggio(&notes, time, current_sample, total_samples, volume, effects, &voice, &melody, &timbral)
+                    }
+                } else {
+                    0.0
+                };
+
+                // MIX buses
+                let raw = if effects.melody_over_drums {
+                    drum_bus * 0.65 + tonal_bus * 0.35
+                } else if effects.drums {
+                    drum_bus
+                } else {
+                    tonal_bus
                 };
 
                 let raw = raw * global_fade;
 
-                if effects.drums {
-                    // DRUMS PATH: light reverb → mono output (crisp hits)
+                if effects.drums && !effects.melody_over_drums {
+                    // PURE DRUMS PATH: light reverb → mono output (crisp hits)
                     let drum_reverb_mix = 0.12;
                     let wet = reverb.process(raw);
                     let with_reverb = raw * (1.0 - drum_reverb_mix) + wet * drum_reverb_mix;
@@ -1939,7 +2243,13 @@ where
 
                     // Low-pass filter with envelope (pad/bulldozer modes)
                     let filtered = if effects.pad {
-                        let cutoff = pad_filter_cutoff(progress, time, voice.pad_shape);
+                        let base_cutoff = pad_filter_cutoff(progress, time, voice.pad_shape);
+                        // Blend filter cutoff with preset's filter_env_amount
+                        let cutoff = if timbral.filter_base > 0.0 {
+                            timbral.filter_base + (base_cutoff - timbral.filter_base) * eff_filter_env
+                        } else {
+                            base_cutoff
+                        };
                         let cutoff = if is_spooky { cutoff.max(200.0) } else { cutoff };
                         pad_lpf.set_cutoff(cutoff, eff_filter_q, sample_rate);
                         pad_lpf.process(raw)
@@ -1954,13 +2264,14 @@ where
                         (filtered, filtered)
                     };
 
-                    // Reverb (all modes)
+                    // Reverb (all modes) — reduce reverb for hybrid to preserve drum transients
+                    let reverb_amount = if effects.melody_over_drums { eff_reverb * 0.7 } else { eff_reverb };
                     let wet_l = reverb.process(post_delay_l);
-                    let with_reverb_l = post_delay_l * (1.0 - eff_reverb) + wet_l * eff_reverb;
+                    let with_reverb_l = post_delay_l * (1.0 - reverb_amount) + wet_l * reverb_amount;
                     // For stereo delay, process right channel through same reverb
                     // (reverb is mono→mono, but L/R differ due to delay offset)
                     let with_reverb_r = if effects.dub_delay {
-                        post_delay_r * (1.0 - eff_reverb) + wet_l * eff_reverb
+                        post_delay_r * (1.0 - reverb_amount) + wet_l * reverb_amount
                     } else {
                         with_reverb_l
                     };
@@ -2105,7 +2416,10 @@ fn pad_note_envelope(shape: PadShape, progress: f32, note_idx: usize, melody: &B
     }
 }
 
-fn generate_pad(notes: &[f32], time: f32, progress: f32, volume: f32, _effects: Effects, voice: &RepoVoice, melody: &BranchMelody, sub_level: f32, saw_mix: f32, num_voices: usize) -> f32 {
+fn generate_pad(notes: &[f32], time: f32, progress: f32, volume: f32, _effects: Effects, voice: &RepoVoice, melody: &BranchMelody, timbral: &EffectiveTimbral) -> f32 {
+    let sub_level = timbral.sub_level;
+    let saw_mix = timbral.saw_mix;
+    let num_voices = timbral.num_voices;
     let mut sample = 0.0;
 
     for (i, &freq) in notes.iter().enumerate() {
@@ -2135,8 +2449,8 @@ fn generate_pad(notes: &[f32], time: f32, progress: f32, volume: f32, _effects: 
 
         let base_freq = freq;
 
-        // Supersaw-style detuning: N voices spread evenly (subtle thickening)
-        let total_spread = melody.chorus_detune * 0.25; // 1–4 cents total spread
+        // Supersaw-style detuning: preset detune_cents defines signature spread
+        let total_spread = if timbral.detune_cents > 0.0 { timbral.detune_cents } else { melody.chorus_detune * 0.25 };
         let nv = num_voices.max(2);
 
         for j in 0..nv {
@@ -2174,7 +2488,7 @@ fn generate_pad(notes: &[f32], time: f32, progress: f32, volume: f32, _effects: 
     sample * volume
 }
 
-fn generate_arpeggio(notes: &[f32], time: f32, current_sample: usize, total_samples: usize, volume: f32, effects: Effects, voice: &RepoVoice, melody: &BranchMelody, sub_level: f32, _saw_mix: f32) -> f32 {
+fn generate_arpeggio(notes: &[f32], time: f32, current_sample: usize, total_samples: usize, volume: f32, effects: Effects, voice: &RepoVoice, melody: &BranchMelody, timbral: &EffectiveTimbral) -> f32 {
     let num_notes = notes.len();
 
     // Calculate swing-adjusted note boundaries
@@ -2215,7 +2529,7 @@ fn generate_arpeggio(notes: &[f32], time: f32, current_sample: usize, total_samp
         // Exponential decay — notes ring out well past their slot boundary
         // Decay rate: reaches ~5% amplitude after ~4x the note slot length
         let decay_time = samples_since_trigger as f32 / note_slot_len as f32;
-        let ring_env = (-1.0 * decay_time).exp();
+        let ring_env = (-timbral.decay_rate * decay_time).exp();
 
         let env = attack_env * ring_env;
 
@@ -2224,7 +2538,7 @@ fn generate_arpeggio(notes: &[f32], time: f32, current_sample: usize, total_samp
             continue;
         }
 
-        let osc = generate_oscillator(frequency, time, effects.chorus, i, voice, melody, sub_level);
+        let osc = generate_oscillator(frequency, time, effects.chorus, i, voice, melody, timbral);
         sample += osc * env;
     }
 
@@ -2249,14 +2563,19 @@ fn generate_arpeggio(notes: &[f32], time: f32, current_sample: usize, total_samp
     sample * global_fade * volume
 }
 
-fn generate_oscillator(freq: f32, time: f32, chorus: bool, voice_idx: usize, voice: &RepoVoice, melody: &BranchMelody, sub_level: f32) -> f32 {
+fn generate_oscillator(freq: f32, time: f32, chorus: bool, voice_idx: usize, _voice: &RepoVoice, melody: &BranchMelody, timbral: &EffectiveTimbral) -> f32 {
     // Sub-octave layer for warmth and depth (always present)
-    let sub = (2.0 * PI * freq * 0.5 * time).sin() * sub_level;
+    let sub = (2.0 * PI * freq * 0.5 * time).sin() * timbral.sub_level;
 
-    // Slow shimmer: gentle pitch wobble for ethereal quality
+    // Slow shimmer: gentle pitch wobble via preset chorus depth
     let shimmer_rate = 2.5 + voice_idx as f32 * 0.3;
-    let shimmer = 1.0 + 0.003 * (2.0 * PI * shimmer_rate * time).sin();
+    let depth = if timbral.chorus_depth > 0.0 { timbral.chorus_depth } else { 0.003 };
+    let shimmer = 1.0 + depth * (2.0 * PI * shimmer_rate * time).sin();
     let freq = freq * shimmer;
+
+    // Use blended timbral harmonics
+    let h2_level = timbral.harmonic_blend;
+    let h3_level = timbral.third_harmonic;
 
     if chorus {
         let detune = melody.chorus_detune;
@@ -2268,8 +2587,8 @@ fn generate_oscillator(freq: f32, time: f32, chorus: bool, voice_idx: usize, voi
             let f = freq * detune_factor;
             let phase_offset = (voice_idx as f32 + i as f32) * 0.1;
             let fundamental = (2.0 * PI * f * time + phase_offset).sin();
-            let h2 = (2.0 * PI * f * 2.0 * time + phase_offset).sin() * voice.harmonic_blend;
-            let h3 = (2.0 * PI * f * 3.0 * time + phase_offset).sin() * voice.third_harmonic;
+            let h2 = (2.0 * PI * f * 2.0 * time + phase_offset).sin() * h2_level;
+            let h3 = (2.0 * PI * f * 3.0 * time + phase_offset).sin() * h3_level;
             sample += (fundamental + h2 + h3) / num_voices;
         }
         sample + sub
@@ -2280,11 +2599,11 @@ fn generate_oscillator(freq: f32, time: f32, chorus: bool, voice_idx: usize, voi
         let f2 = freq * 2.0_f32.powf(light_detune / 1200.0);
 
         let s1 = (2.0 * PI * f1 * time).sin()
-            + (2.0 * PI * f1 * 2.0 * time).sin() * voice.harmonic_blend
-            + (2.0 * PI * f1 * 3.0 * time).sin() * voice.third_harmonic;
+            + (2.0 * PI * f1 * 2.0 * time).sin() * h2_level
+            + (2.0 * PI * f1 * 3.0 * time).sin() * h3_level;
         let s2 = (2.0 * PI * f2 * time).sin()
-            + (2.0 * PI * f2 * 2.0 * time).sin() * voice.harmonic_blend
-            + (2.0 * PI * f2 * 3.0 * time).sin() * voice.third_harmonic;
+            + (2.0 * PI * f2 * 2.0 * time).sin() * h2_level
+            + (2.0 * PI * f2 * 3.0 * time).sin() * h3_level;
 
         (s1 + s2) * 0.5 + sub
     }
@@ -2926,29 +3245,29 @@ mod tests {
     use super::*;
 
     fn default_effects() -> Effects {
-        Effects { pad: false, chorus: false, tremolo: false, bulldozer: false, drums: false, dub_delay: false }
+        Effects { pad: false, chorus: false, tremolo: false, bulldozer: false, drums: false, dub_delay: false, melody_over_drums: false, single_hit: false }
     }
 
     // -- Determinism: same input always produces same output --
 
     #[test]
     fn same_identity_same_notes() {
-        let a = PhraseParams::from_identity("myrepo", "main", 400, 0.25, default_effects(), 3, false);
-        let b = PhraseParams::from_identity("myrepo", "main", 400, 0.25, default_effects(), 3, false);
+        let a = PhraseParams::from_identity("myrepo", "main", 400, 0.25, default_effects(), 3, false, EventCategory::Default, 0);
+        let b = PhraseParams::from_identity("myrepo", "main", 400, 0.25, default_effects(), 3, false, EventCategory::Default, 0);
         assert_eq!(a.notes, b.notes);
     }
 
     #[test]
     fn different_branch_different_notes() {
-        let a = PhraseParams::from_identity("myrepo", "main", 400, 0.25, default_effects(), 3, false);
-        let b = PhraseParams::from_identity("myrepo", "feature/auth", 400, 0.25, default_effects(), 3, false);
+        let a = PhraseParams::from_identity("myrepo", "main", 400, 0.25, default_effects(), 3, false, EventCategory::Default, 0);
+        let b = PhraseParams::from_identity("myrepo", "feature/auth", 400, 0.25, default_effects(), 3, false, EventCategory::Default, 0);
         assert_ne!(a.notes, b.notes);
     }
 
     #[test]
     fn different_repo_different_notes() {
-        let a = PhraseParams::from_identity("repo-a", "main", 400, 0.25, default_effects(), 3, false);
-        let b = PhraseParams::from_identity("repo-b", "main", 400, 0.25, default_effects(), 3, false);
+        let a = PhraseParams::from_identity("repo-a", "main", 400, 0.25, default_effects(), 3, false, EventCategory::Default, 0);
+        let b = PhraseParams::from_identity("repo-b", "main", 400, 0.25, default_effects(), 3, false, EventCategory::Default, 0);
         assert_ne!(a.notes, b.notes);
     }
 
@@ -2956,8 +3275,8 @@ mod tests {
 
     #[test]
     fn same_repo_shares_voice() {
-        let a = PhraseParams::from_identity("myrepo", "main", 400, 0.25, default_effects(), 3, false);
-        let b = PhraseParams::from_identity("myrepo", "feature/x", 400, 0.25, default_effects(), 3, false);
+        let a = PhraseParams::from_identity("myrepo", "main", 400, 0.25, default_effects(), 3, false, EventCategory::Default, 0);
+        let b = PhraseParams::from_identity("myrepo", "feature/x", 400, 0.25, default_effects(), 3, false, EventCategory::Default, 0);
         assert_eq!(a.voice.scale_freqs, b.voice.scale_freqs);
         assert_eq!(a.voice.octave, b.voice.octave);
         assert_eq!(a.voice.harmonic_blend, b.voice.harmonic_blend);
@@ -2965,8 +3284,8 @@ mod tests {
 
     #[test]
     fn same_branch_shares_melody() {
-        let a = PhraseParams::from_identity("repo-a", "main", 400, 0.25, default_effects(), 3, false);
-        let b = PhraseParams::from_identity("repo-b", "main", 400, 0.25, default_effects(), 3, false);
+        let a = PhraseParams::from_identity("repo-a", "main", 400, 0.25, default_effects(), 3, false, EventCategory::Default, 0);
+        let b = PhraseParams::from_identity("repo-b", "main", 400, 0.25, default_effects(), 3, false, EventCategory::Default, 0);
         assert_eq!(a.melody.swing, b.melody.swing);
         assert_eq!(a.melody.envelope_shape, b.melody.envelope_shape);
         assert_eq!(a.melody.stagger_offsets, b.melody.stagger_offsets);
@@ -2976,13 +3295,13 @@ mod tests {
 
     #[test]
     fn three_steps_produces_three_notes() {
-        let p = PhraseParams::from_identity("r", "b", 400, 0.25, default_effects(), 3, false);
+        let p = PhraseParams::from_identity("r", "b", 400, 0.25, default_effects(), 3, false, EventCategory::Default, 0);
         assert_eq!(p.notes.len(), 3);
     }
 
     #[test]
     fn five_steps_produces_five_notes() {
-        let p = PhraseParams::from_identity("r", "b", 400, 0.25, default_effects(), 5, false);
+        let p = PhraseParams::from_identity("r", "b", 400, 0.25, default_effects(), 5, false, EventCategory::Default, 0);
         assert_eq!(p.notes.len(), 5);
     }
 
@@ -2991,7 +3310,7 @@ mod tests {
     #[test]
     fn notes_are_valid_scale_frequencies() {
         for branch in ["main", "develop", "feature/x", "fix/bug-123", "release/v2"] {
-            let p = PhraseParams::from_identity("repo", branch, 400, 0.25, default_effects(), 5, false);
+            let p = PhraseParams::from_identity("repo", branch, 400, 0.25, default_effects(), 5, false, EventCategory::Default, 0);
             for note in &p.notes {
                 assert!(
                     p.voice.scale_freqs.iter().any(|v| (v - note).abs() < 0.01),
@@ -3008,9 +3327,10 @@ mod tests {
     fn oscillator_output_in_range() {
         let voice = RepoVoice::from_repo("test");
         let melody = BranchMelody::from_branch("test", 3);
+        let timbral = voice.effective_timbral();
         for t in 0..1000 {
             let time = t as f32 / 44100.0;
-            let sample = generate_oscillator(440.0, time, false, 0, &voice, &melody, 0.15);
+            let sample = generate_oscillator(440.0, time, false, 0, &voice, &melody, &timbral);
             assert!(sample >= -1.5 && sample <= 1.5, "sample out of range: {}", sample);
         }
     }
@@ -3019,9 +3339,10 @@ mod tests {
     fn chorus_oscillator_output_in_range() {
         let voice = RepoVoice::from_repo("test");
         let melody = BranchMelody::from_branch("test", 3);
+        let timbral = voice.effective_timbral();
         for t in 0..1000 {
             let time = t as f32 / 44100.0;
-            let sample = generate_oscillator(440.0, time, true, 0, &voice, &melody, 0.15);
+            let sample = generate_oscillator(440.0, time, true, 0, &voice, &melody, &timbral);
             assert!(sample >= -1.5 && sample <= 1.5, "chorus sample out of range: {}", sample);
         }
     }
@@ -3044,13 +3365,19 @@ mod tests {
     #[test]
     fn pad_envelope_rises_and_falls() {
         let notes = vec![440.0];
-        let effects = Effects { pad: true, chorus: false, tremolo: false, bulldozer: false, drums: false, dub_delay: false };
+        let effects = Effects { pad: true, chorus: false, tremolo: false, bulldozer: false, drums: false, dub_delay: false, melody_over_drums: false, single_hit: false };
         let voice = RepoVoice::from_repo("test");
         let melody = BranchMelody::from_branch("test", 3);
+        let timbral = EffectiveTimbral {
+            saw_mix: 1.0, num_voices: 3, sub_level: 0.15,
+            harmonic_blend: 0.15, third_harmonic: 0.05,
+            filter_base: 2200.0, filter_env_amount: 0.6,
+            detune_cents: 12.0, chorus_depth: 0.003, chorus_rate: 0.5, decay_rate: 3.0,
+        };
 
-        let start = generate_pad(&notes, 0.0, 0.01, 1.0, effects, &voice, &melody, 0.15, 1.0, 3).abs();
-        let mid = generate_pad(&notes, 0.5, 0.5, 1.0, effects, &voice, &melody, 0.15, 1.0, 3).abs();
-        let end = generate_pad(&notes, 1.0, 0.99, 1.0, effects, &voice, &melody, 0.15, 1.0, 3).abs();
+        let start = generate_pad(&notes, 0.0, 0.01, 1.0, effects, &voice, &melody, &timbral).abs();
+        let mid = generate_pad(&notes, 0.5, 0.5, 1.0, effects, &voice, &melody, &timbral).abs();
+        let end = generate_pad(&notes, 1.0, 0.99, 1.0, effects, &voice, &melody, &timbral).abs();
 
         assert!(mid > start, "pad should be louder in middle than at start");
         assert!(mid > end, "pad should be louder in middle than at end");
@@ -3103,7 +3430,20 @@ mod tests {
                 })
             });
 
-            if !already_present {
+            if already_present {
+                // Ensure existing entry has "async": true
+                for entry in event_hooks.iter_mut() {
+                    if let Some(inner) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                        for h in inner.iter_mut() {
+                            if h.get("command").and_then(|c| c.as_str()) == Some(hook_command) {
+                                if h.get("async") != Some(&serde_json::json!(true)) {
+                                    h.as_object_mut().unwrap().insert("async".into(), serde_json::json!(true));
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
                 event_hooks.push(new_hook_entry.clone());
             }
         }
@@ -3138,6 +3478,33 @@ mod tests {
         for event in HOOK_EVENTS {
             let event_hooks = settings["hooks"][event].as_array().unwrap();
             assert_eq!(event_hooks.len(), 1, "{} should not duplicate on re-init", event);
+        }
+    }
+
+    #[test]
+    fn hook_init_patches_missing_async() {
+        // Simulate hooks written by an older version (missing "async": true)
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "Stop": [
+                    {"hooks": [{"type": "command", "command": "branch-tone hook"}]}
+                ],
+                "SessionStart": [
+                    {"hooks": [{"type": "command", "command": "branch-tone hook"}]}
+                ]
+            }
+        });
+        // Verify async is missing before init
+        assert!(settings["hooks"]["Stop"][0]["hooks"][0].get("async").is_none());
+
+        apply_hook_init(&mut settings);
+
+        // All events should now have async: true
+        for event in HOOK_EVENTS {
+            let event_hooks = settings["hooks"][event].as_array().unwrap();
+            assert_eq!(event_hooks.len(), 1, "{} should have one entry", event);
+            let inner = event_hooks[0]["hooks"].as_array().unwrap();
+            assert_eq!(inner[0]["async"], true, "{} should have async: true after init", event);
         }
     }
 
@@ -3311,20 +3678,48 @@ mod tests {
     // -- Hook mapping tests --
 
     #[test]
-    fn session_events_use_drums() {
+    fn session_events_use_pads() {
         for event in ["SessionStart", "SessionEnd"] {
             let args = hook_play_args(event, "repo".into(), "main".into(), false);
-            assert!(args.drums, "{} should use drums", event);
-            assert!(!args.dub_delay, "{} should not use dub_delay", event);
+            assert!(args.pad, "{} should use pad", event);
+            assert!(args.dub_delay, "{} should use dub_delay", event);
+            assert!(!args.drums, "{} should not use drums", event);
+            assert!(!args.single_hit, "{} should not use single_hit", event);
+            assert_eq!(args.event_category, EventCategory::SessionBoundary, "{} should be SessionBoundary", event);
         }
+        // Start uses chorus, End uses tremolo — different sonic character
+        let start = hook_play_args("SessionStart", "repo".into(), "main".into(), false);
+        let end = hook_play_args("SessionEnd", "repo".into(), "main".into(), false);
+        assert!(start.chorus, "SessionStart should use chorus");
+        assert!(!start.tremolo, "SessionStart should not use tremolo");
+        assert!(end.tremolo, "SessionEnd should use tremolo");
+        assert!(!end.chorus, "SessionEnd should not use chorus");
     }
 
     #[test]
-    fn tonal_events_use_dub_delay() {
-        for event in ["Stop", "UserPromptSubmit", "PermissionRequest", "Notification", "PreCompact"] {
+    fn attention_events_use_pad() {
+        for event in ["PermissionRequest", "Notification"] {
             let args = hook_play_args(event, "repo".into(), "main".into(), false);
-            assert!(args.dub_delay, "{} should use dub_delay", event);
+            assert!(args.pad, "{} should use pad", event);
             assert!(!args.drums, "{} should not use drums", event);
+            assert!(!args.single_hit, "{} should not use single_hit", event);
+            assert_eq!(args.event_category, EventCategory::Attention, "{} should be Attention", event);
+        }
+        // PreCompact still uses dub_delay but no drums
+        let precompact = hook_play_args("PreCompact", "repo".into(), "main".into(), false);
+        assert!(precompact.dub_delay, "PreCompact should use dub_delay");
+        assert!(!precompact.drums, "PreCompact should not use drums");
+        assert!(!precompact.single_hit, "PreCompact should not use single_hit");
+    }
+
+    #[test]
+    fn frequent_events_use_single_hit() {
+        for event in ["Stop", "UserPromptSubmit"] {
+            let args = hook_play_args(event, "repo".into(), "main".into(), false);
+            assert!(args.single_hit, "{} should use single_hit", event);
+            assert!(!args.drums, "{} should not use drums", event);
+            assert!(!args.pad, "{} should not use pad", event);
+            assert_eq!(args.event_category, EventCategory::DrumHit, "{} should be DrumHit", event);
         }
     }
 
@@ -3334,6 +3729,8 @@ mod tests {
             let args = hook_play_args(event, "repo".into(), "main".into(), false);
             assert!(!args.dub_delay, "{} should not use dub_delay", event);
             assert!(!args.drums, "{} should not use drums", event);
+            assert!(!args.melody_over_drums, "{} should not use melody_over_drums", event);
+            assert!(!args.single_hit, "{} should not use single_hit", event);
         }
     }
 
@@ -3470,5 +3867,211 @@ mod tests {
         assert!(state.sustain.load(Relaxed));
         state.sustain.store(false, Relaxed);
         assert!(!state.sustain.load(Relaxed));
+    }
+
+    // -- Synth preset per repo tests --
+
+    #[test]
+    fn synth_preset_idx_deterministic() {
+        let v1 = RepoVoice::from_repo("my-project");
+        let v2 = RepoVoice::from_repo("my-project");
+        assert_eq!(v1.synth_preset_idx, v2.synth_preset_idx);
+        assert!(v1.synth_preset_idx < SYNTH_PRESETS.len());
+
+        // Different repos should (usually) get different presets
+        let v3 = RepoVoice::from_repo("other-project");
+        assert!(v3.synth_preset_idx < SYNTH_PRESETS.len());
+    }
+
+    #[test]
+    fn effective_timbral_blends_correctly() {
+        let voice = RepoVoice::from_repo("test-blend");
+        let timbral = voice.effective_timbral();
+        let preset = &SYNTH_PRESETS[voice.synth_preset_idx];
+
+        // 85% preset + 15% hash (saw_mix, sub_level)
+        let expected_saw = preset.saw_mix * 0.85 + voice.saw_mix * 0.15;
+        assert!((timbral.saw_mix - expected_saw).abs() < 0.001,
+            "saw_mix blend: expected {}, got {}", expected_saw, timbral.saw_mix);
+
+        let expected_sub = preset.sub_level * 0.85 + voice.sub_level * 0.15;
+        assert!((timbral.sub_level - expected_sub).abs() < 0.001,
+            "sub_level blend: expected {}, got {}", expected_sub, timbral.sub_level);
+
+        // Preset wins for these fields
+        assert_eq!(timbral.num_voices, preset.num_voices as usize);
+        assert_eq!(timbral.filter_base, preset.filter_base);
+        assert_eq!(timbral.detune_cents, preset.detune_cents);
+        assert_eq!(timbral.chorus_depth, preset.chorus_depth);
+        assert_eq!(timbral.decay_rate, preset.decay_rate);
+    }
+
+    #[test]
+    fn event_categories_are_set_correctly() {
+        assert_eq!(hook_play_args("SessionStart", "r".into(), "b".into(), false).event_category, EventCategory::SessionBoundary);
+        assert_eq!(hook_play_args("SessionEnd", "r".into(), "b".into(), false).event_category, EventCategory::SessionBoundary);
+        assert_eq!(hook_play_args("Stop", "r".into(), "b".into(), false).event_category, EventCategory::DrumHit);
+        assert_eq!(hook_play_args("UserPromptSubmit", "r".into(), "b".into(), false).event_category, EventCategory::DrumHit);
+        assert_eq!(hook_play_args("PermissionRequest", "r".into(), "b".into(), false).event_category, EventCategory::Attention);
+        assert_eq!(hook_play_args("Notification", "r".into(), "b".into(), false).event_category, EventCategory::Attention);
+        assert_eq!(hook_play_args("SubagentStart", "r".into(), "b".into(), false).event_category, EventCategory::Ambient);
+        assert_eq!(hook_play_args("SubagentStop", "r".into(), "b".into(), false).event_category, EventCategory::Ambient);
+        assert_eq!(hook_play_args("PreCompact", "r".into(), "b".into(), false).event_category, EventCategory::Ambient);
+        assert_eq!(hook_play_args("TeammateIdle", "r".into(), "b".into(), false).event_category, EventCategory::Ambient);
+        assert_eq!(hook_play_args("Unknown", "r".into(), "b".into(), false).event_category, EventCategory::Default);
+    }
+
+    #[test]
+    fn ambient_events_still_no_drums() {
+        let ambient_events = ["SubagentStart", "SubagentStop", "PreCompact", "TeammateIdle"];
+        for event in ambient_events {
+            let args = hook_play_args(event, "repo".into(), "main".into(), false);
+            assert!(!args.melody_over_drums, "{} should not use melody_over_drums", event);
+            assert!(!args.single_hit, "{} should not use single_hit", event);
+        }
+    }
+
+    // -- Single hit tests --
+
+    #[test]
+    fn single_hit_output_in_range() {
+        let voice = RepoVoice::from_repo("test");
+        for i in 0..4000 {
+            let t = i as f32 / 44100.0;
+            let s = generate_single_hit(t, 44100.0, &voice);
+            assert!(!s.is_nan(), "single_hit NaN at t={}", t);
+            assert!(s.abs() <= 2.0, "single_hit out of range at t={}: {}", t, s);
+        }
+    }
+
+    #[test]
+    fn single_hit_decays_quickly() {
+        let voice = RepoVoice::from_repo("test");
+        // After 200ms the signal should be very quiet
+        let late = generate_single_hit(0.2, 44100.0, &voice);
+        assert!(late.abs() < 0.05, "single_hit should decay by 200ms, got {}", late);
+    }
+
+    #[test]
+    fn rimshot_output_in_range() {
+        for i in 0..2000 {
+            let t = i as f32 / 44100.0;
+            let s = synth_rimshot(t, 0.0);
+            assert!(!s.is_nan(), "rimshot NaN at t={}", t);
+            assert!(s.abs() <= 2.0, "rimshot out of range at t={}: {}", t, s);
+        }
+    }
+
+    #[test]
+    fn drum_hit_type_deterministic() {
+        let v1 = RepoVoice::from_repo("my-project");
+        let v2 = RepoVoice::from_repo("my-project");
+        assert_eq!(v1.drum_hit_type, v2.drum_hit_type);
+
+        // Different repos can get different hit types
+        let v3 = RepoVoice::from_repo("other-project");
+        // Just verify it's a valid variant (always true for an enum, but ensures no panic)
+        let _ = match v3.drum_hit_type {
+            DrumHitType::Kick | DrumHitType::Snare | DrumHitType::Rimshot | DrumHitType::ClosedHat => true,
+        };
+    }
+
+    // -- EventCategory tests --
+
+    #[test]
+    fn event_category_octave_offsets() {
+        assert_eq!(EventCategory::SessionBoundary.octave_offset(), 1.0);
+        assert_eq!(EventCategory::Attention.octave_offset(), 1.5);
+        assert_eq!(EventCategory::DrumHit.octave_offset(), 1.0);
+        assert_eq!(EventCategory::Ambient.octave_offset(), 0.75);
+        assert_eq!(EventCategory::Default.octave_offset(), 1.0);
+    }
+
+    #[test]
+    fn event_category_transpose() {
+        assert_eq!(EventCategory::SessionBoundary.transpose_semitones(), 0);
+        assert_eq!(EventCategory::Attention.transpose_semitones(), 5);
+        assert_eq!(EventCategory::DrumHit.transpose_semitones(), 0);
+        assert_eq!(EventCategory::Ambient.transpose_semitones(), -3);
+        assert_eq!(EventCategory::Default.transpose_semitones(), 0);
+    }
+
+    #[test]
+    fn event_category_effective_steps() {
+        assert_eq!(EventCategory::SessionBoundary.effective_steps(3), 5);
+        assert_eq!(EventCategory::Attention.effective_steps(1), 3);
+        assert_eq!(EventCategory::Attention.effective_steps(5), 5);
+        assert_eq!(EventCategory::DrumHit.effective_steps(5), 1);
+        assert_eq!(EventCategory::Ambient.effective_steps(5), 3);
+        assert_eq!(EventCategory::Ambient.effective_steps(2), 2);
+        assert_eq!(EventCategory::Default.effective_steps(3), 3);
+    }
+
+    // -- Event seed tests --
+
+    #[test]
+    fn event_seed_produces_different_patterns() {
+        // Same repo+branch but different seeds → different note patterns
+        let a = PhraseParams::from_identity("myrepo", "main", 400, 0.25, default_effects(), 5, false, EventCategory::Default, 1);
+        let b = PhraseParams::from_identity("myrepo", "main", 400, 0.25, default_effects(), 5, false, EventCategory::Default, 2);
+        // Pattern indices are rotated, so notes will differ
+        assert_ne!(a.voice.pattern_idx, b.voice.pattern_idx,
+            "different seeds should rotate pattern_idx");
+    }
+
+    #[test]
+    fn event_seed_zero_preserves_original() {
+        // seed=0 means no rotation — should match base pattern
+        let base = RepoVoice::from_repo("myrepo");
+        let params = PhraseParams::from_identity("myrepo", "main", 400, 0.25, default_effects(), 5, false, EventCategory::Default, 0);
+        assert_eq!(params.voice.pattern_idx, base.pattern_idx,
+            "seed=0 should not rotate pattern_idx");
+        assert_eq!(params.voice.drum_hit_type, base.drum_hit_type,
+            "seed=0 should not rotate drum_hit_type");
+    }
+
+    #[test]
+    fn stop_and_submit_get_different_hit_types() {
+        // Stop seed=3, UserPromptSubmit seed=5 — offset of 2 guarantees different hit type
+        let stop = hook_play_args("Stop", "repo".into(), "main".into(), false);
+        let submit = hook_play_args("UserPromptSubmit", "repo".into(), "main".into(), false);
+        assert_ne!(stop.event_seed, submit.event_seed);
+        // The actual hit type depends on the repo, but the seed difference of 2
+        // means they'll always rotate to a different position in the 4-type cycle
+        let stop_params = PhraseParams::from_identity("repo", "main", 200, 0.12,
+            Effects { pad: false, chorus: false, tremolo: false, bulldozer: false,
+                      drums: false, dub_delay: false, melody_over_drums: false, single_hit: true },
+            1, false, EventCategory::DrumHit, stop.event_seed);
+        let submit_params = PhraseParams::from_identity("repo", "main", 150, 0.08,
+            Effects { pad: false, chorus: false, tremolo: false, bulldozer: false,
+                      drums: false, dub_delay: false, melody_over_drums: false, single_hit: true },
+            1, false, EventCategory::DrumHit, submit.event_seed);
+        assert_ne!(stop_params.voice.drum_hit_type, submit_params.voice.drum_hit_type,
+            "Stop and UserPromptSubmit should have different hit types for same repo");
+    }
+
+    #[test]
+    fn session_start_and_end_get_different_melodies() {
+        let start = hook_play_args("SessionStart", "repo".into(), "main".into(), false);
+        let end = hook_play_args("SessionEnd", "repo".into(), "main".into(), false);
+        assert_ne!(start.event_seed, end.event_seed);
+        let start_params = PhraseParams::from_identity("repo", "main", 1500, 0.30, default_effects(), 5, false, EventCategory::SessionBoundary, start.event_seed);
+        let end_params = PhraseParams::from_identity("repo", "main", 1500, 0.25, default_effects(), 5, false, EventCategory::SessionBoundary, end.event_seed);
+        assert_ne!(start_params.notes, end_params.notes,
+            "SessionStart and SessionEnd should have different melodies");
+    }
+
+    #[test]
+    fn all_hook_events_have_unique_seeds() {
+        let seeds: Vec<u8> = HOOK_EVENTS.iter()
+            .map(|e| hook_play_args(e, "r".into(), "b".into(), false).event_seed)
+            .collect();
+        for i in 0..seeds.len() {
+            for j in (i+1)..seeds.len() {
+                assert_ne!(seeds[i], seeds[j],
+                    "events {} and {} should have different seeds, both got {}",
+                    HOOK_EVENTS[i], HOOK_EVENTS[j], seeds[i]);
+            }
+        }
     }
 }
