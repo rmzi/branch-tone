@@ -1265,6 +1265,8 @@ struct BranchMelody {
     // Drum modulation (hash bytes 16–17)
     drum_chop_idx: usize,    // 0–7 (CHOP_ORDERS index)
     drum_ghost_level: f32,   // 0.0–0.4
+    // Quantize subdivision (hash byte 18): multiplier on 16th-note grid
+    quantize_subdiv: f32,    // 0.5=1/32, 1.0=1/16, 2.0=1/8, 4.0=1/4, 8.0=1/2
 }
 
 impl BranchMelody {
@@ -1321,6 +1323,10 @@ impl BranchMelody {
         let drum_chop_idx = (hash[16] as usize) % 8;
         let drum_ghost_level = (hash[17] as f32 / 255.0) * 0.4;
 
+        // Quantize subdivision (hash byte 18): snap arp notes to BPM grid
+        const QUANTIZE_SUBDIVS: [f32; 4] = [1.0, 2.0, 4.0, 2.0]; // bias toward 1/8
+        let quantize_subdiv = QUANTIZE_SUBDIVS[(hash[18] as usize) % QUANTIZE_SUBDIVS.len()];
+
         Self {
             swing,
             envelope_shape,
@@ -1336,6 +1342,7 @@ impl BranchMelody {
             drum_velocity_var,
             drum_chop_idx,
             drum_ghost_level,
+            quantize_subdiv,
         }
     }
 }
@@ -1516,6 +1523,27 @@ fn run_play(args: PlayArgs) -> Result<()> {
     if let Some(bp) = break_pattern {
         params.voice.drum_pattern_idx = bp % CLASSIC_BREAKS.len();
     }
+
+    // Bar-align phrase duration to the break's BPM grid (nearest half-bar)
+    let break_idx = params.voice.drum_pattern_idx % CLASSIC_BREAKS.len();
+    let brk_bpm = CLASSIC_BREAKS[break_idx].bpm;
+    let bar_ms = 240_000.0 / brk_bpm as f64;
+    let half_bar = bar_ms / 2.0;
+    let num_half_bars = (params.total_duration as f64 / half_bar).round().max(1.0);
+    params.total_duration = (num_half_bars * half_bar) as u64;
+
+    // BRANCH_TONE_QUANTIZE overrides subdivision: 4=1/4, 8=1/8, 16=1/16, 32=1/32
+    if let Ok(val) = std::env::var("BRANCH_TONE_QUANTIZE") {
+        if let Ok(denom) = val.parse::<u32>() {
+            params.melody.quantize_subdiv = match denom {
+                4 => 4.0,
+                8 => 2.0,
+                16 => 1.0,
+                32 => 0.5,
+                _ => params.melody.quantize_subdiv,
+            };
+        }
+    }
     if reverse { params.notes.reverse(); }
     if randomize {
         // Pick random notes from the repo's scale (always in key)
@@ -1558,8 +1586,15 @@ fn run_play(args: PlayArgs) -> Result<()> {
             format!(" [{}]", hit_name)
         } else { String::new() };
         let hybrid_tag = if melody_over_drums { " +hybrid" } else { "" };
+        let grid_label = match params.melody.quantize_subdiv {
+            x if x <= 0.5 => "1/32",
+            x if x <= 1.0 => "1/16",
+            x if x <= 2.0 => "1/8",
+            x if x <= 4.0 => "1/4",
+            _ => "1/2",
+        };
         let envelope_names = ["Punchy", "Soft", "Pluck", "Swell"];
-        println!("🎵 Repo: {} | Branch: {} [{}] ({}){}{}{}", repo, branch, mode_label, preset_name, hit_tag, hybrid_tag, spooky_tag);
+        println!("🎵 Repo: {} | Branch: {} [{}] ({}){}{}{} | {:.0} BPM | {} grid", repo, branch, mode_label, preset_name, hit_tag, hybrid_tag, spooky_tag, brk_bpm, grid_label);
         if !single_hit {
             let shape_name = PAD_SHAPE_NAMES[PAD_SHAPES.iter().position(|s| *s == params.voice.pad_shape).unwrap_or(0)];
             println!("   Key: {} {} | Octave: {}x | Shape: {}", params.voice.root_name, params.voice.scale_name, params.voice.octave, shape_name);
@@ -2474,6 +2509,12 @@ where
     // For bulldozer: arp uses same notes but doesn't drop an octave
     let arp_effects = Effects { pad: false, chorus: true, tremolo: false, bulldozer: false, drums: false, dub_delay: false, melody_over_drums: false, single_hit: false };
 
+    // Compute quantize grid in samples (snap arp notes to BPM-derived grid)
+    let break_idx = voice.drum_pattern_idx % CLASSIC_BREAKS.len();
+    let brk_bpm = CLASSIC_BREAKS[break_idx].bpm;
+    let sixteenth = 60.0 / brk_bpm / 4.0 * sample_rate;
+    let grid_samples = (sixteenth * melody.quantize_subdiv).round() as usize;
+
     // Single-hit reverb state (light 8% reverb for percussive events)
     let mut hit_reverb = SimpleReverb::new(sample_rate);
 
@@ -2543,12 +2584,12 @@ where
                 let tonal_bus = if effects.melody_over_drums || !effects.drums {
                     if effects.bulldozer {
                         let pad_out = generate_pad(&notes, time, progress, 1.0, effects, &voice, &melody, &timbral);
-                        let arp_out = generate_arpeggio(&notes, time, current_sample, total_samples, 1.0, arp_effects, &voice, &melody, &timbral);
+                        let arp_out = generate_arpeggio(&notes, time, current_sample, total_samples, 1.0, arp_effects, &voice, &melody, &timbral, grid_samples);
                         (pad_out * 0.7 + arp_out * 0.3) * volume
                     } else if effects.pad {
                         generate_pad(&notes, time, progress, volume, effects, &voice, &melody, &timbral)
                     } else {
-                        generate_arpeggio(&notes, time, current_sample, total_samples, volume, effects, &voice, &melody, &timbral)
+                        generate_arpeggio(&notes, time, current_sample, total_samples, volume, effects, &voice, &melody, &timbral, grid_samples)
                     }
                 } else {
                     0.0
@@ -2824,7 +2865,7 @@ fn generate_pad(notes: &[f32], time: f32, progress: f32, volume: f32, _effects: 
     sample * volume
 }
 
-fn generate_arpeggio(notes: &[f32], time: f32, current_sample: usize, total_samples: usize, volume: f32, effects: Effects, voice: &RepoVoice, melody: &BranchMelody, timbral: &EffectiveTimbral) -> f32 {
+fn generate_arpeggio(notes: &[f32], time: f32, current_sample: usize, total_samples: usize, volume: f32, effects: Effects, voice: &RepoVoice, melody: &BranchMelody, timbral: &EffectiveTimbral, grid_samples: usize) -> f32 {
     let num_notes = notes.len();
 
     // Calculate swing-adjusted note boundaries
@@ -2838,6 +2879,23 @@ fn generate_arpeggio(notes: &[f32], time: f32, current_sample: usize, total_samp
         boundaries.push(accum.round() as usize);
     }
     *boundaries.last_mut().unwrap() = total_samples;
+
+    // Snap interior boundaries to the nearest BPM grid point
+    if grid_samples > 0 {
+        for b in boundaries[1..num_notes].iter_mut() {
+            *b = ((*b as f32 / grid_samples as f32).round() as usize) * grid_samples;
+        }
+        // Ensure no two boundaries collide — minimum 1 grid step apart
+        for i in 1..boundaries.len() - 1 {
+            if boundaries[i] <= boundaries[i - 1] {
+                boundaries[i] = boundaries[i - 1] + grid_samples;
+            }
+            if boundaries[i] >= total_samples {
+                boundaries[i] = total_samples.saturating_sub(grid_samples * (boundaries.len() - 1 - i));
+            }
+        }
+        *boundaries.last_mut().unwrap() = total_samples;
+    }
 
     // Ethereal arpeggio: notes ring out and overlap rather than cutting off.
     // Each note triggers at its boundary and decays exponentially over remaining time.
