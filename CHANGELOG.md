@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.9.0] - 2026-03-10
+
+### Added
+- **Jazz ensemble model**: 18 Claude Code hook events mapped as a jazz band — drums, hi-hat, bass, keys/pad, horn, piano/comping
+- **8 new hook events**: PreToolUse, PostToolUse, PostToolUseFailure, InstructionsLoaded, ConfigChange, TaskCompleted, WorktreeCreate, WorktreeRemove
+- **3 new event categories**: `ToolPulse` (hi-hat micro-clicks for tool events), `Bass` (low-register agent lifecycle), `Lifecycle` (piano/comping for structural events) — replaces `Ambient`
+- **`DrumHitType::OpenHat`**: New drum synthesis variant for open hi-hat sounds
+- **Jazz micro-patterns**: Ghost notes, flams, and drags on percussive hits (1–4 hits per event, 15–60ms spacing) — deterministic per repo+event seed
+- **Worktree-as-voice**: Subagents in worktrees automatically get unique melodic signatures (same repo key, different branch melody)
+- **PDS lifecycle mapping**: Sound design informed by Portable Dev System's 6-phase agent workflow (advisory, not coupled)
+- **`docs/jazz-ensemble.md`**: Design documentation for the ensemble model, PDS mapping, and micro-pattern system
+- 2 new tests (75 total) for micro-pattern determinism and event seed rotation
+
+### Changed
+- **Extended durations**: SessionStart/End 2s→3.5s, SubagentStart/Stop 500ms→1s, PermissionRequest 1.5s→2.5s, Notification 1.2s→2s, PreCompact 1.1s→2s, TeammateIdle 600ms→1.5s
+- **Category reassignment**: SubagentStart/Stop moved from Ambient to Bass; PreCompact/TeammateIdle moved from Ambient to Lifecycle
+- **EventCategory parameters**: Bass uses octave 0.5x / transpose -5; ToolPulse uses octave 2.0x; Lifecycle uses octave 1.25x / transpose +3
+- **Drum hit cycle**: 4-type rotation expanded to 5-type (Kick→Snare→Rimshot→ClosedHat→OpenHat)
+- Plugin manifest registers all 18 hook events
+
 ## [0.8.0] - 2026-03-02
 
 ### Added

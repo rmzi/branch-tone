@@ -4,7 +4,7 @@
     <strong>Hear your git context. Every repo has a voice. Every branch has a melody.</strong>
   </p>
   <p align="center">
-    <a href="https://github.com/rmzi/branch-tone/releases"><img alt="Version" src="https://img.shields.io/badge/version-0.8.0-blue?style=flat-square"></a>
+    <a href="https://github.com/rmzi/branch-tone/releases"><img alt="Version" src="https://img.shields.io/badge/version-0.9.0-blue?style=flat-square"></a>
     <a href="https://www.rust-lang.org/"><img alt="Rust" src="https://img.shields.io/badge/rust-2024_edition-orange?style=flat-square&logo=rust"></a>
     <a href="https://github.com/rmzi/branch-tone/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-green?style=flat-square"></a>
     <a href="#"><img alt="Platform" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey?style=flat-square"></a>
