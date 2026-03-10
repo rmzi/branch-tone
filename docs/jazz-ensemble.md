@@ -28,11 +28,11 @@ Each voice corresponds to an `EventCategory` that shapes the sound:
 Category         Octave  Transpose  Steps   Register
 ───────────────  ──────  ─────────  ──────  ─────────────
 SessionBoundary  1.0x    0          5       Center — full chord
-Attention        1.5x    +5         max(3)  High — bright alert
+Attention        1.0x    +5         max(3)  Bright via transpose, not octave
 DrumHit          1.0x    0          1       Center — single punch
-ToolPulse        2.0x    0          1       Very high — barely audible click
+ToolPulse        2.0x    0          1       High — barely audible click
 Bass             0.5x    -5         3       Low — foundation
-Lifecycle        1.25x   +3         3       Upper-mid — comping texture
+Lifecycle        0.75x   +3         3       Below pad — comping texture
 Default          1.0x    0          base    Center — fallback
 ```
 

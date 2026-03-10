@@ -207,7 +207,7 @@ const SCALE_NAMES: [&str; 10] = [
 ];
 
 /// Octave multipliers — clean musical intervals only (no sub-bass rumble)
-const OCTAVES: [f32; 5] = [0.5, 1.0, 1.5, 2.0, 3.0];
+const OCTAVES: [f32; 5] = [0.5, 0.75, 1.0, 1.5, 2.0];
 
 /// Mode presets that repos can be assigned to
 const MODE_NAMES: [&str; 5] = ["Arpeggio", "Chorus Arp", "Pad", "Bulldozer", "Tremolo Arp"];
@@ -304,11 +304,11 @@ impl EventCategory {
     fn octave_offset(&self) -> f32 {
         match self {
             Self::SessionBoundary => 1.0,
-            Self::Attention => 1.5,
+            Self::Attention => 1.0,
             Self::DrumHit => 1.0,
             Self::ToolPulse => 2.0,
             Self::Bass => 0.5,
-            Self::Lifecycle => 1.25,
+            Self::Lifecycle => 0.75,
             Self::Default => 1.0,
         }
     }
@@ -4430,11 +4430,11 @@ mod tests {
     #[test]
     fn event_category_octave_offsets() {
         assert_eq!(EventCategory::SessionBoundary.octave_offset(), 1.0);
-        assert_eq!(EventCategory::Attention.octave_offset(), 1.5);
+        assert_eq!(EventCategory::Attention.octave_offset(), 1.0);
         assert_eq!(EventCategory::DrumHit.octave_offset(), 1.0);
         assert_eq!(EventCategory::ToolPulse.octave_offset(), 2.0);
         assert_eq!(EventCategory::Bass.octave_offset(), 0.5);
-        assert_eq!(EventCategory::Lifecycle.octave_offset(), 1.25);
+        assert_eq!(EventCategory::Lifecycle.octave_offset(), 0.75);
         assert_eq!(EventCategory::Default.octave_offset(), 1.0);
     }
 
