@@ -213,10 +213,13 @@ const OCTAVES: [f32; 5] = [0.5, 1.0, 1.5, 2.0, 3.0];
 const MODE_NAMES: [&str; 5] = ["Arpeggio", "Chorus Arp", "Pad", "Bulldozer", "Tremolo Arp"];
 
 /// All Claude Code hook events we register and handle
-const HOOK_EVENTS: [&str; 10] = [
+const HOOK_EVENTS: [&str; 18] = [
     "SessionStart", "SessionEnd", "Stop", "UserPromptSubmit",
     "PermissionRequest", "Notification",
     "SubagentStart", "SubagentStop", "PreCompact", "TeammateIdle",
+    "PreToolUse", "PostToolUse", "PostToolUseFailure",
+    "InstructionsLoaded", "ConfigChange", "TaskCompleted",
+    "WorktreeCreate", "WorktreeRemove",
 ];
 
 /// Arpeggio patterns - 3 note (intervals from root in scale degrees)
@@ -287,10 +290,12 @@ impl Effects {
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 enum EventCategory {
-    SessionBoundary, // SessionStart/End: long pads
-    Attention,       // PermissionRequest, Notification: alert pads
-    DrumHit,         // Stop, UserPromptSubmit: short percussive
-    Ambient,         // SubagentStart/Stop, PreCompact: soft background
+    SessionBoundary, // SessionStart/End: keys/pad — long chord blooms
+    Attention,       // PermissionRequest, Notification: horn/lead — melodic alert
+    DrumHit,         // Stop, UserPromptSubmit: kick/snare — short percussive
+    ToolPulse,       // PreToolUse, PostToolUse, PostToolUseFailure: hi-hat — rapid micro-hits
+    Bass,            // SubagentStart/Stop, WorktreeCreate/Remove: bass — agent lifecycle
+    Lifecycle,       // InstructionsLoaded, ConfigChange, TaskCompleted, PreCompact, TeammateIdle: piano/comping
     #[default]
     Default,         // CLI / unknown
 }
@@ -301,7 +306,9 @@ impl EventCategory {
             Self::SessionBoundary => 1.0,
             Self::Attention => 1.5,
             Self::DrumHit => 1.0,
-            Self::Ambient => 0.75,
+            Self::ToolPulse => 2.0,
+            Self::Bass => 0.5,
+            Self::Lifecycle => 1.25,
             Self::Default => 1.0,
         }
     }
@@ -311,7 +318,9 @@ impl EventCategory {
             Self::SessionBoundary => 0,
             Self::Attention => 5,
             Self::DrumHit => 0,
-            Self::Ambient => -3,
+            Self::ToolPulse => 0,
+            Self::Bass => -5,
+            Self::Lifecycle => 3,
             Self::Default => 0,
         }
     }
@@ -321,7 +330,9 @@ impl EventCategory {
             Self::SessionBoundary => 5,
             Self::Attention => base.max(3),
             Self::DrumHit => 1,
-            Self::Ambient => base.min(3),
+            Self::ToolPulse => 1,
+            Self::Bass => 3,
+            Self::Lifecycle => 3,
             Self::Default => base,
         }
     }
@@ -650,6 +661,7 @@ enum DrumHitType {
     Snare,
     Rimshot,
     ClosedHat,
+    OpenHat,
 }
 
 /// Generate a single drum hit (~125ms decay) for short percussive events.
@@ -661,6 +673,7 @@ fn generate_single_hit(time: f32, sample_rate: f32, voice: &RepoVoice) -> f32 {
         DrumHitType::Snare => synth_snare(time, noise_seed) * voice.snare_tone,
         DrumHitType::Rimshot => synth_rimshot(time, noise_seed),
         DrumHitType::ClosedHat => synth_hihat(time, false, noise_seed) * voice.hihat_brightness,
+        DrumHitType::OpenHat => synth_hihat(time, true, noise_seed) * voice.hihat_brightness,
     };
     raw * decay_env
 }
@@ -1076,6 +1089,9 @@ struct RepoVoice {
     synth_preset_idx: usize,  // index into SYNTH_PRESETS
     // Single-hit drum type (hash byte 23)
     drum_hit_type: DrumHitType,
+    // Jazz micro-pattern for single hits (hash bytes 24–25)
+    hit_count: usize,       // 1–4 hits per event (primary + ghost notes)
+    hit_spacing_ms: f32,    // 15–60ms between ghost notes
 }
 
 impl RepoVoice {
@@ -1142,12 +1158,19 @@ impl RepoVoice {
         let synth_preset_idx = (hash[22] as usize) % SYNTH_PRESETS.len();
 
         // Single-hit drum type (hash byte 23)
-        let drum_hit_type = match hash[23] % 4 {
+        let drum_hit_type = match hash[23] % 5 {
             0 => DrumHitType::Kick,
             1 => DrumHitType::Snare,
             2 => DrumHitType::Rimshot,
-            _ => DrumHitType::ClosedHat,
+            3 => DrumHitType::ClosedHat,
+            _ => DrumHitType::OpenHat,
         };
+
+        // Jazz micro-pattern (hash bytes 24–25): ghost notes and flams
+        // hit_count 1–4: some repos get clean singles, others get drags/flams
+        let hit_count = 1 + (hash[24] as usize % 4);
+        // hit_spacing 15–60ms: tighter = flam, wider = drag
+        let hit_spacing_ms = 15.0 + (hash[25] as f32 / 255.0) * 45.0;
 
         Self {
             root_name,
@@ -1175,6 +1198,8 @@ impl RepoVoice {
             delay_wow_rate,
             synth_preset_idx,
             drum_hit_type,
+            hit_count,
+            hit_spacing_ms,
         }
     }
 
@@ -1367,13 +1392,20 @@ impl PhraseParams {
                 DrumHitType::Snare => 1,
                 DrumHitType::Rimshot => 2,
                 DrumHitType::ClosedHat => 3,
+                DrumHitType::OpenHat => 4,
             };
-            voice.drum_hit_type = match (hit_idx + event_seed as usize) % 4 {
+            voice.drum_hit_type = match (hit_idx + event_seed as usize) % 5 {
                 0 => DrumHitType::Kick,
                 1 => DrumHitType::Snare,
                 2 => DrumHitType::Rimshot,
-                _ => DrumHitType::ClosedHat,
+                3 => DrumHitType::ClosedHat,
+                _ => DrumHitType::OpenHat,
             };
+        }
+
+        // Rotate micro-pattern by event_seed — each event gets different jazz feel
+        if event_seed > 0 {
+            voice.hit_count = 1 + (voice.hit_count - 1 + event_seed as usize) % 4;
         }
 
         let melody = BranchMelody::from_branch(branch, effective_steps);
@@ -1521,6 +1553,7 @@ fn run_play(args: PlayArgs) -> Result<()> {
                 DrumHitType::Snare => "Snare",
                 DrumHitType::Rimshot => "Rimshot",
                 DrumHitType::ClosedHat => "ClosedHat",
+                DrumHitType::OpenHat => "OpenHat",
             };
             format!(" [{}]", hit_name)
         } else { String::new() };
@@ -1616,13 +1649,15 @@ fn run_test(args: TestArgs) -> Result<()> {
         voice.filter_q, voice.reverb_mix, voice.saw_mix, voice.chorus_rate, voice.sub_level);
     println!();
 
-    // Group labels for display
+    // Group labels for display — jazz ensemble voices
     let event_groups: &[(&str, &[&str])] = &[
-        ("Session",  &["SessionStart", "SessionEnd"]),
-        ("Rhythm",   &["Stop", "UserPromptSubmit"]),
-        ("Alerts",   &["PermissionRequest", "Notification"]),
-        ("Ambient",  &["SubagentStart", "SubagentStop", "PreCompact"]),
-        ("Waiting",  &["TeammateIdle"]),
+        ("Drums (rhythm)",     &["UserPromptSubmit", "Stop"]),
+        ("Hi-Hat (tools)",     &["PreToolUse", "PostToolUse", "PostToolUseFailure"]),
+        ("Bass (agents)",      &["SubagentStart", "SubagentStop", "WorktreeCreate", "WorktreeRemove"]),
+        ("Keys/Pad (session)", &["SessionStart", "SessionEnd"]),
+        ("Horn (attention)",   &["PermissionRequest", "Notification"]),
+        ("Piano (lifecycle)",  &["InstructionsLoaded", "ConfigChange", "TaskCompleted",
+                                 "PreCompact", "TeammateIdle"]),
     ];
 
     for (group_name, events) in event_groups {
@@ -1636,6 +1671,7 @@ fn run_test(args: TestArgs) -> Result<()> {
                 DrumHitType::Snare => "Snare",
                 DrumHitType::Rimshot => "Rimshot",
                 DrumHitType::ClosedHat => "ClosedHat",
+                DrumHitType::OpenHat => "OpenHat",
             };
             let fx: String = if play_args.single_hit {
                 format!("hit:{}", hit_name)
@@ -1688,10 +1724,10 @@ fn hook_play_args(event: &str, repo: String, branch: String, spooky: bool) -> Pl
     // Each event gets a unique seed (1–10) so pattern/hit rotates per event.
     // seed=0 means "no rotation" (CLI default).
     match event {
-        // ── Session boundaries (pad + chorus + dub) ─────────────
+        // ── Keys/Pad (session boundaries — the band starts/stops) ──
         "SessionStart" => PlayArgs {
             branch: Some(branch), repo: Some(repo),
-            duration: 2000, volume: 0.30,
+            duration: 3500, volume: 0.30,
             pad: true, chorus: true, tremolo: false, bulldozer: false,
             steps: 5, spooky, reverse: false, randomize: false,
             drums: false, dub_delay: true, melody_over_drums: false,
@@ -1701,18 +1737,18 @@ fn hook_play_args(event: &str, repo: String, branch: String, spooky: bool) -> Pl
         },
         "SessionEnd" => PlayArgs {
             branch: Some(branch), repo: Some(repo),
-            duration: 2000, volume: 0.25,
+            duration: 3500, volume: 0.25,
             pad: true, chorus: false, tremolo: true, bulldozer: false,
             steps: 5, spooky, reverse: true, randomize: false,
             drums: false, dub_delay: true, melody_over_drums: false,
             single_hit: false, event_category: EventCategory::SessionBoundary,
-            event_seed: 4,  // seed=4 (vs start=1) → 3-step pad shape + pattern rotation
+            event_seed: 4,  // seed=4 (vs start=1) → different pad shape + pattern rotation
             break_pattern: None, dry_run: false, quiet: true,
         },
-        // ── Frequent rhythm (single percussive hit) ─────────────
+        // ── Drums — kick/snare (frequent rhythm) ───────────────────
         "Stop" => PlayArgs {
             branch: Some(branch), repo: Some(repo),
-            duration: 300, volume: 0.12,
+            duration: 400, volume: 0.12,
             pad: false, chorus: false, tremolo: false, bulldozer: false,
             steps: 1, spooky, reverse: false, randomize: false,
             drums: false, dub_delay: false, melody_over_drums: false,
@@ -1722,7 +1758,7 @@ fn hook_play_args(event: &str, repo: String, branch: String, spooky: bool) -> Pl
         },
         "UserPromptSubmit" => PlayArgs {
             branch: Some(branch), repo: Some(repo),
-            duration: 250, volume: 0.08,
+            duration: 350, volume: 0.08,
             pad: false, chorus: false, tremolo: false, bulldozer: false,
             steps: 1, spooky, reverse: false, randomize: false,
             drums: false, dub_delay: false, melody_over_drums: false,
@@ -1730,10 +1766,41 @@ fn hook_play_args(event: &str, repo: String, branch: String, spooky: bool) -> Pl
             event_seed: 5,  // +2 offset from Stop → always a different hit type
             break_pattern: None, dry_run: false, quiet: true,
         },
-        // ── Attention required (pad + tremolo + dub) ────────────
+        // ── Hi-Hat — tool pulse (very frequent, very quiet) ────────
+        "PreToolUse" => PlayArgs {
+            branch: Some(branch), repo: Some(repo),
+            duration: 120, volume: 0.05,
+            pad: false, chorus: false, tremolo: false, bulldozer: false,
+            steps: 1, spooky, reverse: false, randomize: false,
+            drums: false, dub_delay: false, melody_over_drums: false,
+            single_hit: true, event_category: EventCategory::ToolPulse,
+            event_seed: 11,
+            break_pattern: None, dry_run: false, quiet: true,
+        },
+        "PostToolUse" => PlayArgs {
+            branch: Some(branch), repo: Some(repo),
+            duration: 150, volume: 0.05,
+            pad: false, chorus: false, tremolo: false, bulldozer: false,
+            steps: 1, spooky, reverse: false, randomize: false,
+            drums: false, dub_delay: false, melody_over_drums: false,
+            single_hit: true, event_category: EventCategory::ToolPulse,
+            event_seed: 12,
+            break_pattern: None, dry_run: false, quiet: true,
+        },
+        "PostToolUseFailure" => PlayArgs {
+            branch: Some(branch), repo: Some(repo),
+            duration: 250, volume: 0.08,
+            pad: false, chorus: false, tremolo: false, bulldozer: false,
+            steps: 1, spooky, reverse: false, randomize: false,
+            drums: false, dub_delay: false, melody_over_drums: false,
+            single_hit: true, event_category: EventCategory::ToolPulse,
+            event_seed: 13,
+            break_pattern: None, dry_run: false, quiet: true,
+        },
+        // ── Horn/Lead — attention required (melodic alert) ─────────
         "PermissionRequest" => PlayArgs {
             branch: Some(branch), repo: Some(repo),
-            duration: 1500, volume: 0.18,
+            duration: 2500, volume: 0.18,
             pad: true, chorus: false, tremolo: true, bulldozer: false,
             steps: 5, spooky, reverse: true, randomize: false,
             drums: false, dub_delay: true, melody_over_drums: false,
@@ -1743,7 +1810,7 @@ fn hook_play_args(event: &str, repo: String, branch: String, spooky: bool) -> Pl
         },
         "Notification" => PlayArgs {
             branch: Some(branch), repo: Some(repo),
-            duration: 1200, volume: 0.15,
+            duration: 2000, volume: 0.15,
             pad: true, chorus: true, tremolo: true, bulldozer: false,
             steps: 3, spooky, reverse: false, randomize: false,
             drums: false, dub_delay: false, melody_over_drums: false,
@@ -1751,50 +1818,99 @@ fn hook_play_args(event: &str, repo: String, branch: String, spooky: bool) -> Pl
             event_seed: 6,
             break_pattern: None, dry_run: false, quiet: true,
         },
-        // ── Background activity (randomized, no delay) ──────────
+        // ── Bass — agent lifecycle (voices entering/leaving) ───────
         "SubagentStart" => PlayArgs {
             branch: Some(branch), repo: Some(repo),
-            duration: 500, volume: 0.06,
+            duration: 1000, volume: 0.10,
             pad: true, chorus: false, tremolo: false, bulldozer: false,
             steps: 3, spooky, reverse: false, randomize: true,
             drums: false, dub_delay: false, melody_over_drums: false,
-            single_hit: false, event_category: EventCategory::Ambient,
+            single_hit: false, event_category: EventCategory::Bass,
             event_seed: 7,
             break_pattern: None, dry_run: false, quiet: true,
         },
         "SubagentStop" => PlayArgs {
             branch: Some(branch), repo: Some(repo),
-            duration: 500, volume: 0.06,
+            duration: 1000, volume: 0.10,
             pad: true, chorus: true, tremolo: false, bulldozer: false,
             steps: 3, spooky, reverse: true, randomize: true,
             drums: false, dub_delay: false, melody_over_drums: false,
-            single_hit: false, event_category: EventCategory::Ambient,
+            single_hit: false, event_category: EventCategory::Bass,
             event_seed: 8,
             break_pattern: None, dry_run: false, quiet: true,
         },
-        // ── Ambient (soft stab + trailing echo) ─────────────────
-        "PreCompact" => PlayArgs {
+        "WorktreeCreate" => PlayArgs {
             branch: Some(branch), repo: Some(repo),
-            duration: 1100, volume: 0.10,
-            pad: true, chorus: true, tremolo: false, bulldozer: false,
-            steps: 5, spooky, reverse: true, randomize: false,
-            drums: false, dub_delay: true, melody_over_drums: false,
-            single_hit: false, event_category: EventCategory::Ambient,
-            event_seed: 9,
-            break_pattern: None, dry_run: false, quiet: true,
-        },
-        // ── Waiting state (clean gentle ping) ───────────────────
-        "TeammateIdle" => PlayArgs {
-            branch: Some(branch), repo: Some(repo),
-            duration: 600, volume: 0.08,
+            duration: 1200, volume: 0.10,
             pad: true, chorus: false, tremolo: false, bulldozer: false,
             steps: 3, spooky, reverse: false, randomize: false,
             drums: false, dub_delay: false, melody_over_drums: false,
-            single_hit: false, event_category: EventCategory::Ambient,
+            single_hit: false, event_category: EventCategory::Bass,
+            event_seed: 14,
+            break_pattern: None, dry_run: false, quiet: true,
+        },
+        "WorktreeRemove" => PlayArgs {
+            branch: Some(branch), repo: Some(repo),
+            duration: 1200, volume: 0.10,
+            pad: true, chorus: false, tremolo: false, bulldozer: false,
+            steps: 3, spooky, reverse: true, randomize: false,
+            drums: false, dub_delay: false, melody_over_drums: false,
+            single_hit: false, event_category: EventCategory::Bass,
+            event_seed: 15,
+            break_pattern: None, dry_run: false, quiet: true,
+        },
+        // ── Piano/Comping — lifecycle (structural events) ──────────
+        "InstructionsLoaded" => PlayArgs {
+            branch: Some(branch), repo: Some(repo),
+            duration: 1500, volume: 0.10,
+            pad: false, chorus: true, tremolo: false, bulldozer: false,
+            steps: 3, spooky, reverse: false, randomize: false,
+            drums: false, dub_delay: false, melody_over_drums: false,
+            single_hit: false, event_category: EventCategory::Lifecycle,
+            event_seed: 16,
+            break_pattern: None, dry_run: false, quiet: true,
+        },
+        "ConfigChange" => PlayArgs {
+            branch: Some(branch), repo: Some(repo),
+            duration: 1800, volume: 0.10,
+            pad: true, chorus: false, tremolo: true, bulldozer: false,
+            steps: 3, spooky, reverse: false, randomize: false,
+            drums: false, dub_delay: false, melody_over_drums: false,
+            single_hit: false, event_category: EventCategory::Lifecycle,
+            event_seed: 17,
+            break_pattern: None, dry_run: false, quiet: true,
+        },
+        "TaskCompleted" => PlayArgs {
+            branch: Some(branch), repo: Some(repo),
+            duration: 2500, volume: 0.15,
+            pad: true, chorus: true, tremolo: false, bulldozer: false,
+            steps: 5, spooky, reverse: false, randomize: false,
+            drums: false, dub_delay: true, melody_over_drums: false,
+            single_hit: false, event_category: EventCategory::Lifecycle,
+            event_seed: 18,
+            break_pattern: None, dry_run: false, quiet: true,
+        },
+        "PreCompact" => PlayArgs {
+            branch: Some(branch), repo: Some(repo),
+            duration: 2000, volume: 0.10,
+            pad: true, chorus: true, tremolo: false, bulldozer: false,
+            steps: 3, spooky, reverse: true, randomize: false,
+            drums: false, dub_delay: true, melody_over_drums: false,
+            single_hit: false, event_category: EventCategory::Lifecycle,
+            event_seed: 9,
+            break_pattern: None, dry_run: false, quiet: true,
+        },
+        "TeammateIdle" => PlayArgs {
+            branch: Some(branch), repo: Some(repo),
+            duration: 1500, volume: 0.08,
+            pad: true, chorus: false, tremolo: false, bulldozer: false,
+            steps: 3, spooky, reverse: false, randomize: false,
+            drums: false, dub_delay: false, melody_over_drums: false,
+            single_hit: false, event_category: EventCategory::Lifecycle,
             event_seed: 10,
             break_pattern: None, dry_run: false, quiet: true,
         },
-        // ── Unknown events ──────────────────────────────────────
+        // ── Unknown events ─────────────────────────────────────────
         _ => PlayArgs {
             branch: Some(branch), repo: Some(repo),
             duration: 300, volume: 0.12,
@@ -2388,9 +2504,23 @@ where
                     1.0
                 };
 
-                // ── SINGLE HIT PATH ──────────────────────────────
+                // ── SINGLE HIT PATH (jazz micro-pattern) ────────
+                // Plays 1–4 time-offset hits: primary at full velocity,
+                // ghost notes at 30–60% for flams, drags, and jazz feel.
                 if effects.single_hit {
-                    let raw = generate_single_hit(time, sample_rate, &voice) * volume * global_fade;
+                    let spacing_secs = voice.hit_spacing_ms / 1000.0;
+                    let mut sum = 0.0f32;
+                    for h in 0..voice.hit_count {
+                        let hit_time = time - (h as f32 * spacing_secs);
+                        if hit_time >= 0.0 {
+                            let vel = if h == 0 { 1.0 } else {
+                                // Ghost notes: 30–60% velocity, decreasing with distance
+                                0.6 - (h as f32 * 0.1)
+                            };
+                            sum += generate_single_hit(hit_time, sample_rate, &voice) * vel;
+                        }
+                    }
+                    let raw = sum * volume * global_fade;
                     let hit_reverb_mix = 0.08;
                     let wet = hit_reverb.process(raw);
                     let with_reverb = raw * (1.0 - hit_reverb_mix) + wet * hit_reverb_mix;
@@ -3930,14 +4060,109 @@ mod tests {
     }
 
     #[test]
-    fn background_events_no_delay() {
-        for event in ["SubagentStart", "SubagentStop", "TeammateIdle"] {
+    fn bass_events_no_delay() {
+        for event in ["SubagentStart", "SubagentStop", "WorktreeCreate", "WorktreeRemove"] {
             let args = hook_play_args(event, "repo".into(), "main".into(), false);
             assert!(!args.dub_delay, "{} should not use dub_delay", event);
             assert!(!args.drums, "{} should not use drums", event);
             assert!(!args.melody_over_drums, "{} should not use melody_over_drums", event);
             assert!(!args.single_hit, "{} should not use single_hit", event);
         }
+    }
+
+    #[test]
+    fn tool_pulse_events_use_single_hit() {
+        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+            let args = hook_play_args(event, "repo".into(), "main".into(), false);
+            assert!(args.single_hit, "{} should use single_hit", event);
+            assert!(!args.pad, "{} should not use pad", event);
+            assert!(!args.drums, "{} should not use drums", event);
+            assert_eq!(args.event_category, EventCategory::ToolPulse, "{} should be ToolPulse", event);
+        }
+    }
+
+    #[test]
+    fn tool_pulse_events_are_quiet() {
+        for event in ["PreToolUse", "PostToolUse"] {
+            let args = hook_play_args(event, "repo".into(), "main".into(), false);
+            assert!(args.volume <= 0.06, "{} volume {} should be <= 0.06", event, args.volume);
+            assert!(args.duration <= 200, "{} duration {} should be <= 200ms", event, args.duration);
+        }
+    }
+
+    #[test]
+    fn bass_events_use_low_octave() {
+        for event in ["SubagentStart", "SubagentStop", "WorktreeCreate", "WorktreeRemove"] {
+            let args = hook_play_args(event, "repo".into(), "main".into(), false);
+            assert_eq!(args.event_category, EventCategory::Bass, "{} should be Bass", event);
+        }
+        assert!(EventCategory::Bass.octave_offset() < 1.0, "Bass octave should be below center");
+    }
+
+    #[test]
+    fn worktree_events_are_directional() {
+        let create = hook_play_args("WorktreeCreate", "repo".into(), "main".into(), false);
+        let remove = hook_play_args("WorktreeRemove", "repo".into(), "main".into(), false);
+        assert!(!create.reverse, "WorktreeCreate should ascend (not reversed)");
+        assert!(remove.reverse, "WorktreeRemove should descend (reversed)");
+    }
+
+    #[test]
+    fn lifecycle_events_medium_duration() {
+        for event in ["InstructionsLoaded", "ConfigChange", "TaskCompleted", "PreCompact", "TeammateIdle"] {
+            let args = hook_play_args(event, "repo".into(), "main".into(), false);
+            assert_eq!(args.event_category, EventCategory::Lifecycle, "{} should be Lifecycle", event);
+            assert!(args.duration >= 1500, "{} duration {} should be >= 1500ms", event, args.duration);
+        }
+    }
+
+    #[test]
+    fn task_completed_uses_resolved_cadence() {
+        let args = hook_play_args("TaskCompleted", "repo".into(), "main".into(), false);
+        assert!(args.pad, "TaskCompleted should use pad");
+        assert!(args.chorus, "TaskCompleted should use chorus");
+        assert!(args.dub_delay, "TaskCompleted should use dub_delay");
+        assert_eq!(args.steps, 5, "TaskCompleted should have 5 steps for full phrase");
+        assert!(args.duration >= 2000, "TaskCompleted should be long enough for resolution");
+    }
+
+    #[test]
+    fn open_hat_single_hit_output_in_range() {
+        let mut voice = RepoVoice::from_repo("test");
+        voice.drum_hit_type = DrumHitType::OpenHat;
+        for i in 0..4000 {
+            let t = i as f32 / 44100.0;
+            let s = generate_single_hit(t, 44100.0, &voice);
+            assert!(!s.is_nan(), "OpenHat NaN at t={}", t);
+            assert!(s.abs() <= 2.0, "OpenHat out of range at t={}: {}", t, s);
+        }
+    }
+
+    #[test]
+    fn jazz_micro_pattern_deterministic() {
+        let v1 = RepoVoice::from_repo("my-project");
+        let v2 = RepoVoice::from_repo("my-project");
+        assert_eq!(v1.hit_count, v2.hit_count, "same repo should get same hit_count");
+        assert_eq!(v1.hit_spacing_ms, v2.hit_spacing_ms, "same repo should get same spacing");
+        assert!(v1.hit_count >= 1 && v1.hit_count <= 4, "hit_count should be 1–4, got {}", v1.hit_count);
+        assert!(v1.hit_spacing_ms >= 15.0 && v1.hit_spacing_ms <= 60.0,
+            "spacing should be 15–60ms, got {}", v1.hit_spacing_ms);
+    }
+
+    #[test]
+    fn event_seed_rotates_micro_pattern() {
+        // Different seeds should produce different hit counts (rotating through 1–4)
+        let a = PhraseParams::from_identity("repo", "main", 400, 0.12,
+            Effects { pad: false, chorus: false, tremolo: false, bulldozer: false,
+                      drums: false, dub_delay: false, melody_over_drums: false, single_hit: true },
+            1, false, EventCategory::DrumHit, 1);
+        let b = PhraseParams::from_identity("repo", "main", 400, 0.12,
+            Effects { pad: false, chorus: false, tremolo: false, bulldozer: false,
+                      drums: false, dub_delay: false, melody_over_drums: false, single_hit: true },
+            1, false, EventCategory::DrumHit, 3);
+        // Seeds 1 and 3 differ by 2, so hit_count should rotate differently
+        assert_ne!(a.voice.hit_count, b.voice.hit_count,
+            "different seeds should rotate hit_count: seed1={} seed3={}", a.voice.hit_count, b.voice.hit_count);
     }
 
     #[test]
@@ -4114,23 +4339,41 @@ mod tests {
 
     #[test]
     fn event_categories_are_set_correctly() {
+        // Keys/Pad (session)
         assert_eq!(hook_play_args("SessionStart", "r".into(), "b".into(), false).event_category, EventCategory::SessionBoundary);
         assert_eq!(hook_play_args("SessionEnd", "r".into(), "b".into(), false).event_category, EventCategory::SessionBoundary);
+        // Drums (kick/snare)
         assert_eq!(hook_play_args("Stop", "r".into(), "b".into(), false).event_category, EventCategory::DrumHit);
         assert_eq!(hook_play_args("UserPromptSubmit", "r".into(), "b".into(), false).event_category, EventCategory::DrumHit);
+        // Hi-Hat (tool pulse)
+        assert_eq!(hook_play_args("PreToolUse", "r".into(), "b".into(), false).event_category, EventCategory::ToolPulse);
+        assert_eq!(hook_play_args("PostToolUse", "r".into(), "b".into(), false).event_category, EventCategory::ToolPulse);
+        assert_eq!(hook_play_args("PostToolUseFailure", "r".into(), "b".into(), false).event_category, EventCategory::ToolPulse);
+        // Horn (attention)
         assert_eq!(hook_play_args("PermissionRequest", "r".into(), "b".into(), false).event_category, EventCategory::Attention);
         assert_eq!(hook_play_args("Notification", "r".into(), "b".into(), false).event_category, EventCategory::Attention);
-        assert_eq!(hook_play_args("SubagentStart", "r".into(), "b".into(), false).event_category, EventCategory::Ambient);
-        assert_eq!(hook_play_args("SubagentStop", "r".into(), "b".into(), false).event_category, EventCategory::Ambient);
-        assert_eq!(hook_play_args("PreCompact", "r".into(), "b".into(), false).event_category, EventCategory::Ambient);
-        assert_eq!(hook_play_args("TeammateIdle", "r".into(), "b".into(), false).event_category, EventCategory::Ambient);
+        // Bass (agent lifecycle)
+        assert_eq!(hook_play_args("SubagentStart", "r".into(), "b".into(), false).event_category, EventCategory::Bass);
+        assert_eq!(hook_play_args("SubagentStop", "r".into(), "b".into(), false).event_category, EventCategory::Bass);
+        assert_eq!(hook_play_args("WorktreeCreate", "r".into(), "b".into(), false).event_category, EventCategory::Bass);
+        assert_eq!(hook_play_args("WorktreeRemove", "r".into(), "b".into(), false).event_category, EventCategory::Bass);
+        // Piano (lifecycle)
+        assert_eq!(hook_play_args("InstructionsLoaded", "r".into(), "b".into(), false).event_category, EventCategory::Lifecycle);
+        assert_eq!(hook_play_args("ConfigChange", "r".into(), "b".into(), false).event_category, EventCategory::Lifecycle);
+        assert_eq!(hook_play_args("TaskCompleted", "r".into(), "b".into(), false).event_category, EventCategory::Lifecycle);
+        assert_eq!(hook_play_args("PreCompact", "r".into(), "b".into(), false).event_category, EventCategory::Lifecycle);
+        assert_eq!(hook_play_args("TeammateIdle", "r".into(), "b".into(), false).event_category, EventCategory::Lifecycle);
+        // Unknown
         assert_eq!(hook_play_args("Unknown", "r".into(), "b".into(), false).event_category, EventCategory::Default);
     }
 
     #[test]
-    fn ambient_events_still_no_drums() {
-        let ambient_events = ["SubagentStart", "SubagentStop", "PreCompact", "TeammateIdle"];
-        for event in ambient_events {
+    fn background_events_no_melody_over_drums() {
+        let bg_events = [
+            "SubagentStart", "SubagentStop", "WorktreeCreate", "WorktreeRemove",
+            "PreCompact", "TeammateIdle", "InstructionsLoaded", "ConfigChange",
+        ];
+        for event in bg_events {
             let args = hook_play_args(event, "repo".into(), "main".into(), false);
             assert!(!args.melody_over_drums, "{} should not use melody_over_drums", event);
             assert!(!args.single_hit, "{} should not use single_hit", event);
@@ -4178,7 +4421,7 @@ mod tests {
         let v3 = RepoVoice::from_repo("other-project");
         // Just verify it's a valid variant (always true for an enum, but ensures no panic)
         let _ = match v3.drum_hit_type {
-            DrumHitType::Kick | DrumHitType::Snare | DrumHitType::Rimshot | DrumHitType::ClosedHat => true,
+            DrumHitType::Kick | DrumHitType::Snare | DrumHitType::Rimshot | DrumHitType::ClosedHat | DrumHitType::OpenHat => true,
         };
     }
 
@@ -4189,7 +4432,9 @@ mod tests {
         assert_eq!(EventCategory::SessionBoundary.octave_offset(), 1.0);
         assert_eq!(EventCategory::Attention.octave_offset(), 1.5);
         assert_eq!(EventCategory::DrumHit.octave_offset(), 1.0);
-        assert_eq!(EventCategory::Ambient.octave_offset(), 0.75);
+        assert_eq!(EventCategory::ToolPulse.octave_offset(), 2.0);
+        assert_eq!(EventCategory::Bass.octave_offset(), 0.5);
+        assert_eq!(EventCategory::Lifecycle.octave_offset(), 1.25);
         assert_eq!(EventCategory::Default.octave_offset(), 1.0);
     }
 
@@ -4198,7 +4443,9 @@ mod tests {
         assert_eq!(EventCategory::SessionBoundary.transpose_semitones(), 0);
         assert_eq!(EventCategory::Attention.transpose_semitones(), 5);
         assert_eq!(EventCategory::DrumHit.transpose_semitones(), 0);
-        assert_eq!(EventCategory::Ambient.transpose_semitones(), -3);
+        assert_eq!(EventCategory::ToolPulse.transpose_semitones(), 0);
+        assert_eq!(EventCategory::Bass.transpose_semitones(), -5);
+        assert_eq!(EventCategory::Lifecycle.transpose_semitones(), 3);
         assert_eq!(EventCategory::Default.transpose_semitones(), 0);
     }
 
@@ -4208,8 +4455,11 @@ mod tests {
         assert_eq!(EventCategory::Attention.effective_steps(1), 3);
         assert_eq!(EventCategory::Attention.effective_steps(5), 5);
         assert_eq!(EventCategory::DrumHit.effective_steps(5), 1);
-        assert_eq!(EventCategory::Ambient.effective_steps(5), 3);
-        assert_eq!(EventCategory::Ambient.effective_steps(2), 2);
+        assert_eq!(EventCategory::ToolPulse.effective_steps(5), 1);
+        assert_eq!(EventCategory::Bass.effective_steps(5), 3);
+        assert_eq!(EventCategory::Bass.effective_steps(1), 3);
+        assert_eq!(EventCategory::Lifecycle.effective_steps(5), 3);
+        assert_eq!(EventCategory::Lifecycle.effective_steps(1), 3);
         assert_eq!(EventCategory::Default.effective_steps(3), 3);
     }
 
