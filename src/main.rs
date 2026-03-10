@@ -802,7 +802,7 @@ fn generate_drums(
     let brk = &CLASSIC_BREAKS[break_idx];
 
     // BPM-based step timing (16th notes) — pattern loops naturally
-    let step_samples = (60.0 / brk.bpm / 4.0 * sample_rate) as usize;
+    let step_samples = sixteenth_samples(brk.bpm, sample_rate) as usize;
     if step_samples == 0 { return 0.0; }
 
     // Swing: shift odd steps (off-beats) forward
@@ -1324,7 +1324,8 @@ impl BranchMelody {
         let drum_ghost_level = (hash[17] as f32 / 255.0) * 0.4;
 
         // Quantize subdivision (hash byte 18): snap arp notes to BPM grid
-        const QUANTIZE_SUBDIVS: [f32; 4] = [1.0, 2.0, 4.0, 2.0]; // bias toward 1/8
+        // Table biases toward 1/8; env var BRANCH_TONE_QUANTIZE allows 1/32 and 1/2 too
+        const QUANTIZE_SUBDIVS: [f32; 4] = [1.0, 2.0, 4.0, 2.0];
         let quantize_subdiv = QUANTIZE_SUBDIVS[(hash[18] as usize) % QUANTIZE_SUBDIVS.len()];
 
         Self {
@@ -1345,6 +1346,23 @@ impl BranchMelody {
             quantize_subdiv,
         }
     }
+}
+
+/// Map quantize subdivision multiplier to a musical label.
+fn subdiv_label(subdiv: f32) -> &'static str {
+    match subdiv as u8 {
+        0 => "1/32",  // 0.5 truncates to 0
+        1 => "1/16",
+        2 => "1/8",
+        4 => "1/4",
+        8 => "1/2",
+        _ => "1/8",   // safe fallback
+    }
+}
+
+/// Duration of one 16th note in samples at the given BPM.
+fn sixteenth_samples(bpm: f32, sample_rate: f32) -> f32 {
+    60.0 / bpm / 4.0 * sample_rate
 }
 
 // -----------------------------------------------------------------------------
@@ -1586,13 +1604,7 @@ fn run_play(args: PlayArgs) -> Result<()> {
             format!(" [{}]", hit_name)
         } else { String::new() };
         let hybrid_tag = if melody_over_drums { " +hybrid" } else { "" };
-        let grid_label = match params.melody.quantize_subdiv {
-            x if x <= 0.5 => "1/32",
-            x if x <= 1.0 => "1/16",
-            x if x <= 2.0 => "1/8",
-            x if x <= 4.0 => "1/4",
-            _ => "1/2",
-        };
+        let grid_label = subdiv_label(params.melody.quantize_subdiv);
         let envelope_names = ["Punchy", "Soft", "Pluck", "Swell"];
         println!("🎵 Repo: {} | Branch: {} [{}] ({}){}{}{} | {:.0} BPM | {} grid", repo, branch, mode_label, preset_name, hit_tag, hybrid_tag, spooky_tag, brk_bpm, grid_label);
         if !single_hit {
@@ -2512,8 +2524,7 @@ where
     // Compute quantize grid in samples (snap arp notes to BPM-derived grid)
     let break_idx = voice.drum_pattern_idx % CLASSIC_BREAKS.len();
     let brk_bpm = CLASSIC_BREAKS[break_idx].bpm;
-    let sixteenth = 60.0 / brk_bpm / 4.0 * sample_rate;
-    let grid_samples = (sixteenth * melody.quantize_subdiv).round() as usize;
+    let grid_samples = (sixteenth_samples(brk_bpm, sample_rate) * melody.quantize_subdiv).round() as usize;
 
     // Single-hit reverb state (light 8% reverb for percussive events)
     let mut hit_reverb = SimpleReverb::new(sample_rate);
@@ -2880,8 +2891,10 @@ fn generate_arpeggio(notes: &[f32], time: f32, current_sample: usize, total_samp
     }
     *boundaries.last_mut().unwrap() = total_samples;
 
-    // Snap interior boundaries to the nearest BPM grid point
-    if grid_samples > 0 {
+    // Snap interior boundaries to the nearest BPM grid point.
+    // Skip quantization when there are too many notes to fit the grid —
+    // each note needs at least one grid step, so we need num_notes * grid_samples <= total_samples.
+    if num_notes * grid_samples <= total_samples {
         for b in boundaries[1..num_notes].iter_mut() {
             *b = ((*b as f32 / grid_samples as f32).round() as usize) * grid_samples;
         }
@@ -2889,9 +2902,6 @@ fn generate_arpeggio(notes: &[f32], time: f32, current_sample: usize, total_samp
         for i in 1..boundaries.len() - 1 {
             if boundaries[i] <= boundaries[i - 1] {
                 boundaries[i] = boundaries[i - 1] + grid_samples;
-            }
-            if boundaries[i] >= total_samples {
-                boundaries[i] = total_samples.saturating_sub(grid_samples * (boundaries.len() - 1 - i));
             }
         }
         *boundaries.last_mut().unwrap() = total_samples;
@@ -3055,6 +3065,9 @@ struct PlayerState {
     synth_preset: AtomicU8,          // 0-6 (index into SYNTH_PRESETS)
     pad_shape_idx: AtomicU8,         // 0-5 (index into PAD_SHAPES)
     sustain: AtomicBool,             // hold notes without decay
+    // Mode & note sequencer
+    mode: AtomicU8,                  // 0=drums, 1=keys
+    note_steps: [AtomicU8; 16],      // note at each step: 0=off, 1-16=semitone+1
 }
 
 impl PlayerState {
@@ -3082,6 +3095,8 @@ impl PlayerState {
             synth_preset: AtomicU8::new(2), // Iceman (default)
             pad_shape_idx: AtomicU8::new(0),
             sustain: AtomicBool::new(false),
+            mode: AtomicU8::new(0),
+            note_steps: std::array::from_fn(|_| AtomicU8::new(0)),
         }
     }
 
@@ -3297,7 +3312,7 @@ fn start_player_audio(state: Arc<PlayerState>, voice: &RepoVoice) -> Result<cpal
                 let mut drum_out = 0.0;
                 if state.playing.load(Relaxed) {
                     let bpm = state.bpm.load(Relaxed) as f32;
-                    let step_samples = (60.0 / bpm / 4.0 * sample_rate) as u64;
+                    let step_samples = sixteenth_samples(bpm, sample_rate) as u64;
                     if step_samples > 0 {
                         let current_step = ((sample_counter / step_samples) % 16) as u8;
                         state.playhead.store(current_step, Relaxed);
@@ -3305,6 +3320,14 @@ fn start_player_audio(state: Arc<PlayerState>, voice: &RepoVoice) -> Result<cpal
                         if current_step != prev_step {
                             step_time = 0.0;
                             prev_step = current_step;
+                            // Trigger sequenced note at this step
+                            let note_val = state.note_steps[current_step as usize].load(Relaxed);
+                            if note_val > 0 {
+                                let semitone = (note_val - 1) as usize;
+                                if semitone < 16 {
+                                    state.note_triggers[semitone].store(200, Relaxed);
+                                }
+                            }
                         }
 
                         let flags = state.steps[current_step as usize].load(Relaxed);
@@ -3347,12 +3370,22 @@ fn start_player_audio(state: Arc<PlayerState>, voice: &RepoVoice) -> Result<cpal
     Ok(stream)
 }
 
+/// Note name for a semitone offset from the given root.
+fn note_label(root_name: &str, semitone: usize) -> String {
+    let root_idx = NOTE_NAMES.iter().position(|n| *n == root_name).unwrap_or(0);
+    let note_idx = (root_idx + semitone) % 12;
+    let oct = 4 + (root_idx + semitone) / 12;
+    format!("{}{}", NOTE_NAMES[note_idx], oct)
+}
+
 /// Render the step sequencer grid to the terminal.
 fn render_grid(
     state: &PlayerState,
     cursor_step: usize,
     cursor_row: usize,
+    root_name: &str,
     scale_name: &str,
+    show_help: bool,
     stdout: &mut impl std::io::Write,
 ) -> Result<()> {
     use crossterm::{cursor::MoveTo, terminal::{Clear, ClearType}};
@@ -3365,18 +3398,21 @@ fn render_grid(
     let playing = state.playing.load(Relaxed);
     let playhead = state.playhead.load(Relaxed) as usize;
     let recording = state.recording.load(Relaxed);
+    let mode = state.mode.load(Relaxed); // 0=drums, 1=keys
+    let mode_label = if mode == 0 { "DRUMS" } else { "KEYS" };
     let status = if recording { "\x1b[31mREC\x1b[0m" }
         else if playing { "PLAYING" }
         else { "PAUSED" };
 
     // Header
-    write!(stdout, " branch-tone player --- {} @ {} BPM --- [{}]\r\n\r\n", break_name, bpm, status)?;
+    write!(stdout, " branch-tone player ─── {} @ {} BPM ─── [{}] ─── {}\r\n\r\n",
+        break_name, bpm, status, mode_label)?;
 
     // Column headers
-    write!(stdout, "   ")?;
+    write!(stdout, "      ")?;
     for i in 0..16 {
         if i == playhead && playing {
-            write!(stdout, "{}{:>2} {}", "\x1b[1m", i + 1, "\x1b[0m")?;
+            write!(stdout, "\x1b[1m{:>2}\x1b[0m ", i + 1)?;
         } else {
             write!(stdout, "{:>2} ", i + 1)?;
         }
@@ -3386,54 +3422,84 @@ fn render_grid(
     // Drum rows: K, S, H, O
     let row_labels = ['K', 'S', 'H', 'O'];
     let row_flags = [K, S, H, O];
+    let in_drum_mode = mode == 0;
 
     for (row, (&label, &flag)) in row_labels.iter().zip(row_flags.iter()).enumerate() {
-        write!(stdout, "{}  ", label)?;
+        write!(stdout, "  {}   ", label)?;
         for step in 0..16 {
             let flags = state.steps[step].load(Relaxed);
             let vel = state.velocities[step].load(Relaxed);
             let active = flags & flag != 0;
-            let is_cursor = step == cursor_step && row == cursor_row;
+            let is_cursor = in_drum_mode && step == cursor_step && row == cursor_row;
             let is_playhead = step == playhead && playing;
 
             let symbol = if active && vel > 100 {
                 "●"
             } else if active && vel > 0 {
-                "○" // ghost hit
+                "○"
             } else {
-                "·"     // empty
+                "·"
             };
 
             if is_cursor {
-                // Inverted for cursor
                 write!(stdout, "\x1b[7m")?;
-            }
-            if is_playhead && !is_cursor {
-                // Bold for playhead column
+            } else if is_playhead {
                 write!(stdout, "\x1b[1m")?;
             }
 
             write!(stdout, " {} ", symbol)?;
 
-            if is_cursor || (is_playhead && !is_cursor) {
+            if is_cursor || is_playhead {
                 write!(stdout, "\x1b[0m")?;
             }
         }
         write!(stdout, "\r\n")?;
     }
 
-    // Playhead indicator
-    write!(stdout, "\r\n   ")?;
-    for i in 0..16 {
-        if i == playhead && playing {
-            write!(stdout, " \u{25b2} ")?; // ▲
+    // Separator + note lane
+    write!(stdout, "  ─────────────────────────────────────────────────────\r\n")?;
+    write!(stdout, "  ♪   ")?;
+    for step in 0..16 {
+        let note_val = state.note_steps[step].load(Relaxed);
+        let is_cursor = !in_drum_mode && step == cursor_step;
+        let is_playhead = step == playhead && playing;
+
+        if is_cursor {
+            write!(stdout, "\x1b[7m")?;
+        } else if is_playhead && note_val > 0 {
+            write!(stdout, "\x1b[1;36m")?;
+        }
+
+        if note_val > 0 {
+            let label = note_label(root_name, (note_val - 1) as usize);
+            write!(stdout, "{:>3}", label)?;
         } else {
-            write!(stdout, "   ")?;
+            write!(stdout, " · ")?;
+        }
+
+        if is_cursor || (is_playhead && note_val > 0) {
+            write!(stdout, "\x1b[0m")?;
         }
     }
     write!(stdout, "\r\n")?;
 
-    // Piano settings display
+    // Playhead indicator
+    write!(stdout, "      ")?;
+    for i in 0..16 {
+        if i == playhead && playing {
+            write!(stdout, " ▲ ")?;
+        } else {
+            write!(stdout, "   ")?;
+        }
+    }
+    write!(stdout, "\r\n\r\n")?;
+
+    // Both visualizations — drum kit + piano keyboard
+    render_drum_kit(state, playhead, playing, stdout)?;
+    write!(stdout, "\r\n")?;
+    render_piano_keys(state, root_name, playhead, playing, stdout)?;
+
+    // Settings line
     let oct = state.octave_shift.load(Relaxed);
     let oct_str = if oct > 0 { format!("+{}", oct) } else { format!("{}", oct) };
     let preset_idx = state.synth_preset.load(Relaxed) as usize;
@@ -3441,29 +3507,243 @@ fn render_grid(
     let pad_idx = state.pad_shape_idx.load(Relaxed) as usize;
     let pad_name = PAD_SHAPE_NAMES[pad_idx.min(PAD_SHAPE_NAMES.len() - 1)];
     let sustain = state.sustain.load(Relaxed);
-    let sustain_str = if sustain { " | \x1b[33mSUSTAIN\x1b[0m" } else { "" };
+    let sustain_str = if sustain { " │ \x1b[33mSUSTAIN\x1b[0m" } else { "" };
 
-    write!(stdout, "\r\n Piano: Oct {} | Synth: {} | Shape: {}{}\r\n", oct_str, preset_name, pad_name, sustain_str)?;
+    write!(stdout, "\r\n  Synth: {} │ Oct {} │ Shape: {} │ {}{}\r\n", preset_name, oct_str, pad_name, scale_name, sustain_str)?;
 
-    // Piano keyboard display
-    write!(stdout, "\r\n    W E   T Y U   O P\r\n")?;
-    write!(stdout, "   A S D F G H J K L       [{}]\r\n", scale_name)?;
-
-    // Help text
-    write!(stdout, "\r\n [enter] toggle  [i] ghost  [</>] move  [^/v] row\r\n")?;
-    write!(stdout, " [1-0] pattern   [+/-] BPM  [space] play/pause  [q] quit\r\n")?;
-    write!(stdout, " [A-L] piano     [r] record  [z/x/c/v] rec K/S/H/O\r\n")?;
-    write!(stdout, " [\\[/\\]] octave  [,/.] synth  [;/'] pad shape  [tab] sustain\r\n")?;
+    // Help (toggled with ?)
+    write!(stdout, "\r\n")?;
+    if show_help {
+        if mode == 0 {
+            write!(stdout, "  [enter] toggle  [i] ghost  [←/→] step  [↑/↓] row  [m] keys mode\r\n")?;
+            write!(stdout, "  [1-0] pattern  [+/-] BPM  [space] play/pause  [r] record\r\n")?;
+            write!(stdout, "  [A-L] piano  [z/x/c/v] rec K/S/H/O  [\\[/\\]] oct  [,/.] synth  [tab] sustain\r\n")?;
+        } else {
+            write!(stdout, "  [↑/↓] pitch  [←/→] step  [enter] clear  [m] drums mode\r\n")?;
+            write!(stdout, "  [A-L/W-P] place note at step  [+/-] BPM  [space] play/pause\r\n")?;
+            write!(stdout, "  [\\[/\\]] oct  [,/.] synth  [;/'] shape  [tab] sustain  [1-0] pattern\r\n")?;
+        }
+        write!(stdout, "  [?] hide help  [ctrl+c] quit\r\n")?;
+    } else {
+        write!(stdout, "  \x1b[2m[?] help  [ctrl+c] quit\x1b[0m\r\n")?;
+    }
 
     stdout.flush()?;
     Ok(())
 }
 
+/// Render ASCII drum kit visualization with active drum highlighting.
+fn render_drum_kit(
+    state: &PlayerState,
+    playhead: usize,
+    playing: bool,
+    stdout: &mut impl std::io::Write,
+) -> Result<()> {
+    let (kick, snare, hh, oh) = if playing {
+        let flags = state.steps[playhead].load(Relaxed);
+        let vel = state.velocities[playhead].load(Relaxed);
+        if vel > 0 {
+            (flags & K != 0, flags & S != 0, flags & H != 0, flags & O != 0)
+        } else {
+            (false, false, false, false)
+        }
+    } else {
+        (false, false, false, false)
+    };
+
+    // ANSI helpers: bold-inverse for hit, dim for idle
+    let on = "\x1b[1;7m";
+    let off = "\x1b[0m";
+    let dim = "\x1b[2m";
+
+    let (hl, hr) = if hh { (on, off) } else { (dim, off) };
+    let (ol, or_) = if oh { (on, off) } else { (dim, off) };
+    let (sl, sr) = if snare { (on, off) } else { (dim, off) };
+    let (kl, kr) = if kick { (on, off) } else { (dim, off) };
+
+    //  Drum kit — front view, box-drawing
+    write!(stdout, "  {}┌──────────┐{}                  {}┌──────────┐{}\r\n", hl, hr, ol, or_)?;
+    write!(stdout, "  {}│ ░ HI-HAT │{}                  {}│ ░  OPEN  │{}\r\n", hl, hr, ol, or_)?;
+    write!(stdout, "  {}└────┬─────┘{}                  {}└─────┬────┘{}\r\n", hl, hr, ol, or_)?;
+    write!(stdout, "       │    {}┌──────────────┐{}       │\r\n", sl, sr)?;
+    write!(stdout, "       │    {}│              │{}       │\r\n", sl, sr)?;
+    write!(stdout, "       │    {}│    SNARE     │{}       │\r\n", sl, sr)?;
+    write!(stdout, "       │    {}└──────┬───────┘{}       │\r\n", sl, sr)?;
+    write!(stdout, "       │   {}┌───────┴────────┐{}     │\r\n", kl, kr)?;
+    write!(stdout, "       │   {}│                │{}     │\r\n", kl, kr)?;
+    write!(stdout, "       └───{}│     K I C K    │{}─────┘\r\n", kl, kr)?;
+    write!(stdout, "           {}│                │{}\r\n", kl, kr)?;
+    write!(stdout, "           {}└────────────────┘{}\r\n", kl, kr)?;
+
+    Ok(())
+}
+
+/// Render piano keyboard with active note highlighting.
+fn render_piano_keys(
+    state: &PlayerState,
+    root_name: &str,
+    playhead: usize,
+    playing: bool,
+    stdout: &mut impl std::io::Write,
+) -> Result<()> {
+    let root_idx = NOTE_NAMES.iter().position(|n| *n == root_name).unwrap_or(0);
+
+    // Which semitones are currently active (live keys + sequenced note at playhead)
+    let mut active = [false; 16];
+    for i in 0..16 {
+        if state.note_triggers[i].load(Relaxed) > 0 {
+            active[i] = true;
+        }
+    }
+    if playing {
+        let note_val = state.note_steps[playhead].load(Relaxed);
+        if note_val > 0 && (note_val - 1) < 16 {
+            active[(note_val - 1) as usize] = true;
+        }
+    }
+
+    // Classify each semitone as black or white key
+    let is_black = |semitone: usize| -> bool {
+        matches!((root_idx + semitone) % 12, 1 | 3 | 6 | 8 | 10)
+    };
+
+    // Does this white key have a black key to its right?
+    let has_black_right = |semitone: usize| -> bool {
+        semitone + 1 < 16 && is_black(semitone + 1)
+    };
+
+    // Keyboard key labels
+    const KEY_MAP: [&str; 16] = [
+        "a", "w", "s", "e", "d", "f", "t", "g", "y", "h", "u", "j", "k", "o", "l", "p",
+    ];
+
+    let on = "\x1b[1;7m";       // bold inverse for active
+    let blk_on = "\x1b[1;7;33m"; // bold inverse yellow for active black key
+    let blk_bg = "\x1b[40;97m";  // white-on-black for black keys
+    let rst = "\x1b[0m";
+
+    // Build ordered list of white key indices and black key indices
+    let mut whites: Vec<usize> = Vec::new();
+    let mut blacks: Vec<usize> = Vec::new();
+    for i in 0..16 {
+        if is_black(i) { blacks.push(i); } else { whites.push(i); }
+    }
+
+    // Each white key is 5 chars wide. Total width: whites.len() * 5 + 1 (for final border)
+    let w_count = whites.len();
+
+    // Row 1: Top border with black key slots
+    // Black keys sit between white keys — we render them in the top 3 rows
+    write!(stdout, "    ┌")?;
+    for (wi, &w) in whites.iter().enumerate() {
+        if has_black_right(w) {
+            write!(stdout, "───┬──")?;
+        } else {
+            write!(stdout, "─────")?;
+        }
+        if wi < w_count - 1 {
+            // Check if next white key has black to its LEFT (i.e., current white has black right)
+            if has_black_right(w) {
+                write!(stdout, "")?; // ┬ already placed
+            } else {
+                write!(stdout, "┬")?;
+            }
+        }
+    }
+    write!(stdout, "┐\r\n")?;
+
+    // Row 2-3: Black key bodies (raised) + white key upper space
+    for _row in 0..2 {
+        write!(stdout, "    │")?;
+        for (wi, &w) in whites.iter().enumerate() {
+            if has_black_right(w) {
+                let bi = w + 1; // the black key semitone
+                let a = active[bi];
+                if a { write!(stdout, "{}", blk_on)?; }
+                else { write!(stdout, "{}", blk_bg)?; }
+                write!(stdout, "   │{:>2}", note_label(root_name, bi))?;
+                write!(stdout, "{}", rst)?;
+            } else {
+                write!(stdout, "     ")?;
+            }
+            if wi < w_count - 1 {
+                if has_black_right(w) {
+                    write!(stdout, "")?;
+                } else {
+                    write!(stdout, "│")?;
+                }
+            }
+        }
+        write!(stdout, "│\r\n")?;
+    }
+
+    // Row 4: Black key bottom border merging into white key body
+    write!(stdout, "    │")?;
+    for (wi, &w) in whites.iter().enumerate() {
+        if has_black_right(w) {
+            write!(stdout, "   └──")?;
+        } else {
+            write!(stdout, "     ")?;
+        }
+        if wi < w_count - 1 {
+            if has_black_right(w) {
+                write!(stdout, "")?;
+            } else {
+                write!(stdout, "│")?;
+            }
+        }
+    }
+    write!(stdout, "│\r\n")?;
+
+    // Row 5: White key note names
+    write!(stdout, "    │")?;
+    for (wi, &w) in whites.iter().enumerate() {
+        let a = active[w];
+        let label = note_label(root_name, w);
+        let wide = if has_black_right(w) { 6 } else { 5 };
+        if a { write!(stdout, "{}", on)?; }
+        write!(stdout, " {:>3}{}", label, " ".repeat(wide - 4))?;
+        if a { write!(stdout, "{}", rst)?; }
+        if wi < w_count - 1 && !has_black_right(w) {
+            write!(stdout, "│")?;
+        }
+    }
+    write!(stdout, "│\r\n")?;
+
+    // Row 6: White key keyboard shortcuts
+    write!(stdout, "    │")?;
+    for (wi, &w) in whites.iter().enumerate() {
+        let a = active[w];
+        let wide = if has_black_right(w) { 6 } else { 5 };
+        if a { write!(stdout, "{}", on)?; }
+        write!(stdout, "  {}  {}", KEY_MAP[w], " ".repeat(wide - 5))?;
+        if a { write!(stdout, "{}", rst)?; }
+        if wi < w_count - 1 && !has_black_right(w) {
+            write!(stdout, "│")?;
+        }
+    }
+    write!(stdout, "│\r\n")?;
+
+    // Bottom border
+    write!(stdout, "    └")?;
+    for (wi, &w) in whites.iter().enumerate() {
+        let wide = if has_black_right(w) { 6 } else { 5 };
+        write!(stdout, "{}", "─".repeat(wide))?;
+        if wi < w_count - 1 && !has_black_right(w) {
+            write!(stdout, "┴")?;
+        }
+    }
+    write!(stdout, "┘\r\n")?;
+
+    Ok(())
+}
+
 /// Main entry point for the interactive step sequencer.
 fn run_player(initial_pattern: usize, initial_bpm: Option<u16>) -> Result<()> {
-    use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
     let voice = detect_repo_voice();
+    let root_name = voice.root_name.clone();
     let scale_name = format!("{} {}", voice.root_name, voice.scale_name);
     let state = Arc::new(PlayerState::new(initial_pattern));
     if let Some(bpm) = initial_bpm {
@@ -3478,28 +3758,56 @@ fn run_player(initial_pattern: usize, initial_bpm: Option<u16>) -> Result<()> {
 
     let mut stdout = std::io::stdout();
     let mut cursor_step: usize = 0;
-    let mut cursor_row: usize = 0; // 0=K, 1=S, 2=H, 3=O
+    let mut cursor_row: usize = 0; // 0=K, 1=S, 2=H, 3=O (drum mode)
+    let mut show_help = false;
+
+    // Map piano key char → semitone index (0-15)
+    let key_to_semitone = |c: char| -> Option<usize> {
+        match c {
+            'a' => Some(0),  'w' => Some(1),  's' => Some(2),  'e' => Some(3),
+            'd' => Some(4),  'f' => Some(5),  't' => Some(6),  'g' => Some(7),
+            'y' => Some(8),  'h' => Some(9),  'u' => Some(10), 'j' => Some(11),
+            'k' => Some(12), 'o' => Some(13), 'l' => Some(14), 'p' => Some(15),
+            _ => None,
+        }
+    };
 
     loop {
-        render_grid(&state, cursor_step, cursor_row, &scale_name, &mut stdout)?;
+        render_grid(&state, cursor_step, cursor_row, &root_name, &scale_name, show_help, &mut stdout)?;
 
         if event::poll(Duration::from_millis(33))? {
             if let Event::Key(key) = event::read()? {
-                // Only handle Press events (avoid double-firing on release)
                 if key.kind != KeyEventKind::Press { continue; }
 
                 let recording = state.recording.load(Relaxed);
+                let mode = state.mode.load(Relaxed);
+
+                // Ctrl+C to quit
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                    state.quit.store(true, Relaxed);
+                    break;
+                }
 
                 match key.code {
-                    KeyCode::Char('q') => {
-                        state.quit.store(true, Relaxed);
-                        break;
+                    // Help toggle
+                    KeyCode::Char('?') => {
+                        show_help = !show_help;
                     }
-                    // Grid editing
+                    // Mode switch
+                    KeyCode::Char('m') if !recording => {
+                        let cur = state.mode.load(Relaxed);
+                        state.mode.store(if cur == 0 { 1 } else { 0 }, Relaxed);
+                    }
+                    // Grid editing (mode-aware)
                     KeyCode::Enter => {
-                        state.toggle_step(cursor_step, drum_for_row(cursor_row));
+                        if mode == 0 {
+                            state.toggle_step(cursor_step, drum_for_row(cursor_row));
+                        } else {
+                            // Clear note at cursor step
+                            state.note_steps[cursor_step].store(0, Relaxed);
+                        }
                     }
-                    KeyCode::Char('i') => {
+                    KeyCode::Char('i') if mode == 0 => {
                         state.cycle_velocity(cursor_step);
                     }
                     // Transport
@@ -3507,7 +3815,7 @@ fn run_player(initial_pattern: usize, initial_bpm: Option<u16>) -> Result<()> {
                         let was = state.playing.load(Relaxed);
                         state.playing.store(!was, Relaxed);
                     }
-                    KeyCode::Char('r') => {
+                    KeyCode::Char('r') if mode == 0 => {
                         let was = state.recording.load(Relaxed);
                         state.recording.store(!was, Relaxed);
                         if !was { state.playing.store(true, Relaxed); }
@@ -3520,10 +3828,31 @@ fn run_player(initial_pattern: usize, initial_bpm: Option<u16>) -> Result<()> {
                         cursor_step = (cursor_step + 1).min(15);
                     }
                     KeyCode::Up => {
-                        cursor_row = cursor_row.saturating_sub(1);
+                        if mode == 0 {
+                            cursor_row = cursor_row.saturating_sub(1);
+                        } else {
+                            // Raise pitch at cursor step (wraps 16 → 0 = off)
+                            let cur = state.note_steps[cursor_step].load(Relaxed);
+                            let next = if cur >= 16 { 0 } else { cur + 1 };
+                            state.note_steps[cursor_step].store(next, Relaxed);
+                            // Play the note live for feedback
+                            if next > 0 {
+                                state.note_triggers[(next - 1) as usize].store(200, Relaxed);
+                            }
+                        }
                     }
                     KeyCode::Down => {
-                        cursor_row = (cursor_row + 1).min(3);
+                        if mode == 0 {
+                            cursor_row = (cursor_row + 1).min(3);
+                        } else {
+                            // Lower pitch at cursor step (wraps 0 → 16)
+                            let cur = state.note_steps[cursor_step].load(Relaxed);
+                            let next = if cur == 0 { 16 } else { cur - 1 };
+                            state.note_steps[cursor_step].store(next, Relaxed);
+                            if next > 0 {
+                                state.note_triggers[(next - 1) as usize].store(200, Relaxed);
+                            }
+                        }
                     }
                     KeyCode::Char('+') | KeyCode::Char('=') => {
                         let cur = state.bpm.load(Relaxed);
@@ -3539,47 +3868,40 @@ fn run_player(initial_pattern: usize, initial_bpm: Option<u16>) -> Result<()> {
                             state.load_pattern(idx);
                         }
                     }
-                    // Piano: white keys A-L (chromatic semitones 0,2,4,5,7,9,11,12,14)
-                    KeyCode::Char('a') => state.note_triggers[0].store(200, Relaxed),  // root
-                    KeyCode::Char('s') => state.note_triggers[2].store(200, Relaxed),  // +2
-                    KeyCode::Char('d') => state.note_triggers[4].store(200, Relaxed),  // +4
-                    KeyCode::Char('f') => state.note_triggers[5].store(200, Relaxed),  // +5
-                    KeyCode::Char('g') => state.note_triggers[7].store(200, Relaxed),  // +7
-                    KeyCode::Char('h') => state.note_triggers[9].store(200, Relaxed),  // +9
-                    KeyCode::Char('j') => state.note_triggers[11].store(200, Relaxed), // +11
-                    KeyCode::Char('k') => state.note_triggers[12].store(200, Relaxed), // +12 (octave)
-                    KeyCode::Char('l') => state.note_triggers[14].store(200, Relaxed), // +14
-                    // Piano: black keys W,E,T,Y,U,O,P (sharps/flats)
-                    KeyCode::Char('w') => state.note_triggers[1].store(200, Relaxed),  // +1
-                    KeyCode::Char('e') => state.note_triggers[3].store(200, Relaxed),  // +3
-                    KeyCode::Char('t') => state.note_triggers[6].store(200, Relaxed),  // +6
-                    KeyCode::Char('y') => state.note_triggers[8].store(200, Relaxed),  // +8
-                    KeyCode::Char('u') => state.note_triggers[10].store(200, Relaxed), // +10
-                    KeyCode::Char('o') => state.note_triggers[13].store(200, Relaxed), // +13
-                    KeyCode::Char('p') => state.note_triggers[15].store(200, Relaxed), // +15
+                    // Piano keys: play live + write to step in keys mode
+                    KeyCode::Char(c) if key_to_semitone(c).is_some() => {
+                        let semitone = key_to_semitone(c).unwrap();
+                        // Always trigger live sound
+                        state.note_triggers[semitone].store(200, Relaxed);
+                        // In keys mode: also write to note grid + advance cursor
+                        if mode == 1 {
+                            state.note_steps[cursor_step].store((semitone + 1) as u8, Relaxed);
+                            cursor_step = (cursor_step + 1).min(15);
+                        }
+                    }
                     // Record-mode drum triggers: z/x/c/v write at playhead
-                    KeyCode::Char('z') if recording => {
+                    KeyCode::Char('z') if recording && mode == 0 => {
                         let step = state.playhead.load(Relaxed) as usize;
                         state.steps[step].fetch_or(K, Relaxed);
                         if state.velocities[step].load(Relaxed) == 0 {
                             state.velocities[step].store(200, Relaxed);
                         }
                     }
-                    KeyCode::Char('x') if recording => {
+                    KeyCode::Char('x') if recording && mode == 0 => {
                         let step = state.playhead.load(Relaxed) as usize;
                         state.steps[step].fetch_or(S, Relaxed);
                         if state.velocities[step].load(Relaxed) == 0 {
                             state.velocities[step].store(200, Relaxed);
                         }
                     }
-                    KeyCode::Char('c') if recording => {
+                    KeyCode::Char('c') if recording && mode == 0 => {
                         let step = state.playhead.load(Relaxed) as usize;
                         state.steps[step].fetch_or(H, Relaxed);
                         if state.velocities[step].load(Relaxed) == 0 {
                             state.velocities[step].store(200, Relaxed);
                         }
                     }
-                    KeyCode::Char('v') if recording => {
+                    KeyCode::Char('v') if recording && mode == 0 => {
                         let step = state.playhead.load(Relaxed) as usize;
                         state.steps[step].fetch_or(O, Relaxed);
                         if state.velocities[step].load(Relaxed) == 0 {
@@ -4356,6 +4678,53 @@ mod tests {
         assert!(state.sustain.load(Relaxed));
         state.sustain.store(false, Relaxed);
         assert!(!state.sustain.load(Relaxed));
+    }
+
+    // -- Note step sequencer tests --
+
+    #[test]
+    fn player_note_steps_default_off() {
+        let state = PlayerState::new(0);
+        for i in 0..16 {
+            assert_eq!(state.note_steps[i].load(Relaxed), 0, "step {} should be off", i);
+        }
+    }
+
+    #[test]
+    fn player_note_steps_write_and_read() {
+        let state = PlayerState::new(0);
+        // Write a note (semitone 5 → stored as 6)
+        state.note_steps[3].store(6, Relaxed);
+        assert_eq!(state.note_steps[3].load(Relaxed), 6);
+        // Clear it
+        state.note_steps[3].store(0, Relaxed);
+        assert_eq!(state.note_steps[3].load(Relaxed), 0);
+    }
+
+    #[test]
+    fn player_mode_toggle() {
+        let state = PlayerState::new(0);
+        assert_eq!(state.mode.load(Relaxed), 0, "should start in drums mode");
+        state.mode.store(1, Relaxed);
+        assert_eq!(state.mode.load(Relaxed), 1);
+        state.mode.store(0, Relaxed);
+        assert_eq!(state.mode.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn note_label_chromatic() {
+        assert_eq!(note_label("C", 0), "C4");
+        assert_eq!(note_label("C", 12), "C5");
+        assert_eq!(note_label("C", 7), "G4");
+        assert_eq!(note_label("A", 0), "A4");
+        assert_eq!(note_label("A", 3), "C5");  // A + 3 semitones = C (next octave group)
+    }
+
+    #[test]
+    fn sixteenth_samples_correct() {
+        // At 120 BPM, one beat = 0.5s, one 16th = 0.125s = 5512.5 samples at 44100
+        let s = sixteenth_samples(120.0, 44100.0);
+        assert!((s - 5512.5).abs() < 1.0, "expected ~5512.5, got {}", s);
     }
 
     // -- Synth preset per repo tests --
