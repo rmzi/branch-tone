@@ -1517,7 +1517,13 @@ impl PhraseParams {
             voice.hit_count = 1 + (voice.hit_count - 1 + event_seed as usize) % 4;
         }
 
-        let melody = BranchMelody::from_branch(branch, effective_steps);
+        let mut melody = BranchMelody::from_branch(branch, effective_steps);
+
+        // Rotate envelope shape by event_seed — each event gets a different ADSR feel.
+        // This is critical for comping/stab/bass variety within the same category.
+        if event_seed > 0 {
+            melody.envelope_shape = (melody.envelope_shape + event_seed as usize) % ENVELOPE_SHAPES.len();
+        }
 
         // Notes from repo's pattern + scale (repo = identity),
         // interval_spread from branch adds subtle reharmonization
@@ -1918,13 +1924,13 @@ fn hook_play_args(event: &str, repo: String, branch: String, spooky: bool) -> Pl
         // Long, full bloom — always at least 5 notes, always dub delay
         "SessionStart" => tonal(
             repo, branch, spooky, mode_effects, mode_steps,
-            3500, 0.45, 5,
+            3500, 0.35, 5,
             true, false, false,
             EventCategory::SessionBoundary, 1,
         ),
         "SessionEnd" => tonal(
             repo, branch, spooky, mode_effects, mode_steps,
-            3500, 0.38, 5,
+            3500, 0.30, 5,
             true, true, false,
             EventCategory::SessionBoundary, 4,
         ),
@@ -2004,25 +2010,25 @@ fn hook_play_args(event: &str, repo: String, branch: String, spooky: bool) -> Pl
         // Dub delay, randomize for organic feel
         "SubagentStart" => tonal(
             repo, branch, spooky, mode_effects, mode_steps,
-            1000, 0.15, 3,
+            1000, 0.25, 3,
             true, false, true,
             EventCategory::Bass, 7,
         ),
         "SubagentStop" => tonal(
             repo, branch, spooky, mode_effects, mode_steps,
-            1000, 0.15, 3,
+            1000, 0.25, 3,
             true, true, true,
             EventCategory::Bass, 8,
         ),
         "WorktreeCreate" => tonal(
             repo, branch, spooky, mode_effects, mode_steps,
-            1200, 0.15, 3,
+            1200, 0.25, 3,
             true, false, false,
             EventCategory::Bass, 14,
         ),
         "WorktreeRemove" => tonal(
             repo, branch, spooky, mode_effects, mode_steps,
-            1200, 0.15, 3,
+            1200, 0.25, 3,
             true, true, false,
             EventCategory::Bass, 15,
         ),
