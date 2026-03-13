@@ -28,37 +28,37 @@ Each voice corresponds to an `EventCategory` that shapes the sound:
 Category         Octave  Transpose  Steps   Register
 ───────────────  ──────  ─────────  ──────  ─────────────
 SessionBoundary  1.0x    0          5       Center — full chord
-Attention        1.0x    +5         max(3)  Bright via transpose, not octave
+Attention        1.0x    +2         max(3)  Whole step up — bright but close
 DrumHit          1.0x    0          1       Center — single punch
 ToolPulse        2.0x    0          1       High — barely audible click
-Bass             0.5x    -5         3       Low — foundation
-Lifecycle        0.75x   +3         3       Below pad — comping texture
+Bass             0.5x    -2         3       Whole step down — foundation
+Lifecycle        0.75x   +1         3       Half step up — subtle color shift
 Default          1.0x    0          base    Center — fallback
 ```
 
-## Duration & Volume Map
+## Duration, Volume & Effects Map
 
 ```
-Event                Dur(ms)  Vol    Voice           Seed
-───────────────────  ───────  ─────  ──────────────  ────
-SessionStart         3500     0.30   Keys/Pad        1
-SessionEnd           3500     0.25   Keys/Pad        4
-Stop                 400      0.12   Drums (snare)   3
-UserPromptSubmit     350      0.08   Drums (kick)    5
-PreToolUse           120      0.05   Hi-Hat (closed) 11
-PostToolUse          150      0.05   Hi-Hat (open)   12
-PostToolUseFailure   250      0.08   Hi-Hat (rim)    13
-PermissionRequest    2500     0.18   Horn            2
-Notification         2000     0.15   Horn            6
-SubagentStart        1000     0.10   Bass (ascend)   7
-SubagentStop         1000     0.10   Bass (descend)  8
-WorktreeCreate       1200     0.10   Bass (ascend)   14
-WorktreeRemove       1200     0.10   Bass (descend)  15
-InstructionsLoaded   1500     0.10   Piano (arp)     16
-ConfigChange         1800     0.10   Piano (shift)   17
-TaskCompleted        2500     0.15   Piano (resolve) 18
-PreCompact           2000     0.10   Piano (sweep)   9
-TeammateIdle         1500     0.08   Piano (hold)    10
+Event                Dur(ms)  Vol    Voice           Effects                      Seed
+───────────────────  ───────  ─────  ──────────────  ───────────────────────────── ────
+SessionStart         3500     0.30   Keys/Pad        bulldozer+chorus+dub         1
+SessionEnd           3500     0.25   Keys/Pad        bulldozer+chorus+dub+reverse 4
+Stop                 400      0.12   Drums (snare)   single_hit                   3
+UserPromptSubmit     350      0.08   Drums (kick)    single_hit                   5
+PreToolUse           120      0.05   Hi-Hat (closed) single_hit                   11
+PostToolUse          150      0.05   Hi-Hat (open)   single_hit                   12
+PostToolUseFailure   250      0.08   Hi-Hat (rim)    single_hit                   13
+PermissionRequest    2500     0.18   Horn            bulldozer+chorus+dub         2
+Notification         2000     0.15   Horn            bulldozer+chorus+dub         6
+SubagentStart        1000     0.10   Bass (ascend)   pad+dub                      7
+SubagentStop         1000     0.10   Bass (descend)  pad+chorus+dub+reverse       8
+WorktreeCreate       1200     0.10   Bass (ascend)   pad+dub                      14
+WorktreeRemove       1200     0.10   Bass (descend)  pad+dub+reverse              15
+InstructionsLoaded   1500     0.10   Piano (arp)     pad+chorus+dub               16
+ConfigChange         1800     0.10   Piano (shift)   pad+tremolo+dub              17
+TaskCompleted        2500     0.15   Piano (resolve) pad+chorus+dub               18
+PreCompact           2000     0.10   Piano (sweep)   pad+chorus+dub+reverse       9
+TeammateIdle         1500     0.08   Piano (hold)    pad+chorus+dub               10
 ```
 
 ## Worktree-as-Voice
@@ -118,6 +118,24 @@ hit_count=4  ○○○●            Buzz (three ghosts + primary)
              └─┘ spacing_ms
 ```
 
+## Dub Philosophy
+
+Every tonal voice (non-percussive) gets `dub_delay: true` — tape-style echo
+with wow/flutter, filtered feedback, and gradual decay. This is the core
+aesthetic: sounds don't stop, they ring out and dissolve into space. The delay
+tail means successive events layer and blend rather than replacing each other.
+
+- **Percussive events** (DrumHit, ToolPulse) stay dry — they're meant to be
+  crisp transient markers
+- **Bass events** get pad body + dub delay — low notes echo like a dubby
+  sub-bass in a sound system
+- **Lifecycle events** get pad + chorus + dub — warm chords that bloom and
+  trail off with tape echo
+- **Session events** get the full bulldozer treatment (pad + arp shimmer) +
+  chorus + dub — the richest sound in the ensemble, heard only twice per session
+- **Attention events** also use bulldozer + dub — they need to cut through
+  and demand notice
+
 ## Design Principles
 
 1. **Frequency maps to frequency**: High-firing events (tool calls) get
@@ -134,6 +152,14 @@ hit_count=4  ○○○●            Buzz (three ghosts + primary)
 4. **Deterministic identity**: Same repo+branch+event always produces the
    same sound. You learn to recognize your projects by ear.
 
-5. **PDS-informed, not PDS-coupled**: The ensemble voices map naturally to
+5. **Dub-inspired ring-out**: Every tonal event uses dub delay so sounds
+   dissolve into space rather than cutting off abruptly. Successive events
+   blend together into a continuous sonic texture.
+
+6. **Tight transpositions**: Category offsets stay within ±2 semitones of root.
+   This keeps voices in the same harmonic neighborhood — a jazz ensemble where
+   every instrument is in tune, not a cacophony of distant keys.
+
+7. **PDS-informed, not PDS-coupled**: The ensemble voices map naturally to
    agent lifecycle phases, but nothing in the code references PDS directly.
    branch-tone's design direction is driven by PDS's evolution.
