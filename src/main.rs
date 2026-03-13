@@ -4014,14 +4014,16 @@ fn generate_arpeggio(notes: &[f32], time: f32, current_sample: usize, total_samp
 
 /// Horn stab: all notes play simultaneously with a sharp attack and quick release.
 /// Think disco brass hits or jazz horn stabs — punchy, rhythmic, in-your-face.
+/// ADSR varies per event via melody.envelope_shape.
 fn generate_stab(notes: &[f32], time: f32, progress: f32, volume: f32, voice: &RepoVoice, melody: &BranchMelody, timbral: &EffectiveTimbral, category: EventCategory) -> f32 {
-    // Sharp attack: ~15ms ramp
-    let attack_time = 0.015;
-    let attack_env = (time / attack_time).min(1.0);
+    // ADSR from melody.envelope_shape — each seed gets a different stab feel
+    let (base_attack, base_decay) = ENVELOPE_SHAPES[melody.envelope_shape];
+    // Horn stab scaling: fast attack (5-40ms), varied decay
+    let attack_time = (base_attack * 0.1).max(0.005);  // 5-40ms
+    let decay_rate = 2.0 + base_decay * 20.0;          // 5-6 for punchy, 2-3 for sustained
+    let sustain = base_attack * 0.5;                    // 0.01-0.20 (punchy→held)
 
-    // Quick release: stab decays to 15% over the duration, then fades out
-    let sustain = 0.15;
-    let decay_rate = 4.0;
+    let attack_env = (time / attack_time).min(1.0);
     let decay_env = sustain + (1.0 - sustain) * (-decay_rate * progress).exp();
 
     // Final release fade in last 20%
@@ -4047,61 +4049,84 @@ fn generate_stab(notes: &[f32], time: f32, progress: f32, volume: f32, voice: &R
 
 /// Piano comping: rhythmic chord hits at regular intervals.
 /// Like a jazz pianist hitting voicings on beats 2 and 4, or a rhythmic stab pattern.
-/// Each hit has a percussive attack and exponential decay — notes ring briefly then fade.
+/// ADSR and voicing vary per event via melody.envelope_shape and event_seed-rotated notes.
 fn generate_comping(notes: &[f32], time: f32, current_sample: usize, total_samples: usize, volume: f32, voice: &RepoVoice, melody: &BranchMelody, timbral: &EffectiveTimbral, grid_samples: usize, category: EventCategory) -> f32 {
-    // Determine number of chord hits based on duration (more time = more hits)
-    // Use grid_samples to stay rhythmically locked
-    let hit_interval = (grid_samples * 4).max(1); // every 4 grid steps = 1 beat
-    let num_hits = (total_samples / hit_interval).max(1).min(8);
+    // ADSR from melody.envelope_shape — each seed gets different comping feel
+    let (base_attack, base_decay) = ENVELOPE_SHAPES[melody.envelope_shape];
+    // Piano comping scaling: percussive attack, varied ring time
+    let attack_secs = (base_attack * 0.05).max(0.003);   // 3-20ms attack
+    let decay_rate = timbral.decay_rate * (0.8 + base_decay * 5.0); // varied ring
+    let sustain_floor = base_attack * 0.15;                // tiny sustain for percussive feel
+
+    // Rhythm pattern: use envelope_shape to pick different comping rhythms
+    // shape 0 (Punchy) → every beat, shape 1 (Soft) → every 2 beats,
+    // shape 2 (Pluck) → syncopated (1-and-3), shape 3 (Swell) → backbeat (2-and-4)
+    let beat_grid = (grid_samples * 4).max(1); // 1 beat in samples
+    let total_beats = (total_samples / beat_grid).max(1).min(8);
+
+    // Generate hit pattern based on envelope shape for rhythmic variety
+    let hit_pattern: Vec<usize> = match melody.envelope_shape {
+        0 => (0..total_beats).collect(),                                           // every beat
+        1 => (0..total_beats).filter(|b| b % 2 == 0).collect(),                  // half notes
+        2 => (0..total_beats).filter(|b| b % 2 == 0 || b % 3 == 0).collect(),   // syncopated
+        _ => (0..total_beats).filter(|b| b % 2 == 1).collect(),                  // backbeat
+    };
+    let num_hits = hit_pattern.len().max(1);
 
     let mut sample = 0.0;
 
-    for hit_idx in 0..num_hits {
-        let hit_start = hit_idx * hit_interval;
+    for (hit_seq, &beat_idx) in hit_pattern.iter().enumerate() {
+        // Swing: offset even hits for groove
+        let swing_offset = if beat_idx % 2 == 1 {
+            (melody.swing * beat_grid as f32 * 0.5) as usize
+        } else {
+            0
+        };
+        let hit_start = beat_idx * beat_grid + swing_offset;
         if current_sample < hit_start {
             continue;
         }
 
         let samples_since_hit = current_sample - hit_start;
-        let hit_time = samples_since_hit as f32 / 44100.0; // approximate sample rate for envelope
+        let hit_time = samples_since_hit as f32 / 44100.0;
 
-        // Percussive attack: ~5ms
-        let attack_samples = (0.005 * 44100.0) as usize;
+        // ADSR envelope per hit
+        let attack_samples = (attack_secs * 44100.0) as usize;
         let attack = if samples_since_hit < attack_samples {
-            samples_since_hit as f32 / attack_samples as f32
+            samples_since_hit as f32 / attack_samples.max(1) as f32
         } else {
             1.0
         };
-
-        // Exponential decay: rhodes-like, rings for ~500ms then fades
-        let decay_rate = timbral.decay_rate * 1.5;
-        let decay = (-decay_rate * hit_time).exp();
-
-        // Skip inaudible hits
+        let decay = sustain_floor + (1.0 - sustain_floor) * (-decay_rate * hit_time).exp();
         let env = attack * decay;
+
         if env < 0.005 {
             continue;
         }
 
-        // Voicing variation: odd hits use full chord, even hits drop a note for movement
-        let use_notes: Vec<f32> = if hit_idx % 2 == 0 {
-            notes.to_vec()
-        } else {
-            // Drop middle note(s) for rhythmic variation — like a pianist varying voicings
-            notes.iter().enumerate()
-                .filter(|(i, _)| *i == 0 || *i == notes.len() - 1 || (*i % 2 == 0))
-                .map(|(_, &f)| f)
-                .collect()
+        // Voicing variation per hit: rotate which notes are played
+        // Creates movement like a real pianist — different inversions/voicings each hit
+        let voicing: Vec<f32> = match hit_seq % 4 {
+            0 => notes.to_vec(),                                                    // root position
+            1 => notes.iter().enumerate()                                           // drop root
+                .filter(|(i, _)| *i > 0)
+                .map(|(_, &f)| f).collect(),
+            2 => notes.iter().enumerate()                                           // shell voicing (root + top)
+                .filter(|(i, _)| *i == 0 || *i == notes.len() - 1)
+                .map(|(_, &f)| f).collect(),
+            _ => notes.iter().enumerate()                                           // inner voices only
+                .filter(|(i, _)| *i > 0 && *i < notes.len() - 1)
+                .map(|(_, &f)| f).collect(),
         };
+        let voicing = if voicing.is_empty() { notes.to_vec() } else { voicing };
 
-        // Play all notes in the voicing simultaneously
-        for (i, &freq) in use_notes.iter().enumerate() {
+        for (i, &freq) in voicing.iter().enumerate() {
             let osc = generate_category_oscillator(freq, time, true, i, voice, melody, timbral, category);
-            sample += osc * env / use_notes.len().max(1) as f32;
+            sample += osc * env / voicing.len().max(1) as f32;
         }
     }
 
-    // Normalize by hit count to prevent clipping from overlapping decays
+    // Normalize
     sample *= 0.7 / (num_hits as f32).sqrt();
 
     // Global fade-out
@@ -4115,34 +4140,60 @@ fn generate_comping(notes: &[f32], time: f32, current_sample: usize, total_sampl
     sample * fade * volume
 }
 
-/// Bass note: plays only the root note (lowest frequency) with a deep, punchy character.
-/// Like a bass player laying down single notes — thick sub, clean fundamental, tight envelope.
-fn generate_bass_note(notes: &[f32], time: f32, progress: f32, volume: f32, voice: &RepoVoice, melody: &BranchMelody, timbral: &EffectiveTimbral, category: EventCategory) -> f32 {
-    // Use the root note (lowest frequency) — this is the bass line
-    let root_freq = notes.iter().copied().reduce(f32::min).unwrap_or(220.0);
+/// Bass line: plays a short sequence of punchy bass notes from the seed-rotated pattern.
+/// Each note has its own ADSR envelope derived from melody.envelope_shape.
+/// Like a bass player walking through a short phrase — deep, rhythmic, varied per event.
+fn generate_bass_note(notes: &[f32], time: f32, _progress: f32, volume: f32, voice: &RepoVoice, melody: &BranchMelody, timbral: &EffectiveTimbral, category: EventCategory) -> f32 {
+    let num_notes = notes.len().max(1);
 
-    // Punchy attack: ~10ms
-    let attack_time = 0.010;
-    let attack_env = (time / attack_time).min(1.0);
+    // ADSR from melody.envelope_shape — each branch/seed gets a different feel
+    let (base_attack, base_decay) = ENVELOPE_SHAPES[melody.envelope_shape];
+    // Bass-specific scaling: tighter attack, punchier decay than melodic instruments
+    let attack_secs = (base_attack * 0.08).max(0.005); // 5-32ms attack
+    let decay_rate = 3.0 + base_decay * 15.0;          // 3.5-6.0 decay rate (fast)
+    let sustain_floor = base_attack * 0.3;              // 0.006-0.12 sustain (punchy→soft)
 
-    // Bass envelope: quick punch then sustain with gentle decay
-    let sustain = 0.4;
-    let decay_rate = 2.5;
-    let decay_env = sustain + (1.0 - sustain) * (-decay_rate * progress).exp();
+    // Divide total time evenly among notes, with swing
+    let total_time = time; // elapsed time in seconds
+    let note_duration = (voice.delay_time_base / 1000.0).max(0.15); // ~150-500ms per note from repo hash
 
-    // Release
-    let release = if progress > 0.85 {
-        ((1.0 - progress) / 0.15).sqrt()
+    let mut sample = 0.0f32;
+
+    for i in 0..num_notes {
+        // Swing: odd notes offset slightly for groove
+        let swing_offset = if i % 2 == 1 { melody.swing * note_duration * 0.5 } else { 0.0 };
+        let note_start = i as f32 * note_duration + swing_offset;
+        let note_time = total_time - note_start;
+
+        if note_time < 0.0 {
+            continue; // Note hasn't started yet
+        }
+
+        // ADSR envelope per note
+        let attack_env = (note_time / attack_secs).min(1.0);
+        let decay_env = sustain_floor + (1.0 - sustain_floor) * (-decay_rate * note_time).exp();
+        let env = attack_env * decay_env;
+
+        // Skip inaudible
+        if env < 0.005 {
+            continue;
+        }
+
+        let freq = notes[i % notes.len()];
+        let osc = generate_category_oscillator(freq, note_time, false, i, voice, melody, timbral, category);
+        sample += osc * env;
+    }
+
+    // Global fade-out over last 15%
+    let total_dur_approx = num_notes as f32 * note_duration;
+    let progress_approx = if total_dur_approx > 0.0 { (time / total_dur_approx).min(1.0) } else { 0.0 };
+    let fade = if progress_approx > 0.85 {
+        ((1.0 - progress_approx) / 0.15).sqrt()
     } else {
         1.0
     };
 
-    let env = attack_env * decay_env * release;
-
-    // Single bass voice — deep and focused
-    let osc = generate_category_oscillator(root_freq, time, false, 0, voice, melody, timbral, category);
-
-    osc * env * volume
+    sample * fade * volume
 }
 
 fn generate_oscillator(freq: f32, time: f32, chorus: bool, voice_idx: usize, _voice: &RepoVoice, melody: &BranchMelody, timbral: &EffectiveTimbral) -> f32 {
