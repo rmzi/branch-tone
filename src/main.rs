@@ -176,6 +176,10 @@ enum Command {
     /// Show daemon status (active voices, uptime)
     DaemonStatus,
 
+    /// macOS menu bar icon for daemon monitoring and control
+    #[cfg(all(target_os = "macos", feature = "tray"))]
+    Tray,
+
     /// Interactive step sequencer — toggle drum hits in real-time
     Player {
         /// Starting break pattern (0=Amen, 1=Think, 2=Funky Drummer, 3=Apache,
@@ -1574,6 +1578,8 @@ fn main() -> Result<()> {
         Some(Command::Daemon { detach }) => run_daemon(detach),
         Some(Command::DaemonStop) => run_daemon_stop(),
         Some(Command::DaemonStatus) => run_daemon_status(),
+        #[cfg(all(target_os = "macos", feature = "tray"))]
+        Some(Command::Tray) => run_tray(),
         Some(Command::Player { pattern, bpm }) => run_player(pattern, bpm),
         None => run_play(cli.play_args),
     }
@@ -2145,6 +2151,7 @@ struct DaemonState {
     global_sample: AtomicU64,
     active_count: AtomicU8,
     last_activity_secs: AtomicU64,
+    start_time_secs: AtomicU64,
 }
 
 impl DaemonState {
@@ -2160,6 +2167,7 @@ impl DaemonState {
             global_sample: AtomicU64::new(0),
             active_count: AtomicU8::new(0),
             last_activity_secs: AtomicU64::new(now),
+            start_time_secs: AtomicU64::new(now),
         }
     }
 
@@ -2557,6 +2565,42 @@ fn handle_daemon_connection(stream: std::os::unix::net::UnixStream, state: &Daem
                 format!("Active voices ({}):\n{}", active.len(), active.join("\n"))
             };
             let _ = stream.write_all(status.as_bytes());
+            return;
+        }
+
+        // JSON status query (for tray app and programmatic consumers)
+        if event == "__status_json" {
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let start = state.start_time_secs.load(Relaxed);
+            let last = state.last_activity_secs.load(Relaxed);
+            let pid = std::process::id();
+
+            let mut voices_json = Vec::new();
+            for (i, slot) in state.voices.iter().enumerate() {
+                if slot.active.load(Relaxed) {
+                    let repo = slot.repo.lock().ok().map(|r| r.clone()).unwrap_or_default();
+                    let branch = slot.branch.lock().ok().map(|b| b.clone()).unwrap_or_default();
+                    voices_json.push(format!(
+                        "{{\"slot\":{},\"repo\":\"{}\",\"branch\":\"{}\"}}",
+                        i,
+                        repo.replace('\"', "\\\""),
+                        branch.replace('\"', "\\\""),
+                    ));
+                }
+            }
+
+            let json = format!(
+                "{{\"pid\":{},\"uptime_secs\":{},\"active_voices\":[{}],\"idle_secs\":{},\"idle_timeout\":{}}}",
+                pid,
+                now_secs.saturating_sub(start),
+                voices_json.join(","),
+                now_secs.saturating_sub(last),
+                DAEMON_IDLE_TIMEOUT_SECS,
+            );
+            let _ = stream.write_all(json.as_bytes());
             return;
         }
 
@@ -5104,6 +5148,507 @@ fn render_piano_keys(
     Ok(())
 }
 
+// =============================================================================
+// TRAY: macOS menu bar icon for daemon monitoring and control
+// =============================================================================
+
+#[cfg(all(target_os = "macos", feature = "tray"))]
+mod tray {
+    use std::time::Duration;
+
+    use anyhow::{Context, Result};
+    use objc2::rc::Retained;
+    use objc2::runtime::ProtocolObject;
+    use objc2::{define_class, msg_send, sel, MainThreadOnly};
+    use objc2_app_kit::*;
+    use objc2_foundation::*;
+
+    use super::{daemon_dir, daemon_pid_path, daemon_socket_path};
+
+    /// Parsed daemon status from `__status_json`
+    #[derive(Default)]
+    struct DaemonStatus {
+        pid: u32,
+        uptime_secs: u64,
+        active_voices: Vec<(usize, String, String)>, // (slot, repo, branch)
+        idle_secs: u64,
+        idle_timeout: u64,
+        running: bool,
+    }
+
+    /// Query the daemon for JSON status via Unix socket
+    fn query_daemon_status() -> DaemonStatus {
+        use std::io::{Read, Write};
+
+        let sock = daemon_socket_path();
+        let mut status = DaemonStatus::default();
+
+        let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock) else {
+            return status;
+        };
+        stream.set_read_timeout(Some(Duration::from_millis(500))).ok();
+        stream.set_write_timeout(Some(Duration::from_millis(500))).ok();
+        let _ = stream.write_all(b"{\"event\":\"__status_json\"}\n");
+
+        let mut buf = vec![0u8; 4096];
+        let Ok(n) = stream.read(&mut buf) else {
+            return status;
+        };
+
+        let json_str = String::from_utf8_lossy(&buf[..n]);
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(json_str.trim()) else {
+            return status;
+        };
+
+        status.running = true;
+        status.pid = json.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        status.uptime_secs = json.get("uptime_secs").and_then(|v| v.as_u64()).unwrap_or(0);
+        status.idle_secs = json.get("idle_secs").and_then(|v| v.as_u64()).unwrap_or(0);
+        status.idle_timeout = json.get("idle_timeout").and_then(|v| v.as_u64()).unwrap_or(300);
+
+        if let Some(voices) = json.get("active_voices").and_then(|v| v.as_array()) {
+            for v in voices {
+                let slot = v.get("slot").and_then(|s| s.as_u64()).unwrap_or(0) as usize;
+                let repo = v.get("repo").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                let branch = v.get("branch").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                status.active_voices.push((slot, repo, branch));
+            }
+        }
+
+        status
+    }
+
+    /// Check if daemon is running by probing PID file + process
+    fn is_daemon_running() -> bool {
+        let pid_path = daemon_pid_path();
+        if !pid_path.exists() {
+            return false;
+        }
+        let Ok(pid_str) = std::fs::read_to_string(&pid_path) else {
+            return false;
+        };
+        let Ok(pid) = pid_str.trim().parse::<u32>() else {
+            return false;
+        };
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Start the daemon as a detached background process
+    fn start_daemon() {
+        if is_daemon_running() {
+            return;
+        }
+        let Ok(exe) = std::env::current_exe() else { return };
+        let _ = std::process::Command::new(exe)
+            .args(["daemon", "--detach"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+
+    /// Stop the daemon via socket shutdown command
+    fn stop_daemon() {
+        use std::io::{Read, Write};
+        let sock = daemon_socket_path();
+        if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock) {
+            let _ = stream.write_all(b"{\"event\":\"__shutdown\"}\n");
+            let mut buf = [0u8; 64];
+            let _ = stream.read(&mut buf);
+        }
+        // Clean up PID/socket files
+        let _ = std::fs::remove_file(daemon_pid_path());
+        let _ = std::fs::remove_file(daemon_socket_path());
+    }
+
+    /// Read the last N lines from events.log
+    fn recent_log_lines(max_lines: usize) -> Vec<String> {
+        let log_path = daemon_dir().join("events.log");
+        let Ok(content) = std::fs::read_to_string(&log_path) else {
+            return Vec::new();
+        };
+        content.lines().rev().take(max_lines).map(String::from).collect::<Vec<_>>()
+            .into_iter().rev().collect()
+    }
+
+    /// Format uptime as human-readable string
+    fn format_uptime(secs: u64) -> String {
+        if secs < 60 {
+            format!("{}s", secs)
+        } else if secs < 3600 {
+            format!("{}m {}s", secs / 60, secs % 60)
+        } else {
+            format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+        }
+    }
+
+    // Menu item tags for identification during updates
+    const TAG_STATUS_LINE: isize = 100;
+    const TAG_VOICES_LINE: isize = 101;
+    const TAG_TOGGLE: isize = 102;
+    const TAG_RECENT_EVENTS: isize = 200; // 200..207 for up to 8 log lines
+
+    define_class!(
+        // SAFETY: NSObject has no subclassing requirements. No Drop impl.
+        #[unsafe(super = NSObject)]
+        #[thread_kind = MainThreadOnly]
+        struct TrayDelegate;
+
+        unsafe impl NSObjectProtocol for TrayDelegate {}
+
+        unsafe impl NSApplicationDelegate for TrayDelegate {
+            #[unsafe(method(applicationDidFinishLaunching:))]
+            fn did_finish_launching(&self, _notification: &NSNotification) {
+                let mtm = self.mtm();
+                let app = NSApplication::sharedApplication(mtm);
+
+                // Accessory policy: no dock icon, no app menu — just tray
+                app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+
+                // Auto-start daemon if not running
+                if !is_daemon_running() {
+                    start_daemon();
+                    // Brief pause for daemon to initialize socket
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+
+                // Create status bar item
+                let status_bar = NSStatusBar::systemStatusBar();
+                let status_item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
+
+                // Use deprecated but simple setTitle for text-only icon
+                #[allow(deprecated)]
+                if is_daemon_running() {
+                    status_item.setTitle(Some(ns_string!("♫")));
+                } else {
+                    status_item.setTitle(Some(ns_string!("♩")));
+                }
+
+                // Build the menu
+                let menu = build_menu(mtm);
+                status_item.setMenu(Some(&menu));
+
+                // Store status item in a global (prevent deallocation)
+                // SAFETY: Single-threaded access on main thread only
+                unsafe {
+                    GLOBAL_STATUS_ITEM = Some(status_item);
+                    GLOBAL_MENU = Some(menu);
+                }
+
+                // Spawn poll thread
+                std::thread::spawn(|| {
+                    poll_daemon_loop();
+                });
+            }
+        }
+
+        // Action handlers — NSMenuItem targets nil, so the responder chain
+        // dispatches to the app delegate (this class).
+        impl TrayDelegate {
+            #[unsafe(method(toggleDaemon:))]
+            fn toggle_daemon(&self, _sender: &NSMenuItem) {
+                if is_daemon_running() {
+                    stop_daemon();
+                } else {
+                    start_daemon();
+                }
+            }
+
+            #[unsafe(method(testSounds:))]
+            fn test_sounds(&self, _sender: &NSMenuItem) {
+                let Ok(exe) = std::env::current_exe() else { return };
+                let _ = std::process::Command::new(exe)
+                    .args(["test", "."])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+            }
+
+            #[unsafe(method(openPlayer:))]
+            fn open_player(&self, _sender: &NSMenuItem) {
+                let Ok(exe) = std::env::current_exe() else { return };
+                let script = format!(
+                    "tell application \"Terminal\" to do script \"{}\" & \" player\"",
+                    exe.display()
+                );
+                let _ = std::process::Command::new("osascript")
+                    .args(["-e", &script])
+                    .spawn();
+            }
+
+            #[unsafe(method(openLog:))]
+            fn open_log(&self, _sender: &NSMenuItem) {
+                let log_path = daemon_dir().join("events.log");
+                let _ = std::process::Command::new("open")
+                    .arg(log_path)
+                    .spawn();
+            }
+
+            #[unsafe(method(quitApp:))]
+            fn quit_app(&self, _sender: &NSMenuItem) {
+                // Stop daemon if running
+                if is_daemon_running() {
+                    stop_daemon();
+                }
+                let mtm = self.mtm();
+                NSApplication::sharedApplication(mtm).terminate(None);
+            }
+        }
+    );
+
+    // Globals to keep Retained objects alive (main thread only)
+    static mut GLOBAL_STATUS_ITEM: Option<Retained<NSStatusItem>> = None;
+    static mut GLOBAL_MENU: Option<Retained<NSMenu>> = None;
+
+    impl TrayDelegate {
+        fn new(mtm: MainThreadMarker) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(());
+            unsafe { msg_send![super(this), init] }
+        }
+    }
+
+    /// Build the tray dropdown menu
+    fn build_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
+        let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("branch-tone"));
+
+        let status = query_daemon_status();
+
+        // Status line
+        let status_text = if status.running {
+            format!("\u{25CF} Daemon Running (PID {})", status.pid)
+        } else {
+            "\u{25CB} Daemon Stopped".to_string()
+        };
+        let status_item = make_disabled_item(mtm, &status_text);
+        status_item.setTag(TAG_STATUS_LINE);
+        menu.addItem(&status_item);
+
+        // Voice count
+        let voices_text = if status.active_voices.is_empty() {
+            "  No active voices".to_string()
+        } else {
+            format!("  {} active voice{}", status.active_voices.len(),
+                if status.active_voices.len() == 1 { "" } else { "s" })
+        };
+        let voices_item = make_disabled_item(mtm, &voices_text);
+        voices_item.setTag(TAG_VOICES_LINE);
+        menu.addItem(&voices_item);
+
+        // Separator
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+        // Toggle daemon (start/stop)
+        let toggle_title = if status.running {
+            "\u{23F9} Stop Daemon"
+        } else {
+            "\u{25B6}\u{FE0F} Start Daemon"
+        };
+        let toggle_item = make_action_item(mtm, toggle_title, sel!(toggleDaemon:));
+        toggle_item.setTag(TAG_TOGGLE);
+        menu.addItem(&toggle_item);
+
+        // Test sounds
+        let test_item = make_action_item(mtm, "\u{266A} Test Sounds", sel!(testSounds:));
+        menu.addItem(&test_item);
+
+        // Open player
+        let player_item = make_action_item(mtm, "\u{1F3B9} Open Player", sel!(openPlayer:));
+        menu.addItem(&player_item);
+
+        // Separator
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+        // Recent events submenu
+        let events_parent = make_disabled_item(mtm, "\u{25B8} Recent Events");
+        let events_submenu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Recent Events"));
+
+        let lines = recent_log_lines(8);
+        if lines.is_empty() {
+            let empty = make_disabled_item(mtm, "(no events yet)");
+            events_submenu.addItem(&empty);
+        } else {
+            for (i, line) in lines.iter().enumerate() {
+                // Truncate long lines for the menu
+                let display = if line.len() > 60 { &line[..60] } else { line };
+                let item = make_disabled_item(mtm, display);
+                item.setTag(TAG_RECENT_EVENTS + i as isize);
+                events_submenu.addItem(&item);
+            }
+        }
+
+        // "Open Full Log" at bottom of submenu
+        events_submenu.addItem(&NSMenuItem::separatorItem(mtm));
+        let open_log = make_action_item(mtm, "Open Full Log", sel!(openLog:));
+        events_submenu.addItem(&open_log);
+
+        events_parent.setSubmenu(Some(&events_submenu));
+        menu.addItem(&events_parent);
+
+        // Separator + Quit
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        let quit_item = make_action_item(mtm, "Quit", sel!(quitApp:));
+        menu.addItem(&quit_item);
+
+        menu
+    }
+
+    /// Create a disabled (non-clickable) menu item
+    fn make_disabled_item(mtm: MainThreadMarker, title: &str) -> Retained<NSMenuItem> {
+        let ns_title = NSString::from_str(title);
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm), &ns_title, None, ns_string!(""),
+            )
+        };
+        item.setEnabled(false);
+        item
+    }
+
+    /// Create an actionable menu item targeting the NSApp delegate
+    fn make_action_item(mtm: MainThreadMarker, title: &str, action: objc2::runtime::Sel) -> Retained<NSMenuItem> {
+        let ns_title = NSString::from_str(title);
+        unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm), &ns_title, Some(action), ns_string!(""),
+            )
+        }
+    }
+
+    /// Background thread: poll daemon status every 2s, update menu on main thread
+    fn poll_daemon_loop() {
+        loop {
+            std::thread::sleep(Duration::from_secs(2));
+
+            let status = query_daemon_status();
+
+            // Dispatch menu update to main thread
+            // We use a closure-based approach via DispatchQueue since
+            // performSelectorOnMainThread requires an ObjC method
+            dispatch_to_main(move || {
+                update_menu_from_status(&status);
+            });
+        }
+    }
+
+    /// Execute a closure on the main thread via libdispatch
+    fn dispatch_to_main<F: FnOnce() + Send + 'static>(f: F) {
+        // Use dispatch_async_f for thread-safe main-queue dispatch.
+        // dispatch_get_main_queue() is a C macro expanding to &_dispatch_main_q,
+        // so we reference the actual symbol directly.
+        unsafe extern "C" {
+            static _dispatch_main_q: std::ffi::c_void;
+            fn dispatch_async_f(
+                queue: *const std::ffi::c_void,
+                context: *mut std::ffi::c_void,
+                work: unsafe extern "C" fn(*mut std::ffi::c_void),
+            );
+        }
+
+        unsafe extern "C" fn trampoline<F: FnOnce()>(ctx: *mut std::ffi::c_void) {
+            let f = unsafe { Box::from_raw(ctx as *mut F) };
+            f();
+        }
+
+        let boxed = Box::into_raw(Box::new(f));
+        unsafe {
+            dispatch_async_f(
+                &raw const _dispatch_main_q,
+                boxed as *mut std::ffi::c_void,
+                trampoline::<F>,
+            );
+        }
+    }
+
+    /// Update menu items based on current daemon status (called on main thread)
+    fn update_menu_from_status(status: &DaemonStatus) {
+        let Some(_mtm) = MainThreadMarker::new() else { return };
+
+        // Update status item icon
+        unsafe {
+            if let Some(ref item) = GLOBAL_STATUS_ITEM {
+                #[allow(deprecated)]
+                if status.running {
+                    item.setTitle(Some(ns_string!("♫")));
+                } else {
+                    item.setTitle(Some(ns_string!("♩")));
+                }
+            }
+
+            if let Some(ref menu) = GLOBAL_MENU {
+                let n = menu.numberOfItems();
+                for idx in 0..n {
+                    let Some(item) = menu.itemAtIndex(idx) else { continue };
+                    let tag: NSInteger = item.tag();
+
+                    if tag == TAG_STATUS_LINE {
+                        let text = if status.running {
+                            NSString::from_str(&format!(
+                                "\u{25CF} Daemon Running (PID {}) \u{2014} up {}",
+                                status.pid, format_uptime(status.uptime_secs)
+                            ))
+                        } else {
+                            NSString::from_str("\u{25CB} Daemon Stopped")
+                        };
+                        item.setTitle(&text);
+                    } else if tag == TAG_VOICES_LINE {
+                        let text = if status.active_voices.is_empty() {
+                            NSString::from_str("  No active voices")
+                        } else {
+                            let descs: Vec<String> = status.active_voices.iter()
+                                .map(|(_, repo, branch)| format!("{}/{}", repo, branch))
+                                .collect();
+                            NSString::from_str(&format!("  {} voice{}: {}",
+                                status.active_voices.len(),
+                                if status.active_voices.len() == 1 { "" } else { "s" },
+                                descs.join(", ")))
+                        };
+                        item.setTitle(&text);
+                    } else if tag == TAG_TOGGLE {
+                        let text = if status.running {
+                            NSString::from_str("\u{23F9} Stop Daemon")
+                        } else {
+                            NSString::from_str("\u{25B6}\u{FE0F} Start Daemon")
+                        };
+                        item.setTitle(&text);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Entry point called from main()
+    pub fn run() -> Result<()> {
+        let mtm = MainThreadMarker::new()
+            .context("branch-tone tray must be run on the main thread")?;
+
+        let app = NSApplication::sharedApplication(mtm);
+        let delegate = TrayDelegate::new(mtm);
+        app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+
+        app.run();
+
+        Ok(())
+    }
+
+    /// Test helpers (exposed for integration tests)
+    #[cfg(test)]
+    pub mod tests {
+        pub fn format_uptime_pub(secs: u64) -> String {
+            super::format_uptime(secs)
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "tray"))]
+fn run_tray() -> Result<()> {
+    tray::run()
+}
+
 /// Main entry point for the interactive step sequencer.
 fn run_player(initial_pattern: usize, initial_bpm: Option<u16>) -> Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -6715,5 +7260,113 @@ mod tests {
         let end_throw = ((-3.0_f32 * 1.0).exp() * 0.8 + 0.2).min(1.0);
         assert!(end_throw < 0.3, "throw at end should be < 0.3: got {}", end_throw);
         assert!(end_throw > 0.2, "throw at end should be > 0.2 (floor): got {}", end_throw);
+    }
+
+    // -- Phase 5: Tray / status_json tests --
+
+    #[test]
+    fn daemon_state_has_start_time() {
+        let state = DaemonState::new();
+        let start = state.start_time_secs.load(Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // start_time should be within 1 second of now
+        assert!(now.saturating_sub(start) < 2, "start_time should be recent: {}", start);
+    }
+
+    #[test]
+    fn status_json_handler_returns_valid_json() {
+        let state = DaemonState::new();
+
+        // Simulate __status_json response construction (same logic as handler)
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let start = state.start_time_secs.load(Relaxed);
+        let last = state.last_activity_secs.load(Relaxed);
+        let pid = std::process::id();
+
+        let mut voices_json = Vec::new();
+        for (i, slot) in state.voices.iter().enumerate() {
+            if slot.active.load(Relaxed) {
+                let repo = slot.repo.lock().ok().map(|r| r.clone()).unwrap_or_default();
+                let branch = slot.branch.lock().ok().map(|b| b.clone()).unwrap_or_default();
+                voices_json.push(format!(
+                    "{{\"slot\":{},\"repo\":\"{}\",\"branch\":\"{}\"}}",
+                    i, repo, branch,
+                ));
+            }
+        }
+
+        let json_str = format!(
+            "{{\"pid\":{},\"uptime_secs\":{},\"active_voices\":[{}],\"idle_secs\":{},\"idle_timeout\":{}}}",
+            pid,
+            now_secs.saturating_sub(start),
+            voices_json.join(","),
+            now_secs.saturating_sub(last),
+            DAEMON_IDLE_TIMEOUT_SECS,
+        );
+
+        // Parse it back to verify it's valid JSON
+        let parsed: serde_json::Value = serde_json::from_str(&json_str)
+            .expect("__status_json should produce valid JSON");
+        assert!(parsed.get("pid").is_some());
+        assert!(parsed.get("uptime_secs").is_some());
+        assert!(parsed.get("active_voices").unwrap().is_array());
+        assert!(parsed.get("idle_timeout").unwrap().as_u64().unwrap() == DAEMON_IDLE_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn status_json_with_active_voices() {
+        let state = DaemonState::new();
+
+        // Activate a voice slot
+        state.voices[0].active.store(true, Relaxed);
+        if let Ok(mut r) = state.voices[0].repo.lock() { *r = "my-repo".to_string(); }
+        if let Ok(mut b) = state.voices[0].branch.lock() { *b = "feat/test".to_string(); }
+
+        let mut voices_json = Vec::new();
+        for (i, slot) in state.voices.iter().enumerate() {
+            if slot.active.load(Relaxed) {
+                let repo = slot.repo.lock().ok().map(|r| r.clone()).unwrap_or_default();
+                let branch = slot.branch.lock().ok().map(|b| b.clone()).unwrap_or_default();
+                voices_json.push(format!(
+                    "{{\"slot\":{},\"repo\":\"{}\",\"branch\":\"{}\"}}",
+                    i, repo.replace('\"', "\\\""), branch.replace('\"', "\\\""),
+                ));
+            }
+        }
+
+        let json_str = format!(
+            "{{\"pid\":1,\"uptime_secs\":0,\"active_voices\":[{}],\"idle_secs\":0,\"idle_timeout\":300}}",
+            voices_json.join(","),
+        );
+
+        let parsed: serde_json::Value = serde_json::from_str(&json_str)
+            .expect("should be valid JSON");
+        let voices = parsed.get("active_voices").unwrap().as_array().unwrap();
+        assert_eq!(voices.len(), 1);
+        assert_eq!(voices[0].get("slot").unwrap().as_u64().unwrap(), 0);
+        assert_eq!(voices[0].get("repo").unwrap().as_str().unwrap(), "my-repo");
+        assert_eq!(voices[0].get("branch").unwrap().as_str().unwrap(), "feat/test");
+    }
+
+    #[cfg(all(target_os = "macos", feature = "tray"))]
+    #[test]
+    fn tray_format_uptime() {
+        assert_eq!(tray::tests::format_uptime_pub(0), "0s");
+        assert_eq!(tray::tests::format_uptime_pub(59), "59s");
+        assert_eq!(tray::tests::format_uptime_pub(60), "1m 0s");
+        assert_eq!(tray::tests::format_uptime_pub(3661), "1h 1m");
+    }
+
+    #[test]
+    fn daemon_dir_is_under_home() {
+        let dir = daemon_dir();
+        let dir_str = dir.to_string_lossy();
+        assert!(dir_str.contains(".branch-tone"), "daemon_dir should contain .branch-tone: {}", dir_str);
     }
 }
