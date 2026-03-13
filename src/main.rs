@@ -3569,16 +3569,43 @@ where
                     0.0
                 };
 
-                // TONAL BUS: if melody_over_drums, or non-drum mode
+                // TONAL BUS: category-aware articulation
+                // Each instrument plays notes differently:
+                //   Horn  → chord stab (all notes, sharp attack/release)
+                //   Piano → comping (rhythmic chord hits)
+                //   Bass  → single root note (deep, punchy)
+                //   Keys  → sustained pad (warm chord)
+                //   Default → repo's natural mode (arp or pad)
                 let tonal_bus = if effects.melody_over_drums || !effects.drums {
-                    if effects.bulldozer {
-                        let pad_out = generate_pad(&notes, time, progress, 1.0, effects, &voice, &melody, &timbral, event_category);
-                        let arp_out = generate_arpeggio(&notes, time, current_sample, total_samples, 1.0, arp_effects, &voice, &melody, &timbral, grid_samples, event_category);
-                        (pad_out * 0.7 + arp_out * 0.3) * volume
-                    } else if effects.pad {
-                        generate_pad(&notes, time, progress, volume, effects, &voice, &melody, &timbral, event_category)
-                    } else {
-                        generate_arpeggio(&notes, time, current_sample, total_samples, volume, effects, &voice, &melody, &timbral, grid_samples, event_category)
+                    match event_category {
+                        // Horn: disco/jazz brass stab — all notes hit at once, punchy
+                        EventCategory::Attention => {
+                            generate_stab(&notes, time, progress, volume, &voice, &melody, &timbral, event_category)
+                        }
+                        // Piano: rhythmic comping — chord hits at rhythmic intervals
+                        EventCategory::Lifecycle => {
+                            generate_comping(&notes, time, current_sample, total_samples, volume, &voice, &melody, &timbral, grid_samples, event_category)
+                        }
+                        // Bass: single root note — deep, thick, punchy
+                        EventCategory::Bass => {
+                            generate_bass_note(&notes, time, progress, volume, &voice, &melody, &timbral, event_category)
+                        }
+                        // Keys/Pad: sustained warm chord (existing pad behavior)
+                        EventCategory::SessionBoundary => {
+                            generate_pad(&notes, time, progress, volume, effects, &voice, &melody, &timbral, event_category)
+                        }
+                        // Default/CLI: repo's natural mode
+                        _ => {
+                            if effects.bulldozer {
+                                let pad_out = generate_pad(&notes, time, progress, 1.0, effects, &voice, &melody, &timbral, event_category);
+                                let arp_out = generate_arpeggio(&notes, time, current_sample, total_samples, 1.0, arp_effects, &voice, &melody, &timbral, grid_samples, event_category);
+                                (pad_out * 0.7 + arp_out * 0.3) * volume
+                            } else if effects.pad {
+                                generate_pad(&notes, time, progress, volume, effects, &voice, &melody, &timbral, event_category)
+                            } else {
+                                generate_arpeggio(&notes, time, current_sample, total_samples, volume, effects, &voice, &melody, &timbral, grid_samples, event_category)
+                            }
+                        }
                     }
                 } else {
                     0.0
@@ -3983,6 +4010,139 @@ fn generate_arpeggio(notes: &[f32], time: f32, current_sample: usize, total_samp
     };
 
     sample * global_fade * volume
+}
+
+/// Horn stab: all notes play simultaneously with a sharp attack and quick release.
+/// Think disco brass hits or jazz horn stabs — punchy, rhythmic, in-your-face.
+fn generate_stab(notes: &[f32], time: f32, progress: f32, volume: f32, voice: &RepoVoice, melody: &BranchMelody, timbral: &EffectiveTimbral, category: EventCategory) -> f32 {
+    // Sharp attack: ~15ms ramp
+    let attack_time = 0.015;
+    let attack_env = (time / attack_time).min(1.0);
+
+    // Quick release: stab decays to 15% over the duration, then fades out
+    let sustain = 0.15;
+    let decay_rate = 4.0;
+    let decay_env = sustain + (1.0 - sustain) * (-decay_rate * progress).exp();
+
+    // Final release fade in last 20%
+    let release = if progress > 0.80 {
+        ((1.0 - progress) / 0.20).sqrt()
+    } else {
+        1.0
+    };
+
+    let env = attack_env * decay_env * release;
+
+    // All notes sound simultaneously — this IS the stab character
+    let mut sample = 0.0;
+    for (i, &freq) in notes.iter().enumerate() {
+        let osc = generate_category_oscillator(freq, time, true, i, voice, melody, timbral, category);
+        sample += osc * env;
+    }
+
+    // Normalize by note count
+    sample /= notes.len().max(1) as f32;
+    sample * volume
+}
+
+/// Piano comping: rhythmic chord hits at regular intervals.
+/// Like a jazz pianist hitting voicings on beats 2 and 4, or a rhythmic stab pattern.
+/// Each hit has a percussive attack and exponential decay — notes ring briefly then fade.
+fn generate_comping(notes: &[f32], time: f32, current_sample: usize, total_samples: usize, volume: f32, voice: &RepoVoice, melody: &BranchMelody, timbral: &EffectiveTimbral, grid_samples: usize, category: EventCategory) -> f32 {
+    // Determine number of chord hits based on duration (more time = more hits)
+    // Use grid_samples to stay rhythmically locked
+    let hit_interval = (grid_samples * 4).max(1); // every 4 grid steps = 1 beat
+    let num_hits = (total_samples / hit_interval).max(1).min(8);
+
+    let mut sample = 0.0;
+
+    for hit_idx in 0..num_hits {
+        let hit_start = hit_idx * hit_interval;
+        if current_sample < hit_start {
+            continue;
+        }
+
+        let samples_since_hit = current_sample - hit_start;
+        let hit_time = samples_since_hit as f32 / 44100.0; // approximate sample rate for envelope
+
+        // Percussive attack: ~5ms
+        let attack_samples = (0.005 * 44100.0) as usize;
+        let attack = if samples_since_hit < attack_samples {
+            samples_since_hit as f32 / attack_samples as f32
+        } else {
+            1.0
+        };
+
+        // Exponential decay: rhodes-like, rings for ~500ms then fades
+        let decay_rate = timbral.decay_rate * 1.5;
+        let decay = (-decay_rate * hit_time).exp();
+
+        // Skip inaudible hits
+        let env = attack * decay;
+        if env < 0.005 {
+            continue;
+        }
+
+        // Voicing variation: odd hits use full chord, even hits drop a note for movement
+        let use_notes: Vec<f32> = if hit_idx % 2 == 0 {
+            notes.to_vec()
+        } else {
+            // Drop middle note(s) for rhythmic variation — like a pianist varying voicings
+            notes.iter().enumerate()
+                .filter(|(i, _)| *i == 0 || *i == notes.len() - 1 || (*i % 2 == 0))
+                .map(|(_, &f)| f)
+                .collect()
+        };
+
+        // Play all notes in the voicing simultaneously
+        for (i, &freq) in use_notes.iter().enumerate() {
+            let osc = generate_category_oscillator(freq, time, true, i, voice, melody, timbral, category);
+            sample += osc * env / use_notes.len().max(1) as f32;
+        }
+    }
+
+    // Normalize by hit count to prevent clipping from overlapping decays
+    sample *= 0.7 / (num_hits as f32).sqrt();
+
+    // Global fade-out
+    let progress = current_sample as f32 / total_samples as f32;
+    let fade = if progress > 0.85 {
+        ((1.0 - progress) / 0.15).sqrt()
+    } else {
+        1.0
+    };
+
+    sample * fade * volume
+}
+
+/// Bass note: plays only the root note (lowest frequency) with a deep, punchy character.
+/// Like a bass player laying down single notes — thick sub, clean fundamental, tight envelope.
+fn generate_bass_note(notes: &[f32], time: f32, progress: f32, volume: f32, voice: &RepoVoice, melody: &BranchMelody, timbral: &EffectiveTimbral, category: EventCategory) -> f32 {
+    // Use the root note (lowest frequency) — this is the bass line
+    let root_freq = notes.iter().copied().reduce(f32::min).unwrap_or(220.0);
+
+    // Punchy attack: ~10ms
+    let attack_time = 0.010;
+    let attack_env = (time / attack_time).min(1.0);
+
+    // Bass envelope: quick punch then sustain with gentle decay
+    let sustain = 0.4;
+    let decay_rate = 2.5;
+    let decay_env = sustain + (1.0 - sustain) * (-decay_rate * progress).exp();
+
+    // Release
+    let release = if progress > 0.85 {
+        ((1.0 - progress) / 0.15).sqrt()
+    } else {
+        1.0
+    };
+
+    let env = attack_env * decay_env * release;
+
+    // Single bass voice — deep and focused
+    let osc = generate_category_oscillator(root_freq, time, false, 0, voice, melody, timbral, category);
+
+    osc * env * volume
 }
 
 fn generate_oscillator(freq: f32, time: f32, chorus: bool, voice_idx: usize, _voice: &RepoVoice, melody: &BranchMelody, timbral: &EffectiveTimbral) -> f32 {
