@@ -3452,6 +3452,7 @@ where
     let effects = params.effects;
     let voice = params.voice.clone();
     let melody = params.melody.clone();
+    let event_category = params.event_category;
 
     let total_samples = (sample_rate * total_duration as f32 / 1000.0) as usize;
 
@@ -3571,13 +3572,13 @@ where
                 // TONAL BUS: if melody_over_drums, or non-drum mode
                 let tonal_bus = if effects.melody_over_drums || !effects.drums {
                     if effects.bulldozer {
-                        let pad_out = generate_pad(&notes, time, progress, 1.0, effects, &voice, &melody, &timbral);
-                        let arp_out = generate_arpeggio(&notes, time, current_sample, total_samples, 1.0, arp_effects, &voice, &melody, &timbral, grid_samples);
+                        let pad_out = generate_pad(&notes, time, progress, 1.0, effects, &voice, &melody, &timbral, event_category);
+                        let arp_out = generate_arpeggio(&notes, time, current_sample, total_samples, 1.0, arp_effects, &voice, &melody, &timbral, grid_samples, event_category);
                         (pad_out * 0.7 + arp_out * 0.3) * volume
                     } else if effects.pad {
-                        generate_pad(&notes, time, progress, volume, effects, &voice, &melody, &timbral)
+                        generate_pad(&notes, time, progress, volume, effects, &voice, &melody, &timbral, event_category)
                     } else {
-                        generate_arpeggio(&notes, time, current_sample, total_samples, volume, effects, &voice, &melody, &timbral, grid_samples)
+                        generate_arpeggio(&notes, time, current_sample, total_samples, volume, effects, &voice, &melody, &timbral, grid_samples, event_category)
                     }
                 } else {
                     0.0
@@ -3784,7 +3785,7 @@ fn pad_note_envelope(shape: PadShape, progress: f32, note_idx: usize, melody: &B
     }
 }
 
-fn generate_pad(notes: &[f32], time: f32, progress: f32, volume: f32, _effects: Effects, voice: &RepoVoice, melody: &BranchMelody, timbral: &EffectiveTimbral) -> f32 {
+fn generate_pad(notes: &[f32], time: f32, progress: f32, volume: f32, _effects: Effects, voice: &RepoVoice, melody: &BranchMelody, timbral: &EffectiveTimbral, category: EventCategory) -> f32 {
     let sub_level = timbral.sub_level;
     let saw_mix = timbral.saw_mix;
     let num_voices = timbral.num_voices;
@@ -3815,28 +3816,51 @@ fn generate_pad(notes: &[f32], time: f32, progress: f32, volume: f32, _effects: 
             base_env
         };
 
+        // Category-aware envelope modifier: horn gets tighter pad, piano gets sharper attack
+        let note_env = match category {
+            EventCategory::Attention => {
+                // Horn: tighter, punchier pad — faster attack, quicker release
+                let punch = if note_progress < 0.05 {
+                    (note_progress / 0.05).min(1.0)
+                } else {
+                    1.0
+                };
+                note_env * punch * (1.0 - note_progress * 0.3).max(0.4)
+            }
+            _ => note_env,
+        };
+
         let base_freq = freq;
 
         // Supersaw-style detuning: preset detune_cents defines signature spread
         let total_spread = if timbral.detune_cents > 0.0 { timbral.detune_cents } else { melody.chorus_detune * 0.25 };
         let nv = num_voices.max(2);
 
-        for j in 0..nv {
-            // Spread voices evenly from -total_spread/2 to +total_spread/2
-            let cents = if nv == 1 { 0.0 }
-                else { -total_spread / 2.0 + (j as f32 / (nv - 1) as f32) * total_spread };
-            let f = base_freq * 2.0_f32.powf(cents / 1200.0);
-            let phase_offset = j as f32 * 2.0 * PI / nv as f32 + i as f32 * 0.5;
+        // Category-aware pad oscillator: non-default categories use their distinct waveform
+        match category {
+            EventCategory::Attention | EventCategory::Lifecycle | EventCategory::Bass => {
+                // Use category oscillator for distinct timbre, with light detuning
+                let osc = generate_category_oscillator(base_freq, time, true, i, voice, melody, timbral, category);
+                sample += osc * note_env;
+            }
+            _ => {
+                // Default/SessionBoundary: original supersaw pad synthesis
+                for j in 0..nv {
+                    let cents = if nv == 1 { 0.0 }
+                        else { -total_spread / 2.0 + (j as f32 / (nv - 1) as f32) * total_spread };
+                    let f = base_freq * 2.0_f32.powf(cents / 1200.0);
+                    let phase_offset = j as f32 * 2.0 * PI / nv as f32 + i as f32 * 0.5;
 
-            let saw_phase = f * time + phase_offset;
-            let saw = 2.0 * (saw_phase - saw_phase.floor()) - 1.0;
-            let sine = (2.0 * PI * f * time + phase_offset).sin();
-            let wave = sine * (1.0 - saw_mix) + saw * saw_mix;
+                    let saw_phase = f * time + phase_offset;
+                    let saw = 2.0 * (saw_phase - saw_phase.floor()) - 1.0;
+                    let sine = (2.0 * PI * f * time + phase_offset).sin();
+                    let wave = sine * (1.0 - saw_mix) + saw * saw_mix;
 
-            // Center voice slightly louder (supersaw weighting)
-            let center_dist = ((j as f32 / (nv - 1).max(1) as f32) - 0.5).abs() * 2.0;
-            let voice_gain = 1.0 - center_dist * 0.3;
-            sample += wave * note_env * voice_gain / nv as f32;
+                    let center_dist = ((j as f32 / (nv - 1).max(1) as f32) - 0.5).abs() * 2.0;
+                    let voice_gain = 1.0 - center_dist * 0.3;
+                    sample += wave * note_env * voice_gain / nv as f32;
+                }
+            }
         }
 
         // Sub layer — only on the first note for clean low end
@@ -3856,7 +3880,7 @@ fn generate_pad(notes: &[f32], time: f32, progress: f32, volume: f32, _effects: 
     sample * volume
 }
 
-fn generate_arpeggio(notes: &[f32], time: f32, current_sample: usize, total_samples: usize, volume: f32, effects: Effects, voice: &RepoVoice, melody: &BranchMelody, timbral: &EffectiveTimbral, grid_samples: usize) -> f32 {
+fn generate_arpeggio(notes: &[f32], time: f32, current_sample: usize, total_samples: usize, volume: f32, effects: Effects, voice: &RepoVoice, melody: &BranchMelody, timbral: &EffectiveTimbral, grid_samples: usize, category: EventCategory) -> f32 {
     let num_notes = notes.len();
 
     // Calculate swing-adjusted note boundaries
@@ -3902,18 +3926,32 @@ fn generate_arpeggio(notes: &[f32], time: f32, current_sample: usize, total_samp
         let note_slot_len = boundaries[i + 1] - boundaries[i];
         let frequency = notes[i];
 
-        // Attack: ramp up at the start of each note
-        let attack_samples = (note_slot_len as f32 * attack_frac) as usize;
+        // Category-aware envelope shaping: each instrument gets its own attack/decay character
+        let (cat_attack_mult, cat_decay_mult, cat_sustain_floor) = match category {
+            // Piano: very fast attack, steep exponential decay — percussive rhodes character
+            EventCategory::Lifecycle => (0.3, 2.5, 0.0),
+            // Horn: punchy attack, slower decay, moderate sustain — brass stab with body
+            EventCategory::Attention => (0.5, 0.6, 0.3),
+            // Bass: medium attack, moderate decay — punchy but not too short
+            EventCategory::Bass => (0.7, 1.5, 0.05),
+            // Keys/Pad: gentle attack, slow decay — pad-like sustain
+            EventCategory::SessionBoundary => (1.0, 0.4, 0.15),
+            // Default: unchanged behavior
+            _ => (1.0, 1.0, 0.0),
+        };
+
+        let effective_attack_frac = attack_frac * cat_attack_mult;
+        let attack_samples = (note_slot_len as f32 * effective_attack_frac) as usize;
         let attack_env = if attack_samples > 0 && samples_since_trigger < attack_samples {
             samples_since_trigger as f32 / attack_samples as f32
         } else {
             1.0
         };
 
-        // Exponential decay — notes ring out well past their slot boundary
-        // Decay rate: reaches ~5% amplitude after ~4x the note slot length
+        // Exponential decay with category-aware rate and sustain floor
         let decay_time = samples_since_trigger as f32 / note_slot_len as f32;
-        let ring_env = (-timbral.decay_rate * decay_time).exp();
+        let ring_env = (-timbral.decay_rate * cat_decay_mult * decay_time).exp();
+        let ring_env = ring_env.max(cat_sustain_floor);
 
         let env = attack_env * ring_env;
 
@@ -3922,7 +3960,7 @@ fn generate_arpeggio(notes: &[f32], time: f32, current_sample: usize, total_samp
             continue;
         }
 
-        let osc = generate_oscillator(frequency, time, effects.chorus, i, voice, melody, timbral);
+        let osc = generate_category_oscillator(frequency, time, effects.chorus, i, voice, melody, timbral, category);
         sample += osc * env;
     }
 
@@ -3990,6 +4028,136 @@ fn generate_oscillator(freq: f32, time: f32, chorus: bool, voice_idx: usize, _vo
             + (2.0 * PI * f2 * 3.0 * time).sin() * h3_level;
 
         (s1 + s2) * 0.5 + sub
+    }
+}
+
+
+/// Category-aware oscillator: each instrument family gets a distinct waveform.
+/// Falls through to generate_oscillator() for Default/DrumHit/ToolPulse.
+fn generate_category_oscillator(freq: f32, time: f32, chorus: bool, voice_idx: usize, voice: &RepoVoice, melody: &BranchMelody, timbral: &EffectiveTimbral, category: EventCategory) -> f32 {
+    match category {
+        // Horn/Lead (Attention): square-wave harmonics — odd harmonics only for brass character.
+        // Square wave = sum of odd harmonics at 1/n amplitude: fundamental + 3rd/3 + 5th/5 + 7th/7
+        EventCategory::Attention => {
+            let sub = (2.0 * PI * freq * 0.5 * time).sin() * timbral.sub_level * 0.5;
+
+            // Slow shimmer for movement
+            let shimmer_rate = 2.5 + voice_idx as f32 * 0.3;
+            let depth = if timbral.chorus_depth > 0.0 { timbral.chorus_depth * 0.5 } else { 0.002 };
+            let shimmer = 1.0 + depth * (2.0 * PI * shimmer_rate * time).sin();
+            let freq = freq * shimmer;
+
+            if chorus {
+                let detune = melody.chorus_detune * 0.7; // tighter detune for brass precision
+                let detune_cents = [0.0, -detune, detune, -detune * 0.5, detune * 0.5];
+                let num_voices = detune_cents.len() as f32;
+                let mut sample = 0.0;
+                for (i, &cents) in detune_cents.iter().enumerate() {
+                    let detune_factor = 2.0_f32.powf(cents / 1200.0);
+                    let f = freq * detune_factor;
+                    let phase_offset = (voice_idx as f32 + i as f32) * 0.1;
+                    // Odd harmonics only: 1, 3, 5, 7 (square wave spectrum)
+                    let h1 = (2.0 * PI * f * time + phase_offset).sin();
+                    let h3 = (2.0 * PI * f * 3.0 * time + phase_offset).sin() / 3.0;
+                    let h5 = (2.0 * PI * f * 5.0 * time + phase_offset).sin() / 5.0;
+                    let h7 = (2.0 * PI * f * 7.0 * time + phase_offset).sin() / 7.0;
+                    sample += (h1 + h3 + h5 + h7) / num_voices;
+                }
+                sample * 0.85 + sub
+            } else {
+                let light_detune = melody.chorus_detune * 0.2;
+                let f1 = freq * 2.0_f32.powf(-light_detune / 1200.0);
+                let f2 = freq * 2.0_f32.powf(light_detune / 1200.0);
+
+                let s1 = (2.0 * PI * f1 * time).sin()
+                    + (2.0 * PI * f1 * 3.0 * time).sin() / 3.0
+                    + (2.0 * PI * f1 * 5.0 * time).sin() / 5.0
+                    + (2.0 * PI * f1 * 7.0 * time).sin() / 7.0;
+                let s2 = (2.0 * PI * f2 * time).sin()
+                    + (2.0 * PI * f2 * 3.0 * time).sin() / 3.0
+                    + (2.0 * PI * f2 * 5.0 * time).sin() / 5.0
+                    + (2.0 * PI * f2 * 7.0 * time).sin() / 7.0;
+
+                (s1 + s2) * 0.5 * 0.85 + sub
+            }
+        }
+
+        // Piano/Comping (Lifecycle): FM synthesis for bell-like rhodes/electric piano tone.
+        // Carrier sine modulated by another sine: carrier = sin(wc*t + mod_index * sin(wm*t))
+        EventCategory::Lifecycle => {
+            let sub = (2.0 * PI * freq * 0.5 * time).sin() * timbral.sub_level * 0.3;
+
+            // FM parameters: mod_ratio gives harmonic relationship, mod_index controls brightness
+            let mod_ratio = 2.0; // 2:1 ratio — classic electric piano
+            let mod_index = 1.8 + timbral.harmonic_blend * 2.0; // brightness varies with repo timbre
+
+            if chorus {
+                let detune = melody.chorus_detune * 0.5; // subtle detune for warmth
+                let detune_cents = [0.0, -detune, detune];
+                let num_voices = detune_cents.len() as f32;
+                let mut sample = 0.0;
+                for (i, &cents) in detune_cents.iter().enumerate() {
+                    let detune_factor = 2.0_f32.powf(cents / 1200.0);
+                    let f = freq * detune_factor;
+                    let phase_offset = (voice_idx as f32 + i as f32) * 0.15;
+                    // FM synthesis: carrier = sin(wc*t + index * sin(wm*t))
+                    let modulator = (2.0 * PI * f * mod_ratio * time + phase_offset).sin();
+                    let carrier = (2.0 * PI * f * time + phase_offset + mod_index * modulator).sin();
+                    // Add a softer second partial for body
+                    let mod2 = (2.0 * PI * f * (mod_ratio + 1.0) * time + phase_offset).sin();
+                    let carrier2 = (2.0 * PI * f * 2.0 * time + phase_offset + mod_index * 0.3 * mod2).sin();
+                    sample += (carrier * 0.8 + carrier2 * 0.2) / num_voices;
+                }
+                sample * 0.9 + sub
+            } else {
+                let modulator = (2.0 * PI * freq * mod_ratio * time).sin();
+                let carrier = (2.0 * PI * freq * time + mod_index * modulator).sin();
+                let mod2 = (2.0 * PI * freq * (mod_ratio + 1.0) * time).sin();
+                let carrier2 = (2.0 * PI * freq * 2.0 * time + mod_index * 0.3 * mod2).sin();
+                (carrier * 0.8 + carrier2 * 0.2) * 0.9 + sub
+            }
+        }
+
+        // Bass: heavy sub-oscillator at half frequency + mild saw at fundamental.
+        // Deep, thick bass sound — sub sine dominates, fundamental adds definition.
+        EventCategory::Bass => {
+            // Heavy sub at 0.5x frequency — this IS the bass character
+            let sub = (2.0 * PI * freq * 0.5 * time).sin() * 0.65;
+
+            // Fundamental with mild saw for definition
+            let saw_phase = freq * time;
+            let saw = 2.0 * (saw_phase - saw_phase.floor()) - 1.0;
+            let sine = (2.0 * PI * freq * time).sin();
+            let fundamental = sine * 0.7 + saw * 0.3;
+
+            // Very light 2nd harmonic for presence (not brightness)
+            let h2 = (2.0 * PI * freq * 2.0 * time).sin() * 0.08;
+
+            if chorus {
+                let detune = melody.chorus_detune * 0.3; // tight detune for clean bass
+                let f1 = freq * 2.0_f32.powf(-detune / 1200.0);
+                let f2 = freq * 2.0_f32.powf(detune / 1200.0);
+                let saw1 = 2.0 * (f1 * time - (f1 * time).floor()) - 1.0;
+                let saw2 = 2.0 * (f2 * time - (f2 * time).floor()) - 1.0;
+                let s1 = (2.0 * PI * f1 * time).sin() * 0.7 + saw1 * 0.3;
+                let s2 = (2.0 * PI * f2 * time).sin() * 0.7 + saw2 * 0.3;
+                let detuned_fund = (s1 + s2) * 0.5;
+                (sub + detuned_fund * 0.4 + h2) * 0.85
+            } else {
+                (sub + fundamental * 0.4 + h2) * 0.85
+            }
+        }
+
+        // Keys/Pad (SessionBoundary): warm supersaw — uses existing generate_oscillator
+        // which already has good supersaw detuning and sub-oscillator for pad sounds.
+        EventCategory::SessionBoundary => {
+            generate_oscillator(freq, time, chorus, voice_idx, voice, melody, timbral)
+        }
+
+        // Default, DrumHit, ToolPulse: pass through to existing oscillator
+        _ => {
+            generate_oscillator(freq, time, chorus, voice_idx, voice, melody, timbral)
+        }
     }
 }
 
@@ -5072,9 +5240,9 @@ mod tests {
             detune_cents: 12.0, chorus_depth: 0.003, chorus_rate: 0.5, decay_rate: 3.0,
         };
 
-        let start = generate_pad(&notes, 0.0, 0.01, 1.0, effects, &voice, &melody, &timbral).abs();
-        let mid = generate_pad(&notes, 0.5, 0.5, 1.0, effects, &voice, &melody, &timbral).abs();
-        let end = generate_pad(&notes, 1.0, 0.99, 1.0, effects, &voice, &melody, &timbral).abs();
+        let start = generate_pad(&notes, 0.0, 0.01, 1.0, effects, &voice, &melody, &timbral, EventCategory::Default).abs();
+        let mid = generate_pad(&notes, 0.5, 0.5, 1.0, effects, &voice, &melody, &timbral, EventCategory::Default).abs();
+        let end = generate_pad(&notes, 1.0, 0.99, 1.0, effects, &voice, &melody, &timbral, EventCategory::Default).abs();
 
         assert!(mid > start, "pad should be louder in middle than at start");
         assert!(mid > end, "pad should be louder in middle than at end");
