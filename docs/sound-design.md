@@ -4,6 +4,10 @@ Synthesis research and parameter notes for `branch-tone`'s audio engine.
 Based on Blu Mar Ten's JungleJungle (1989–1999) sample pack and broader
 jungle/liquid DnB production techniques.
 
+> **See also**: [Jazz Ensemble](jazz-ensemble.md) — how 18 Claude Code hook
+> events map to a jazz ensemble (drums, bass, keys, horn, piano), including
+> the PDS lifecycle mapping and worktree-as-voice concept.
+
 ## Source Material: Blu Mar Ten JungleJungle Pack
 
 650+ samples from vinyl/CD spanning 1989–1999. The pad samples that define

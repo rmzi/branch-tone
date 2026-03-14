@@ -4,7 +4,7 @@
 
 [package]
 name = "branch-tone"
-version = "0.8.0"
+version = "0.9.1"
 edition = "2024"
 authors = ["Ramzi Abdoch"]
 description = "Generate unique musical tones from git branch names"
@@ -67,6 +67,31 @@ dirs = "5.0"
 # Used by the interactive step sequencer (branch-tone player).
 # -----------------------------------------------------------------------------
 crossterm = "0.28"
+
+# =============================================================================
+# Features - optional functionality behind feature flags
+# =============================================================================
+
+[features]
+default = []
+tray = ["dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
+
+# =============================================================================
+# Platform-specific dependencies
+# =============================================================================
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# objc2 - Rust bindings for Objective-C runtime (already a transitive dep of CPAL)
+objc2 = { version = "0.6", optional = true }
+# objc2-app-kit - Direct bindings to macOS AppKit (NSStatusBar, NSMenu, etc.)
+objc2-app-kit = { version = "0.3", optional = true, features = [
+    "NSApplication", "NSMenu", "NSMenuItem", "NSStatusBar",
+    "NSStatusItem", "NSWorkspace", "NSRunningApplication",
+    "objc2-core-foundation",
+] }
+objc2-foundation = { version = "0.3", optional = true, features = [
+    "NSString", "NSThread",
+] }
 
 # =============================================================================
 # Build configuration

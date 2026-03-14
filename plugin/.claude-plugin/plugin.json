@@ -1,6 +1,6 @@
 {
   "name": "branch-tone",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Hear your git context. Every repo has a voice. Every branch has a melody.",
   "author": {
     "name": "Ramzi Abdoch",
@@ -12,12 +12,20 @@
     "SessionEnd": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
     "Stop": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
     "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "PreToolUse": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "PostToolUse": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
     "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
     "Notification": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
     "SubagentStart": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
     "SubagentStop": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
     "PreCompact": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
-    "TeammateIdle": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }]
+    "TeammateIdle": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "InstructionsLoaded": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "ConfigChange": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "TaskCompleted": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "WorktreeCreate": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "WorktreeRemove": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }]
   },
   "settings": {
     "permissions": { "allow": ["Bash(branch-tone*)"] },
