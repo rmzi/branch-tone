@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.9.1] - 2026-03-14
+
+### Added
+- **macOS menu bar tray** (`--features tray`): Monitor and control the daemon from the system tray — status, start/stop, test sounds, open player, recent events log
+- **`__status_json` daemon command**: Structured JSON status endpoint (PID, uptime, active voices, idle state) for programmatic consumers
+- **`start_time_secs` on DaemonState**: Tracks daemon boot time for uptime reporting
+- **Category-aware articulation**: Stabs, comping, bass lines, and pads per event category
+- **Seed-derived ADSR envelopes**: Per-event envelope variety from deterministic seeds
+- **Category-aware synthesis**: Distinct timbres per instrument (drums, bass, keys, horns)
+- **Event density tracking**: Adjusts behavior based on recent event frequency
+- 5 new tests (106 total with tray feature, 105 without)
+
+### Changed
+- Sound rebalanced: volumes and envelope shapes rotate per event for more musical variety
+- Per-category delay timing for better rhythmic separation
+
 ## [0.9.0] - 2026-03-10
 
 ### Added
