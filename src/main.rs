@@ -731,6 +731,23 @@ fn generate_single_hit(time: f32, sample_rate: f32, voice: &RepoVoice) -> f32 {
     raw * decay_env
 }
 
+/// Generate a pitched percussion hit (kalimba/marimba) — short, tuned to a scale note.
+/// Warm sine fundamental + light harmonics with percussive envelope and click transient.
+fn generate_pitched_hit(time: f32, freq: f32) -> f32 {
+    // Percussive envelope: instant attack, ~100ms decay (kalimba-like)
+    let decay_env = (-12.0 * time).exp();
+    // Click transient (first 2ms) — the "mallet strike"
+    let click = if time < 0.002 { (1.0 - time / 0.002) * 0.25 } else { 0.0 };
+    // Sine fundamental
+    let phase = 2.0 * PI * freq * time;
+    let fundamental = phase.sin();
+    // 2nd harmonic (octave) for brightness
+    let h2 = (phase * 2.0).sin() * 0.2;
+    // 3rd harmonic for body, decays faster
+    let h3 = (phase * 3.0).sin() * 0.08 * (-20.0 * time).exp();
+    (fundamental + h2 + h3 + click) * decay_env
+}
+
 // -----------------------------------------------------------------------------
 // DRUM PATTERN SEQUENCER — CLASSIC BREAKS
 // -----------------------------------------------------------------------------
@@ -2091,6 +2108,17 @@ const MAX_VOICE_SLOTS: usize = 8;
 const DAEMON_IDLE_TIMEOUT_SECS: u64 = 300; // 5 minutes
 
 /// Per-session voice slot in the daemon's shared mix
+/// A queued pitched percussion note for temporal spreading in the daemon.
+/// Instead of playing every tool event immediately (hi-hat barrage), events are
+/// queued and drained at the BPM grid rate, creating rhythmic phrases.
+#[derive(Clone)]
+struct QueuedNote {
+    category: u8,       // packed EventCategory
+    volume: f32,
+    duration_ms: u32,
+    note_freq: f32,     // pitched percussion frequency (from scale)
+}
+
 struct VoiceSlot {
     active: AtomicBool,
     // Session identity (set once on allocation)
@@ -2117,6 +2145,14 @@ struct VoiceSlot {
     pad_shape_idx: AtomicU8, // reserved for daemon v2
     // Last activity timestamp
     last_event_secs: AtomicU64,
+    // Note queue for temporal spreading (ToolPulse/DrumHit → pitched percussion)
+    note_queue: std::sync::Mutex<std::collections::VecDeque<QueuedNote>>,
+    // Walking note counter: advances through scale per event for melodic patterns
+    note_counter: AtomicU8,
+    // Current pitched note frequency for active oneshot (f32 bits)
+    oneshot_note_freq: std::sync::atomic::AtomicU32,
+    // Precomputed grid step in samples (for queue drain timing)
+    grid_step_samples: std::sync::atomic::AtomicU32,
 }
 
 impl VoiceSlot {
@@ -2140,6 +2176,10 @@ impl VoiceSlot {
             effects_bits: AtomicU8::new(0),
             pad_shape_idx: AtomicU8::new(0),
             last_event_secs: AtomicU64::new(0),
+            note_queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            note_counter: AtomicU8::new(0),
+            oneshot_note_freq: std::sync::atomic::AtomicU32::new(0),
+            grid_step_samples: std::sync::atomic::AtomicU32::new(0),
         }
     }
 }
@@ -2152,6 +2192,8 @@ struct DaemonState {
     active_count: AtomicU8,
     last_activity_secs: AtomicU64,
     start_time_secs: AtomicU64,
+    /// Audio sample rate (set by audio engine on init, used by socket handler for grid calc)
+    sample_rate: std::sync::atomic::AtomicU32,
 }
 
 impl DaemonState {
@@ -2168,6 +2210,7 @@ impl DaemonState {
             active_count: AtomicU8::new(0),
             last_activity_secs: AtomicU64::new(now),
             start_time_secs: AtomicU64::new(now),
+            sample_rate: std::sync::atomic::AtomicU32::new(44100),
         }
     }
 
@@ -2662,12 +2705,54 @@ fn handle_daemon_connection(stream: std::os::unix::net::UnixStream, state: &Daem
 
             // Trigger one-shot event
             let cat = args.event_category;
-            slot.oneshot_category.store(category_to_u8(cat), Relaxed);
-            slot.oneshot_duration_ms.store(args.duration as u32, Relaxed);
-            slot.oneshot_volume.store(args.volume.to_bits(), Relaxed);
-            slot.oneshot_sample.store(state.global_sample.load(Relaxed), Relaxed);
-            slot.oneshot_pending.store(true, Relaxed);
             slot.last_event_secs.store(now, Relaxed);
+
+            match cat {
+                // Percussive events → queue for temporal spreading + pitched percussion
+                EventCategory::ToolPulse | EventCategory::DrumHit => {
+                    // Walk through scale notes: each event advances to the next pitch
+                    let note_idx = slot.note_counter.fetch_add(1, Relaxed) as usize;
+                    let note_freq = if let Ok(notes) = slot.notes.lock() {
+                        if notes.is_empty() { 440.0 } else { notes[note_idx % notes.len()] }
+                    } else { 440.0 };
+
+                    // Compute grid step if not yet set (needs sample_rate + slot's BPM)
+                    if slot.grid_step_samples.load(Relaxed) == 0 {
+                        let sr = state.sample_rate.load(Relaxed) as f32;
+                        if let Ok(voice_guard) = slot.voice_data.lock() {
+                            if let Some(ref voice) = *voice_guard {
+                                if let Ok(melody_guard) = slot.melody_data.lock() {
+                                    if let Some(ref melody) = *melody_guard {
+                                        let bpm = CLASSIC_BREAKS[voice.drum_pattern_idx % CLASSIC_BREAKS.len()].bpm;
+                                        let grid = (sixteenth_samples(bpm, sr) * melody.quantize_subdiv).round() as u32;
+                                        slot.grid_step_samples.store(grid.max(1), Relaxed);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if let Ok(mut q) = slot.note_queue.lock() {
+                        // Cap queue depth to avoid unbounded growth (16 notes max)
+                        if q.len() < 16 {
+                            q.push_back(QueuedNote {
+                                category: category_to_u8(cat),
+                                volume: args.volume,
+                                duration_ms: args.duration as u32,
+                                note_freq,
+                            });
+                        }
+                    }
+                }
+                // Tonal/structural events → play immediately (existing behavior)
+                _ => {
+                    slot.oneshot_category.store(category_to_u8(cat), Relaxed);
+                    slot.oneshot_duration_ms.store(args.duration as u32, Relaxed);
+                    slot.oneshot_volume.store(args.volume.to_bits(), Relaxed);
+                    slot.oneshot_sample.store(state.global_sample.load(Relaxed), Relaxed);
+                    slot.oneshot_pending.store(true, Relaxed);
+                }
+            }
 
             // SessionEnd: fade out ambient bed
             if event == "SessionEnd" {
@@ -2691,6 +2776,9 @@ fn daemon_audio_engine(state: Arc<DaemonState>) -> Result<()> {
     let config: cpal::StreamConfig = config.into();
     let sample_rate = config.sample_rate.0 as f32;
     let channels = config.channels as usize;
+
+    // Publish sample rate so socket handler can compute grid step
+    state.sample_rate.store(sample_rate as u32, Relaxed);
 
     // Shared DSP buses
     let mut reverb = SimpleReverb::new(sample_rate);
@@ -2716,6 +2804,8 @@ fn daemon_audio_engine(state: Arc<DaemonState>) -> Result<()> {
     let mut slot_reverbs: Vec<SimpleReverb> = (0..MAX_VOICE_SLOTS)
         .map(|_| SimpleReverb::new(sample_rate))
         .collect();
+    // Per-slot queue drain timing: next sample at which to pop from note_queue
+    let mut queue_next_sample: [u64; MAX_VOICE_SLOTS] = [0; MAX_VOICE_SLOTS];
 
     let err_fn = |err| eprintln!("Daemon audio error: {}", err);
 
@@ -2789,9 +2879,11 @@ fn daemon_audio_engine(state: Arc<DaemonState>) -> Result<()> {
                         mix_r += bed_out;
                     }
 
-                    // Deactivate slot if bed faded out completely and no oneshot
+                    // Deactivate slot if bed faded out completely, no oneshot, and queue empty
+                    let queue_empty = slot.note_queue.try_lock().map_or(false, |q| q.is_empty());
                     if bed_volumes[i] <= 0.001 && slot.bed_fade_out.load(Relaxed)
                         && !oneshot_active[i] && !slot.oneshot_pending.load(Relaxed)
+                        && queue_empty
                     {
                         slot.active.store(false, Relaxed);
                         slot.bed_fade_out.store(false, Relaxed);
@@ -2804,6 +2896,24 @@ fn daemon_audio_engine(state: Arc<DaemonState>) -> Result<()> {
                         oneshot_active[i] = true;
                         oneshot_start_sample[i] = slot.oneshot_sample.load(Relaxed);
                         slot.oneshot_pending.store(false, Relaxed);
+                    }
+
+                    // ── Queue drain: pop pitched percussion notes at grid rate ──
+                    if !oneshot_active[i] && global >= queue_next_sample[i] {
+                        if let Ok(mut q) = slot.note_queue.try_lock() {
+                            if let Some(note) = q.pop_front() {
+                                // Activate this queued note as a oneshot
+                                slot.oneshot_category.store(note.category, Relaxed);
+                                slot.oneshot_duration_ms.store(note.duration_ms, Relaxed);
+                                slot.oneshot_volume.store(note.volume.to_bits(), Relaxed);
+                                slot.oneshot_note_freq.store(note.note_freq.to_bits(), Relaxed);
+                                oneshot_active[i] = true;
+                                oneshot_start_sample[i] = global;
+                                // Schedule next drain at grid boundary
+                                let grid = slot.grid_step_samples.load(Relaxed) as u64;
+                                queue_next_sample[i] = global + grid.max(2048);
+                            }
+                        }
                     }
 
                     if oneshot_active[i] {
@@ -2831,8 +2941,20 @@ fn daemon_audio_engine(state: Arc<DaemonState>) -> Result<()> {
                             let oneshot_out = if let Ok(voice_guard) = slot.voice_data.lock() {
                                 if let Some(ref voice) = *voice_guard {
                                     match cat {
-                                        EventCategory::DrumHit | EventCategory::ToolPulse => {
-                                            generate_single_hit(time, sample_rate, voice)
+                                        EventCategory::ToolPulse => {
+                                            // Pitched percussion: kalimba note from scale
+                                            let freq = f32::from_bits(slot.oneshot_note_freq.load(Relaxed));
+                                            let pitched = generate_pitched_hit(time, if freq > 0.0 { freq } else { voice.root_freq });
+                                            // Light drum ghost underneath (10%) for texture
+                                            let drum = generate_single_hit(time, sample_rate, voice) * 0.1;
+                                            pitched + drum
+                                        }
+                                        EventCategory::DrumHit => {
+                                            // Kick/snare with pitched note layered on top (30%)
+                                            let freq = f32::from_bits(slot.oneshot_note_freq.load(Relaxed));
+                                            let drum = generate_single_hit(time, sample_rate, voice);
+                                            let pitched = generate_pitched_hit(time, if freq > 0.0 { freq } else { voice.root_freq }) * 0.3;
+                                            drum + pitched
                                         }
                                         _ => {
                                             // Tonal: simple pad-like oscillator from slot's notes
@@ -3584,12 +3706,14 @@ where
                     1.0
                 };
 
-                // ── SINGLE HIT PATH (jazz micro-pattern) ────────
-                // Plays 1–4 time-offset hits: primary at full velocity,
-                // ghost notes at 30–60% for flams, drags, and jazz feel.
+                // ── SINGLE HIT PATH (pitched percussion + jazz micro-pattern) ──
+                // ToolPulse: kalimba-like pitched note (walking through scale)
+                // DrumHit: kick/snare with pitched note layered on top
                 if effects.single_hit {
                     let spacing_secs = voice.hit_spacing_ms / 1000.0;
                     let mut sum = 0.0f32;
+                    // Use notes[0] as the pitched frequency (already selected by event_seed)
+                    let pitch_freq = notes.first().copied().unwrap_or(voice.root_freq);
                     for h in 0..voice.hit_count {
                         let hit_time = time - (h as f32 * spacing_secs);
                         if hit_time >= 0.0 {
@@ -3597,7 +3721,22 @@ where
                                 // Ghost notes: 30–60% velocity, decreasing with distance
                                 0.6 - (h as f32 * 0.1)
                             };
-                            sum += generate_single_hit(hit_time, sample_rate, &voice) * vel;
+                            let hit_sample = match event_category {
+                                EventCategory::ToolPulse => {
+                                    // Pitched percussion with light drum ghost
+                                    let pitched = generate_pitched_hit(hit_time, pitch_freq);
+                                    let drum = generate_single_hit(hit_time, sample_rate, &voice) * 0.1;
+                                    pitched + drum
+                                }
+                                EventCategory::DrumHit => {
+                                    // Drum with pitched note layered on top
+                                    let drum = generate_single_hit(hit_time, sample_rate, &voice);
+                                    let pitched = generate_pitched_hit(hit_time, pitch_freq) * 0.3;
+                                    drum + pitched
+                                }
+                                _ => generate_single_hit(hit_time, sample_rate, &voice),
+                            };
+                            sum += hit_sample * vel;
                         }
                     }
                     let raw = sum * volume * global_fade;
@@ -3636,9 +3775,9 @@ where
                         EventCategory::Lifecycle => {
                             generate_comping(&notes, time, current_sample, total_samples, volume, &voice, &melody, &timbral, grid_samples, event_category)
                         }
-                        // Bass: single root note — deep, thick, punchy
+                        // Bass: grid-locked walking bass — deep, thick, punchy
                         EventCategory::Bass => {
-                            generate_bass_note(&notes, time, progress, volume, &voice, &melody, &timbral, event_category)
+                            generate_bass_note(&notes, time, current_sample, volume, &voice, &melody, &timbral, grid_samples, event_category)
                         }
                         // Keys/Pad: sustained warm chord (existing pad behavior)
                         EventCategory::SessionBoundary => {
@@ -4193,7 +4332,7 @@ fn generate_comping(notes: &[f32], time: f32, current_sample: usize, total_sampl
 /// Bass line: plays a short sequence of punchy bass notes from the seed-rotated pattern.
 /// Each note has its own ADSR envelope derived from melody.envelope_shape.
 /// Like a bass player walking through a short phrase — deep, rhythmic, varied per event.
-fn generate_bass_note(notes: &[f32], time: f32, _progress: f32, volume: f32, voice: &RepoVoice, melody: &BranchMelody, timbral: &EffectiveTimbral, category: EventCategory) -> f32 {
+fn generate_bass_note(notes: &[f32], _time: f32, current_sample: usize, volume: f32, voice: &RepoVoice, melody: &BranchMelody, timbral: &EffectiveTimbral, grid_samples: usize, category: EventCategory) -> f32 {
     let num_notes = notes.len().max(1);
 
     // ADSR from melody.envelope_shape — each branch/seed gets a different feel
@@ -4203,21 +4342,24 @@ fn generate_bass_note(notes: &[f32], time: f32, _progress: f32, volume: f32, voi
     let decay_rate = 3.0 + base_decay * 15.0;          // 3.5-6.0 decay rate (fast)
     let sustain_floor = base_attack * 0.3;              // 0.006-0.12 sustain (punchy→soft)
 
-    // Divide total time evenly among notes, with swing
-    let total_time = time; // elapsed time in seconds
-    let note_duration = (voice.delay_time_base / 1000.0).max(0.15); // ~150-500ms per note from repo hash
+    // Lock note spacing to the BPM grid: 1 beat = 4 grid steps (quarter note)
+    let beat_samples = (grid_samples * 4).max(1);
+    let note_duration_samples = beat_samples;
 
     let mut sample = 0.0f32;
 
     for i in 0..num_notes {
-        // Swing: odd notes offset slightly for groove
-        let swing_offset = if i % 2 == 1 { melody.swing * note_duration * 0.5 } else { 0.0 };
-        let note_start = i as f32 * note_duration + swing_offset;
-        let note_time = total_time - note_start;
+        // Swing: odd notes offset by a fraction of the grid step
+        let swing_offset_samples = if i % 2 == 1 {
+            (melody.swing * note_duration_samples as f32 * 0.5) as usize
+        } else { 0 };
+        let note_start_sample = i * note_duration_samples + swing_offset_samples;
 
-        if note_time < 0.0 {
+        if current_sample < note_start_sample {
             continue; // Note hasn't started yet
         }
+
+        let note_time = (current_sample - note_start_sample) as f32 / 44100.0;
 
         // ADSR envelope per note
         let attack_env = (note_time / attack_secs).min(1.0);
@@ -4235,8 +4377,8 @@ fn generate_bass_note(notes: &[f32], time: f32, _progress: f32, volume: f32, voi
     }
 
     // Global fade-out over last 15%
-    let total_dur_approx = num_notes as f32 * note_duration;
-    let progress_approx = if total_dur_approx > 0.0 { (time / total_dur_approx).min(1.0) } else { 0.0 };
+    let total_dur_approx = num_notes * note_duration_samples;
+    let progress_approx = if total_dur_approx > 0 { (current_sample as f32 / total_dur_approx as f32).min(1.0) } else { 0.0 };
     let fade = if progress_approx > 0.85 {
         ((1.0 - progress_approx) / 0.15).sqrt()
     } else {
@@ -6737,6 +6879,47 @@ mod tests {
         // After 200ms the signal should be very quiet
         let late = generate_single_hit(0.2, 44100.0, &voice);
         assert!(late.abs() < 0.05, "single_hit should decay by 200ms, got {}", late);
+    }
+
+    #[test]
+    fn pitched_hit_output_in_range() {
+        let voice = RepoVoice::from_repo("test");
+        for &freq in &voice.scale_freqs {
+            for i in 0..4000 {
+                let t = i as f32 / 44100.0;
+                let s = generate_pitched_hit(t, freq);
+                assert!(!s.is_nan(), "pitched_hit NaN at t={}, freq={}", t, freq);
+                assert!(s.abs() <= 2.0, "pitched_hit out of range at t={}, freq={}: {}", t, freq, s);
+            }
+        }
+    }
+
+    #[test]
+    fn pitched_hit_decays_quickly() {
+        // After 200ms the pitched hit should be very quiet
+        let late = generate_pitched_hit(0.2, 440.0);
+        assert!(late.abs() < 0.05, "pitched_hit should decay by 200ms, got {}", late);
+    }
+
+    #[test]
+    fn pitched_hit_is_pitched() {
+        // A pitched hit at 440Hz should have different output than at 880Hz
+        let a = generate_pitched_hit(0.005, 440.0);
+        let b = generate_pitched_hit(0.005, 880.0);
+        assert_ne!(a, b, "Different frequencies should produce different output");
+    }
+
+    #[test]
+    fn queued_note_walking_scale() {
+        // Successive note_counter values should produce different scale degrees
+        let voice = RepoVoice::from_repo("test");
+        let notes: Vec<f32> = voice.scale_freqs.to_vec();
+        let freq_a = notes[0 % notes.len()];
+        let freq_b = notes[1 % notes.len()];
+        let freq_c = notes[2 % notes.len()];
+        // Walking through the scale should give different pitches
+        assert_ne!(freq_a, freq_b, "Adjacent scale notes should differ");
+        assert_ne!(freq_b, freq_c, "Adjacent scale notes should differ");
     }
 
     #[test]
