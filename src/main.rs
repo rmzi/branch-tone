@@ -176,6 +176,12 @@ enum Command {
     /// Show daemon status (active voices, uptime)
     DaemonStatus,
 
+    /// Mute all sound output (hooks, play, daemon)
+    Mute,
+
+    /// Unmute sound output
+    Unmute,
+
     /// macOS menu bar icon for daemon monitoring and control
     #[cfg(all(target_os = "macos", feature = "tray"))]
     Tray,
@@ -1595,6 +1601,8 @@ fn main() -> Result<()> {
         Some(Command::Daemon { detach }) => run_daemon(detach),
         Some(Command::DaemonStop) => run_daemon_stop(),
         Some(Command::DaemonStatus) => run_daemon_status(),
+        Some(Command::Mute) => run_mute(),
+        Some(Command::Unmute) => run_unmute(),
         #[cfg(all(target_os = "macos", feature = "tray"))]
         Some(Command::Tray) => run_tray(),
         Some(Command::Player { pattern, bpm }) => run_player(pattern, bpm),
@@ -1604,6 +1612,11 @@ fn main() -> Result<()> {
 
 fn run_play(args: PlayArgs) -> Result<()> {
     let PlayArgs { branch, repo, duration, volume, pad, chorus, tremolo, bulldozer, steps, spooky, reverse, randomize, drums, dub_delay, melody_over_drums, single_hit, event_category, event_seed, break_pattern, dry_run, quiet, event_density } = args;
+
+    // Global mute: skip sound entirely (dry_run still prints params)
+    if !dry_run && is_muted() {
+        return Ok(());
+    }
 
     // BRANCH_TONE_VOLUME scales all volumes (default 1.0, e.g. 3.0 = triple)
     let master_vol = std::env::var("BRANCH_TONE_VOLUME")
@@ -2250,6 +2263,14 @@ fn daemon_pid_path() -> std::path::PathBuf {
     daemon_dir().join("daemon.pid")
 }
 
+fn mute_file_path() -> std::path::PathBuf {
+    daemon_dir().join("mute")
+}
+
+fn is_muted() -> bool {
+    mute_file_path().exists()
+}
+
 /// Pack event category into u8 for atomic storage
 fn category_to_u8(cat: EventCategory) -> u8 {
     match cat {
@@ -2535,6 +2556,26 @@ fn run_daemon_status() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn run_mute() -> Result<()> {
+    let path = mute_file_path();
+    let _ = std::fs::create_dir_all(path.parent().unwrap());
+    std::fs::write(&path, "")?;
+    println!("Muted — all branch-tone sound suppressed");
+    println!("Run `branch-tone unmute` to restore");
+    Ok(())
+}
+
+fn run_unmute() -> Result<()> {
+    let path = mute_file_path();
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+        println!("Unmuted — sound restored");
+    } else {
+        println!("Already unmuted");
+    }
     Ok(())
 }
 
@@ -3140,6 +3181,11 @@ fn run_hook() -> Result<()> {
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
             let _ = f.write_all(line.as_bytes());
         }
+    }
+
+    // Muted? Log was written above; skip all sound.
+    if is_muted() {
+        return Ok(());
     }
 
     // Try daemon first: if running, send event via socket (zero-latency)
@@ -5305,7 +5351,7 @@ mod tray {
     use objc2_app_kit::*;
     use objc2_foundation::*;
 
-    use super::{daemon_dir, daemon_pid_path, daemon_socket_path};
+    use super::{daemon_dir, daemon_pid_path, daemon_socket_path, is_muted, mute_file_path};
 
     /// Parsed daemon status from `__status_json`
     #[derive(Default)]
@@ -5432,6 +5478,7 @@ mod tray {
     const TAG_STATUS_LINE: isize = 100;
     const TAG_VOICES_LINE: isize = 101;
     const TAG_TOGGLE: isize = 102;
+    const TAG_MUTE: isize = 103;
     const TAG_RECENT_EVENTS: isize = 200; // 200..207 for up to 8 log lines
 
     define_class!(
@@ -5464,7 +5511,9 @@ mod tray {
 
                 // Use deprecated but simple setTitle for text-only icon
                 #[allow(deprecated)]
-                if is_daemon_running() {
+                if is_muted() {
+                    status_item.setTitle(Some(ns_string!("\u{1F507}")));
+                } else if is_daemon_running() {
                     status_item.setTitle(Some(ns_string!("♫")));
                 } else {
                     status_item.setTitle(Some(ns_string!("♩")));
@@ -5497,6 +5546,17 @@ mod tray {
                     stop_daemon();
                 } else {
                     start_daemon();
+                }
+            }
+
+            #[unsafe(method(toggleMute:))]
+            fn toggle_mute(&self, _sender: &NSMenuItem) {
+                let path = mute_file_path();
+                if is_muted() {
+                    let _ = std::fs::remove_file(&path);
+                } else {
+                    let _ = std::fs::create_dir_all(path.parent().unwrap());
+                    let _ = std::fs::write(&path, "");
                 }
             }
 
@@ -5593,6 +5653,15 @@ mod tray {
         let toggle_item = make_action_item(mtm, toggle_title, sel!(toggleDaemon:));
         toggle_item.setTag(TAG_TOGGLE);
         menu.addItem(&toggle_item);
+
+        // Mute toggle
+        let mute_title = if is_muted() { "\u{1F508} Unmute" } else { "\u{1F507} Mute" };
+        let mute_item = make_action_item(mtm, mute_title, sel!(toggleMute:));
+        mute_item.setTag(TAG_MUTE);
+        // ⌘M keyboard shortcut
+        mute_item.setKeyEquivalent(ns_string!("m"));
+        mute_item.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
+        menu.addItem(&mute_item);
 
         // Test sounds
         let test_item = make_action_item(mtm, "\u{266A} Test Sounds", sel!(testSounds:));
@@ -5710,11 +5779,15 @@ mod tray {
     fn update_menu_from_status(status: &DaemonStatus) {
         let Some(_mtm) = MainThreadMarker::new() else { return };
 
+        let muted = is_muted();
+
         // Update status item icon
         unsafe {
             if let Some(ref item) = GLOBAL_STATUS_ITEM {
                 #[allow(deprecated)]
-                if status.running {
+                if muted {
+                    item.setTitle(Some(ns_string!("\u{1F507}")));
+                } else if status.running {
                     item.setTitle(Some(ns_string!("♫")));
                 } else {
                     item.setTitle(Some(ns_string!("♩")));
@@ -5755,6 +5828,13 @@ mod tray {
                             NSString::from_str("\u{23F9} Stop Daemon")
                         } else {
                             NSString::from_str("\u{25B6}\u{FE0F} Start Daemon")
+                        };
+                        item.setTitle(&text);
+                    } else if tag == TAG_MUTE {
+                        let text = if muted {
+                            NSString::from_str("\u{1F508} Unmute")
+                        } else {
+                            NSString::from_str("\u{1F507} Mute")
                         };
                         item.setTitle(&text);
                     }
@@ -7551,5 +7631,21 @@ mod tests {
         let dir = daemon_dir();
         let dir_str = dir.to_string_lossy();
         assert!(dir_str.contains(".branch-tone"), "daemon_dir should contain .branch-tone: {}", dir_str);
+    }
+
+    #[test]
+    fn mute_file_is_under_branch_tone_dir() {
+        let path = mute_file_path();
+        let path_str = path.to_string_lossy();
+        assert!(path_str.contains(".branch-tone"), "mute file should be under .branch-tone: {}", path_str);
+        assert!(path_str.ends_with("mute"), "mute file should end with 'mute': {}", path_str);
+    }
+
+    #[test]
+    fn is_muted_reflects_file_presence() {
+        // Test the logic directly: mute_file_path().exists() == is_muted()
+        let path = mute_file_path();
+        assert_eq!(path.exists(), is_muted(),
+            "is_muted() should match mute file existence");
     }
 }
