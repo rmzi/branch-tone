@@ -184,7 +184,17 @@ enum Command {
 
     /// macOS menu bar icon for daemon monitoring and control
     #[cfg(all(target_os = "macos", feature = "tray"))]
-    Tray,
+    Tray {
+        /// Run in foreground (default: detach to background)
+        #[arg(long)]
+        foreground: bool,
+        /// Install launchd agent to auto-start tray at login
+        #[arg(long)]
+        install: bool,
+        /// Remove the launchd agent
+        #[arg(long)]
+        uninstall: bool,
+    },
 
     /// Interactive step sequencer — toggle drum hits in real-time
     Player {
@@ -1604,7 +1614,15 @@ fn main() -> Result<()> {
         Some(Command::Mute) => run_mute(),
         Some(Command::Unmute) => run_unmute(),
         #[cfg(all(target_os = "macos", feature = "tray"))]
-        Some(Command::Tray) => run_tray(),
+        Some(Command::Tray { foreground, install, uninstall }) => {
+            if install {
+                return install_tray_agent();
+            }
+            if uninstall {
+                return uninstall_tray_agent();
+            }
+            run_tray(foreground)
+        }
         Some(Command::Player { pattern, bpm }) => run_player(pattern, bpm),
         None => run_play(cli.play_args),
     }
@@ -5867,8 +5885,100 @@ mod tray {
 }
 
 #[cfg(all(target_os = "macos", feature = "tray"))]
-fn run_tray() -> Result<()> {
-    tray::run()
+fn run_tray(foreground: bool) -> Result<()> {
+    if foreground {
+        return tray::run();
+    }
+
+    // Detach: spawn ourselves with --foreground and exit
+    let exe = std::env::current_exe().context("Could not determine executable path")?;
+    let child = std::process::Command::new(exe)
+        .args(["tray", "--foreground"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("Failed to spawn tray process")?;
+
+    println!("Tray started in background (PID {})", child.id());
+    Ok(())
+}
+
+const LAUNCHD_LABEL: &str = "com.branch-tone.tray";
+
+#[cfg(all(target_os = "macos", feature = "tray"))]
+fn launchd_plist_path() -> std::path::PathBuf {
+    dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("Library/LaunchAgents")
+        .join(format!("{}.plist", LAUNCHD_LABEL))
+}
+
+#[cfg(all(target_os = "macos", feature = "tray"))]
+fn install_tray_agent() -> Result<()> {
+    let exe = std::env::current_exe().context("Could not determine executable path")?;
+    let plist_path = launchd_plist_path();
+    let plist_dir = plist_path.parent().unwrap();
+    std::fs::create_dir_all(plist_dir)?;
+
+    let plist = format!(r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{exe}</string>
+        <string>tray</string>
+        <string>--foreground</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>
+"#, label = LAUNCHD_LABEL, exe = exe.display());
+
+    // Unload existing agent if present
+    if plist_path.exists() {
+        let _ = std::process::Command::new("launchctl")
+            .args(["unload", &plist_path.to_string_lossy()])
+            .output();
+    }
+
+    std::fs::write(&plist_path, plist)?;
+
+    // Load the agent
+    std::process::Command::new("launchctl")
+        .args(["load", &plist_path.to_string_lossy()])
+        .output()
+        .context("Failed to load launchd agent")?;
+
+    println!("Installed launch agent: {}", plist_path.display());
+    println!("Tray will auto-start at login");
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", feature = "tray"))]
+fn uninstall_tray_agent() -> Result<()> {
+    let plist_path = launchd_plist_path();
+
+    if !plist_path.exists() {
+        println!("No launch agent installed");
+        return Ok(());
+    }
+
+    let _ = std::process::Command::new("launchctl")
+        .args(["unload", &plist_path.to_string_lossy()])
+        .output();
+
+    std::fs::remove_file(&plist_path)?;
+    println!("Removed launch agent — tray will no longer auto-start");
+    Ok(())
 }
 
 /// Main entry point for the interactive step sequencer.
