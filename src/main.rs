@@ -5848,7 +5848,7 @@ mod tray {
             Some(s) => format!("\u{1F331} Seed: {}", s),
             None => "\u{1F331} Seed: (default)".to_string(),
         };
-        let seed_parent = make_disabled_item(mtm, &seed_label);
+        let seed_parent = make_submenu_parent(mtm, &seed_label);
         seed_parent.setTag(TAG_SEED_PARENT);
         let seed_submenu = build_seed_submenu(mtm, &current_seed);
         seed_parent.setSubmenu(Some(&seed_submenu));
@@ -5866,7 +5866,7 @@ mod tray {
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 
         // Recent events submenu
-        let events_parent = make_disabled_item(mtm, "\u{25B8} Recent Events");
+        let events_parent = make_submenu_parent(mtm, "\u{25B8} Recent Events");
         events_parent.setTag(TAG_EVENTS_PARENT);
         let events_submenu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Recent Events"));
 
@@ -5910,6 +5910,16 @@ mod tray {
         };
         item.setEnabled(false);
         item
+    }
+
+    /// Create an enabled item with no action (for submenu parents)
+    fn make_submenu_parent(mtm: MainThreadMarker, title: &str) -> Retained<NSMenuItem> {
+        let ns_title = NSString::from_str(title);
+        unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm), &ns_title, None, ns_string!(""),
+            )
+        }
     }
 
     /// Create an actionable menu item targeting the NSApp delegate
