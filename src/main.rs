@@ -3047,6 +3047,8 @@ fn daemon_audio_engine(state: Arc<DaemonState>) -> Result<()> {
         .collect();
     // Per-slot queue drain timing: next sample at which to pop from note_queue
     let mut queue_next_sample: [u64; MAX_VOICE_SLOTS] = [0; MAX_VOICE_SLOTS];
+    // Sidechain compressor: smoothed envelope of event bus, used to duck the drone
+    let mut sidechain_env = 0.0f32;
 
     let err_fn = |err| eprintln!("Daemon audio error: {}", err);
 
@@ -3065,21 +3067,9 @@ fn daemon_audio_engine(state: Arc<DaemonState>) -> Result<()> {
                 let mut mix_l = 0.0f32;
                 let mut mix_r = 0.0f32;
 
-                // Compute ducking: check if any slot has an Attention oneshot active
-                let mut duck_level = 1.0f32;
-                for i in 0..MAX_VOICE_SLOTS {
-                    if oneshot_active[i] {
-                        let cat = u8_to_category(state.voices[i].oneshot_category.load(Relaxed));
-                        match cat {
-                            EventCategory::Attention => duck_level = duck_level.min(0.1),
-                            EventCategory::SessionBoundary => duck_level = duck_level.min(0.15),
-                            EventCategory::Bass => duck_level = duck_level.min(0.1),
-                            EventCategory::Lifecycle => duck_level = duck_level.min(0.3),
-                            EventCategory::DrumHit => duck_level = duck_level.min(0.5),
-                            _ => {}
-                        }
-                    }
-                }
+                // Separate buses for sidechain ducking
+                let mut event_bus = 0.0f32;
+                let mut drone_bus = 0.0f32;
 
                 for i in 0..MAX_VOICE_SLOTS {
                     let slot = &state.voices[i];
@@ -3136,9 +3126,9 @@ fn daemon_audio_engine(state: Arc<DaemonState>) -> Result<()> {
                         let third = (2.0 * PI * bed_phases[i] * 3.0).sin() * breath_harmonics * 0.5;
                         let bed_sample = fundamental * 0.55 + sub * 0.3 + second + third;
 
-                        let bed_out = bed_sample * bed_volumes[i] * breath_vol * duck_level;
-                        mix_l += bed_out;
-                        mix_r += bed_out;
+                        // Bed output — routed to drone bus for sidechain ducking
+                        let bed_raw = bed_sample * bed_volumes[i] * breath_vol;
+                        drone_bus += bed_raw;
                     }
 
                     // Deactivate slot if bed faded out completely, no oneshot, and queue empty
@@ -3262,11 +3252,31 @@ fn daemon_audio_engine(state: Arc<DaemonState>) -> Result<()> {
                             // Light reverb per slot
                             let wet = slot_reverbs[i].process(raw);
                             let with_reverb = raw * 0.88 + wet * 0.12;
+                            event_bus += with_reverb.abs();
                             mix_l += with_reverb;
                             mix_r += with_reverb;
                         }
                     }
                 }
+
+                // ── Sidechain compressor: duck drone when events are playing ──
+                // Fast attack (~2ms), slow release (~200ms) for musical pumping
+                let attack = 1.0 - (-1.0 / (0.002 * sample_rate)).exp();
+                let release = 1.0 - (-1.0 / (0.200 * sample_rate)).exp();
+                let coeff = if event_bus > sidechain_env { attack } else { release };
+                sidechain_env += coeff * (event_bus - sidechain_env);
+
+                // Map envelope to ducking: 0 signal = no duck, any signal = heavy duck
+                // Threshold at ~0.001, ratio ~10:1
+                let duck = if sidechain_env > 0.001 {
+                    (0.001 / sidechain_env).min(1.0).powf(0.5) * 0.15
+                } else {
+                    1.0
+                };
+
+                // Mix drone with sidechain ducking into main bus
+                mix_l += drone_bus * duck;
+                mix_r += drone_bus * duck;
 
                 // Shared delay bus (the dub desk)
                 let mono_mix = (mix_l + mix_r) * 0.5;
