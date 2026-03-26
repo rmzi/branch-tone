@@ -3071,10 +3071,11 @@ fn daemon_audio_engine(state: Arc<DaemonState>) -> Result<()> {
                     if oneshot_active[i] {
                         let cat = u8_to_category(state.voices[i].oneshot_category.load(Relaxed));
                         match cat {
-                            EventCategory::Attention => duck_level = duck_level.min(0.2),
-                            EventCategory::SessionBoundary => duck_level = duck_level.min(0.5),
-                            EventCategory::Bass => duck_level = duck_level.min(0.7),
-                            EventCategory::DrumHit => duck_level = duck_level.min(0.8),
+                            EventCategory::Attention => duck_level = duck_level.min(0.1),
+                            EventCategory::SessionBoundary => duck_level = duck_level.min(0.15),
+                            EventCategory::Bass => duck_level = duck_level.min(0.1),
+                            EventCategory::Lifecycle => duck_level = duck_level.min(0.3),
+                            EventCategory::DrumHit => duck_level = duck_level.min(0.5),
                             _ => {}
                         }
                     }
