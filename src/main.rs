@@ -5593,12 +5593,26 @@ mod tray {
             #[unsafe(method(testSounds:))]
             fn test_sounds(&self, _sender: &NSMenuItem) {
                 let Ok(exe) = std::env::current_exe() else { return };
-                let _ = std::process::Command::new(exe)
-                    .args(["test", "."])
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
+                // Play a quick sequence of demo tones with different event types
+                std::thread::spawn(move || {
+                    let demos = [
+                        vec!["play", "--repo", "branch-tone", "--branch", "main",
+                             "--event-category", "session", "--duration", "300", "--quiet"],
+                        vec!["play", "--repo", "branch-tone", "--branch", "feat/mute",
+                             "--event-category", "tool-pulse", "--duration", "200", "--quiet"],
+                        vec!["play", "--repo", "branch-tone", "--branch", "fix/audio",
+                             "--event-category", "attention", "--duration", "300", "--quiet"],
+                    ];
+                    for args in &demos {
+                        let _ = std::process::Command::new(&exe)
+                            .args(args.iter())
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status();
+                        std::thread::sleep(std::time::Duration::from_millis(400));
+                    }
+                });
             }
 
             #[unsafe(method(openPlayer:))]
