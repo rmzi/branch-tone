@@ -182,6 +182,12 @@ enum Command {
     /// Unmute sound output
     Unmute,
 
+    /// Mute the ambient drone (keeps event sounds)
+    MuteDrone,
+
+    /// Restore the ambient drone
+    UnmuteDrone,
+
     /// Set or show the global sound seed (shifts entire sonic palette)
     Seed {
         /// Seed name (e.g. "shadow", "bloom"). Omit to show current seed
@@ -1633,6 +1639,8 @@ fn main() -> Result<()> {
         Some(Command::DaemonStatus) => run_daemon_status(),
         Some(Command::Mute) => run_mute(),
         Some(Command::Unmute) => run_unmute(),
+        Some(Command::MuteDrone) => run_mute_drone(),
+        Some(Command::UnmuteDrone) => run_unmute_drone(),
         Some(Command::Seed { name, clear, list }) => run_seed(name, clear, list),
         #[cfg(all(target_os = "macos", feature = "tray"))]
         Some(Command::Tray { foreground, install, uninstall }) => {
@@ -2245,6 +2253,8 @@ struct DaemonState {
     start_time_secs: AtomicU64,
     /// Audio sample rate (set by audio engine on init, used by socket handler for grid calc)
     sample_rate: std::sync::atomic::AtomicU32,
+    /// Drone mute flag (synced from file every few seconds)
+    drone_muted: AtomicBool,
 }
 
 impl DaemonState {
@@ -2262,6 +2272,7 @@ impl DaemonState {
             last_activity_secs: AtomicU64::new(now),
             start_time_secs: AtomicU64::new(now),
             sample_rate: std::sync::atomic::AtomicU32::new(44100),
+            drone_muted: AtomicBool::new(is_drone_muted()),
         }
     }
 
@@ -2307,6 +2318,14 @@ fn mute_file_path() -> std::path::PathBuf {
 
 fn is_muted() -> bool {
     mute_file_path().exists()
+}
+
+fn drone_mute_path() -> std::path::PathBuf {
+    daemon_dir().join("no-drone")
+}
+
+fn is_drone_muted() -> bool {
+    drone_mute_path().exists()
 }
 
 fn seed_file_path() -> std::path::PathBuf {
@@ -2492,6 +2511,9 @@ fn run_daemon(detach: bool) -> Result<()> {
             break;
         }
 
+        // Sync file-based flags
+        state_idle.drone_muted.store(is_drone_muted(), Relaxed);
+
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -2623,6 +2645,25 @@ fn run_unmute() -> Result<()> {
         println!("Unmuted — sound restored");
     } else {
         println!("Already unmuted");
+    }
+    Ok(())
+}
+
+fn run_mute_drone() -> Result<()> {
+    let path = drone_mute_path();
+    let _ = std::fs::create_dir_all(path.parent().unwrap());
+    std::fs::write(&path, "")?;
+    println!("Drone muted — ambient bed silenced, event sounds continue");
+    Ok(())
+}
+
+fn run_unmute_drone() -> Result<()> {
+    let path = drone_mute_path();
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+        println!("Drone restored");
+    } else {
+        println!("Drone already active");
     }
     Ok(())
 }
@@ -3015,7 +3056,7 @@ fn daemon_audio_engine(state: Arc<DaemonState>) -> Result<()> {
 
                     // ── Ambient bed ──
                     // Ultra-slow Drift pad: very quiet continuous tone
-                    let target_bed_vol = if slot.bed_fade_out.load(Relaxed) {
+                    let target_bed_vol = if slot.bed_fade_out.load(Relaxed) || state.drone_muted.load(Relaxed) {
                         0.0
                     } else {
                         f32::from_bits(slot.bed_volume.load(Relaxed))
@@ -5484,7 +5525,7 @@ mod tray {
     use objc2_app_kit::*;
     use objc2_foundation::*;
 
-    use super::{daemon_dir, daemon_pid_path, daemon_socket_path, get_seed, is_muted, mute_file_path, seed_file_path, SEED_PRESETS};
+    use super::{daemon_dir, daemon_pid_path, daemon_socket_path, drone_mute_path, get_seed, is_drone_muted, is_muted, mute_file_path, seed_file_path, SEED_PRESETS};
 
     // Embedded icon PNGs (template images: black on transparent)
     const ICON_NORMAL: &[u8] = include_bytes!("../assets/icon@2x.png");
@@ -5628,6 +5669,7 @@ mod tray {
     const TAG_MUTE: isize = 103;
     const TAG_EVENTS_PARENT: isize = 104;
     const TAG_SEED_PARENT: isize = 105;
+    const TAG_DRONE_MUTE: isize = 106;
     const TAG_SEED_CLEAR: isize = 300;
     const TAG_SEED_BASE: isize = 301; // 301..316 for curated seeds
     const TAG_RECENT_EVENTS: isize = 200; // 200..207 for up to 8 log lines
@@ -5711,6 +5753,17 @@ mod tray {
                         let _ = std::fs::create_dir_all(path.parent().unwrap());
                         let _ = std::fs::write(&path, name);
                     }
+                }
+            }
+
+            #[unsafe(method(toggleDrone:))]
+            fn toggle_drone(&self, _sender: &NSMenuItem) {
+                let path = drone_mute_path();
+                if is_drone_muted() {
+                    let _ = std::fs::remove_file(&path);
+                } else {
+                    let _ = std::fs::create_dir_all(path.parent().unwrap());
+                    let _ = std::fs::write(&path, "");
                 }
             }
 
@@ -5841,6 +5894,12 @@ mod tray {
         mute_item.setKeyEquivalent(ns_string!("m"));
         mute_item.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
         menu.addItem(&mute_item);
+
+        // Drone mute toggle
+        let drone_title = if is_drone_muted() { "\u{1F50A} Enable Drone" } else { "\u{1F4A4} Mute Drone" };
+        let drone_item = make_action_item(mtm, drone_title, sel!(toggleDrone:));
+        drone_item.setTag(TAG_DRONE_MUTE);
+        menu.addItem(&drone_item);
 
         // Seed submenu
         let current_seed = get_seed();
@@ -6062,6 +6121,13 @@ mod tray {
                             NSString::from_str("\u{1F508} Unmute")
                         } else {
                             NSString::from_str("\u{1F507} Mute")
+                        };
+                        item.setTitle(&text);
+                    } else if tag == TAG_DRONE_MUTE {
+                        let text = if is_drone_muted() {
+                            NSString::from_str("\u{1F50A} Enable Drone")
+                        } else {
+                            NSString::from_str("\u{1F4A4} Mute Drone")
                         };
                         item.setTitle(&text);
                     } else if tag == TAG_EVENTS_PARENT {
