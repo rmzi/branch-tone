@@ -5484,7 +5484,7 @@ mod tray {
     use objc2_app_kit::*;
     use objc2_foundation::*;
 
-    use super::{daemon_dir, daemon_pid_path, daemon_socket_path, is_muted, mute_file_path};
+    use super::{daemon_dir, daemon_pid_path, daemon_socket_path, get_seed, is_muted, mute_file_path, seed_file_path, SEED_PRESETS};
 
     // Embedded icon PNGs (template images: black on transparent)
     const ICON_NORMAL: &[u8] = include_bytes!("../assets/icon@2x.png");
@@ -5627,6 +5627,9 @@ mod tray {
     const TAG_TOGGLE: isize = 102;
     const TAG_MUTE: isize = 103;
     const TAG_EVENTS_PARENT: isize = 104;
+    const TAG_SEED_PARENT: isize = 105;
+    const TAG_SEED_CLEAR: isize = 300;
+    const TAG_SEED_BASE: isize = 301; // 301..316 for curated seeds
     const TAG_RECENT_EVENTS: isize = 200; // 200..207 for up to 8 log lines
 
     define_class!(
@@ -5692,6 +5695,22 @@ mod tray {
                     stop_daemon();
                 } else {
                     start_daemon();
+                }
+            }
+
+            #[unsafe(method(selectSeed:))]
+            fn select_seed(&self, sender: &NSMenuItem) {
+                let tag = sender.tag();
+                if tag == TAG_SEED_CLEAR {
+                    let _ = std::fs::remove_file(seed_file_path());
+                } else {
+                    let idx = (tag - TAG_SEED_BASE) as usize;
+                    if idx < SEED_PRESETS.len() {
+                        let (name, _) = SEED_PRESETS[idx];
+                        let path = seed_file_path();
+                        let _ = std::fs::create_dir_all(path.parent().unwrap());
+                        let _ = std::fs::write(&path, name);
+                    }
                 }
             }
 
@@ -5823,6 +5842,18 @@ mod tray {
         mute_item.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
         menu.addItem(&mute_item);
 
+        // Seed submenu
+        let current_seed = get_seed();
+        let seed_label = match &current_seed {
+            Some(s) => format!("\u{1F331} Seed: {}", s),
+            None => "\u{1F331} Seed: (default)".to_string(),
+        };
+        let seed_parent = make_disabled_item(mtm, &seed_label);
+        seed_parent.setTag(TAG_SEED_PARENT);
+        let seed_submenu = build_seed_submenu(mtm, &current_seed);
+        seed_parent.setSubmenu(Some(&seed_submenu));
+        menu.addItem(&seed_parent);
+
         // Test sounds
         let test_item = make_action_item(mtm, "\u{266A} Test Sounds", sel!(testSounds:));
         menu.addItem(&test_item);
@@ -5889,6 +5920,32 @@ mod tray {
                 NSMenuItem::alloc(mtm), &ns_title, Some(action), ns_string!(""),
             )
         }
+    }
+
+    /// Build the seed selection submenu
+    fn build_seed_submenu(mtm: MainThreadMarker, current: &Option<String>) -> Retained<NSMenu> {
+        let sub = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Seed"));
+
+        // "Default" option (clear seed)
+        let default_title = if current.is_none() { "\u{2713} Default" } else { "  Default" };
+        let default_item = make_action_item(mtm, default_title, sel!(selectSeed:));
+        default_item.setTag(TAG_SEED_CLEAR);
+        sub.addItem(&default_item);
+
+        sub.addItem(&NSMenuItem::separatorItem(mtm));
+
+        // Curated seeds
+        for (i, (name, desc)) in super::SEED_PRESETS.iter().enumerate() {
+            let check = if current.as_deref() == Some(*name) { "\u{2713} " } else { "  " };
+            let title = format!("{}{} — {}", check, name, desc);
+            // Truncate for menu readability
+            let display = if title.len() > 70 { format!("{}...", &title[..67]) } else { title };
+            let item = make_action_item(mtm, &display, sel!(selectSeed:));
+            item.setTag(TAG_SEED_BASE + i as isize);
+            sub.addItem(&item);
+        }
+
+        sub
     }
 
     /// Background thread: poll daemon status every 2s, update menu on main thread
@@ -6022,6 +6079,17 @@ mod tray {
                             mtm, "Open Full Log", sel!(openLog:));
                         sub.addItem(&open_log);
                         item.setSubmenu(Some(&sub));
+                    } else if tag == TAG_SEED_PARENT {
+                        // Update seed label and rebuild submenu
+                        let mtm = MainThreadMarker::new().unwrap();
+                        let current_seed = get_seed();
+                        let label = match &current_seed {
+                            Some(s) => format!("\u{1F331} Seed: {}", s),
+                            None => "\u{1F331} Seed: (default)".to_string(),
+                        };
+                        item.setTitle(&NSString::from_str(&label));
+                        let seed_sub = build_seed_submenu(mtm, &current_seed);
+                        item.setSubmenu(Some(&seed_sub));
                     }
                 }
             }
