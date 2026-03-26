@@ -5511,6 +5511,7 @@ mod tray {
     const TAG_VOICES_LINE: isize = 101;
     const TAG_TOGGLE: isize = 102;
     const TAG_MUTE: isize = 103;
+    const TAG_EVENTS_PARENT: isize = 104;
     const TAG_RECENT_EVENTS: isize = 200; // 200..207 for up to 8 log lines
 
     define_class!(
@@ -5720,6 +5721,7 @@ mod tray {
 
         // Recent events submenu
         let events_parent = make_disabled_item(mtm, "\u{25B8} Recent Events");
+        events_parent.setTag(TAG_EVENTS_PARENT);
         let events_submenu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Recent Events"));
 
         let lines = recent_log_lines(8);
@@ -5880,6 +5882,31 @@ mod tray {
                             NSString::from_str("\u{1F507} Mute")
                         };
                         item.setTitle(&text);
+                    } else if tag == TAG_EVENTS_PARENT {
+                        // Rebuild the recent events submenu
+                        let mtm = MainThreadMarker::new().unwrap();
+                        let sub = NSMenu::initWithTitle(
+                            NSMenu::alloc(mtm), ns_string!("Recent Events"));
+                        let lines = recent_log_lines(8);
+                        if lines.is_empty() {
+                            let empty = make_disabled_item(mtm, "(no events yet)");
+                            sub.addItem(&empty);
+                        } else {
+                            for line in &lines {
+                                let display = if line.len() > 60 {
+                                    &line[..60]
+                                } else {
+                                    line
+                                };
+                                let li = make_disabled_item(mtm, display);
+                                sub.addItem(&li);
+                            }
+                        }
+                        sub.addItem(&NSMenuItem::separatorItem(mtm));
+                        let open_log = make_action_item(
+                            mtm, "Open Full Log", sel!(openLog:));
+                        sub.addItem(&open_log);
+                        item.setSubmenu(Some(&sub));
                     }
                 }
             }
