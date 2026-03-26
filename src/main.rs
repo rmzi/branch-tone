@@ -3003,6 +3003,8 @@ fn daemon_audio_engine(state: Arc<DaemonState>) -> Result<()> {
     let mut bed_phases: [f32; MAX_VOICE_SLOTS] = [0.0; MAX_VOICE_SLOTS];
     // Per-slot bed LFO phases
     let mut bed_lfo_phases: [f32; MAX_VOICE_SLOTS] = [0.0; MAX_VOICE_SLOTS];
+    // Per-slot breath cycle phase (super-long ~90s cycle: silence → presence → silence)
+    let mut bed_breath_phases: [f32; MAX_VOICE_SLOTS] = [0.0; MAX_VOICE_SLOTS];
     // Per-slot bed volume (for fade in/out)
     let mut bed_volumes: [f32; MAX_VOICE_SLOTS] = [0.0; MAX_VOICE_SLOTS];
     // Per-slot one-shot state
@@ -3070,19 +3072,39 @@ fn daemon_audio_engine(state: Arc<DaemonState>) -> Result<()> {
                     }
 
                     if bed_volumes[i] > 0.001 {
-                        // Drift LFO: ultra-slow pitch wobble
+                        // ── Breath cycle: ~90s period, asymmetric (long silence, slow swell) ──
+                        // Rate varies per slot based on root freq for organic desync
+                        let breath_rate = 0.011 + (root % 7.0) * 0.001; // ~0.011–0.018 Hz (55–90s)
+                        bed_breath_phases[i] += breath_rate / sample_rate;
+                        if bed_breath_phases[i] > 1.0 { bed_breath_phases[i] -= 1.0; }
+
+                        // Shape: raised cosine with bias toward silence
+                        // sin^4 gives long valleys (silence) and brief peaks (presence)
+                        let breath_raw = (PI * bed_breath_phases[i]).sin();
+                        let breath = breath_raw * breath_raw * breath_raw * breath_raw; // sin^4
+
+                        // Breath modulates: volume (0.05–1.0), harmonics, pitch drift
+                        let breath_vol = 0.05 + breath * 0.95;
+                        let breath_harmonics = breath * 0.25; // upper partials emerge at peak
+                        let breath_drift = 0.004 * (1.0 - breath); // more pitch wander in quiet
+
+                        // Drift LFO: pitch wobble deepens in quiet phases
                         let lfo_rate = 0.05; // 0.05 Hz — 20 second cycle
                         bed_lfo_phases[i] += lfo_rate / sample_rate;
-                        let lfo = 1.0 + 0.002 * (2.0 * PI * bed_lfo_phases[i]).sin();
+                        let lfo = 1.0 + breath_drift * (2.0 * PI * bed_lfo_phases[i]).sin();
 
                         let bed_freq = fold_to_range(root, 80.0, 200.0) * lfo;
                         bed_phases[i] += bed_freq / sample_rate;
                         if bed_phases[i] > 1.0 { bed_phases[i] -= 1.0; }
 
-                        // Simple warm sine + sub
-                        let bed_sample = (2.0 * PI * bed_phases[i]).sin() * 0.7
-                            + (2.0 * PI * bed_phases[i] * 0.5).sin() * 0.3;
-                        let bed_out = bed_sample * bed_volumes[i] * duck_level;
+                        // Warm sine + sub + harmonics that bloom with breath
+                        let fundamental = (2.0 * PI * bed_phases[i]).sin();
+                        let sub = (2.0 * PI * bed_phases[i] * 0.5).sin();
+                        let second = (2.0 * PI * bed_phases[i] * 2.0).sin() * breath_harmonics;
+                        let third = (2.0 * PI * bed_phases[i] * 3.0).sin() * breath_harmonics * 0.5;
+                        let bed_sample = fundamental * 0.55 + sub * 0.3 + second + third;
+
+                        let bed_out = bed_sample * bed_volumes[i] * breath_vol * duck_level;
                         mix_l += bed_out;
                         mix_r += bed_out;
                     }
