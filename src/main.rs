@@ -182,6 +182,18 @@ enum Command {
     /// Unmute sound output
     Unmute,
 
+    /// Set or show the global sound seed (shifts entire sonic palette)
+    Seed {
+        /// Seed name (e.g. "shadow", "bloom"). Omit to show current seed
+        name: Option<String>,
+        /// Remove seed, restoring default sound
+        #[arg(long)]
+        clear: bool,
+        /// List all curated seed presets
+        #[arg(long)]
+        list: bool,
+    },
+
     /// macOS menu bar icon for daemon monitoring and control
     #[cfg(all(target_os = "macos", feature = "tray"))]
     Tray {
@@ -1199,6 +1211,10 @@ struct RepoVoice {
 impl RepoVoice {
     fn from_repo(repo: &str) -> Self {
         let mut hasher = Sha256::new();
+        if let Some(seed) = get_seed() {
+            hasher.update(seed.as_bytes());
+            hasher.update(b":");
+        }
         hasher.update(repo.as_bytes());
         let hash = hasher.finalize();
 
@@ -1378,6 +1394,10 @@ struct BranchMelody {
 impl BranchMelody {
     fn from_branch(branch: &str, _steps: u8) -> Self {
         let mut hasher = Sha256::new();
+        if let Some(seed) = get_seed() {
+            hasher.update(seed.as_bytes());
+            hasher.update(b":");
+        }
         hasher.update(branch.as_bytes());
         let hash = hasher.finalize();
 
@@ -1613,6 +1633,7 @@ fn main() -> Result<()> {
         Some(Command::DaemonStatus) => run_daemon_status(),
         Some(Command::Mute) => run_mute(),
         Some(Command::Unmute) => run_unmute(),
+        Some(Command::Seed { name, clear, list }) => run_seed(name, clear, list),
         #[cfg(all(target_os = "macos", feature = "tray"))]
         Some(Command::Tray { foreground, install, uninstall }) => {
             if install {
@@ -2288,6 +2309,16 @@ fn is_muted() -> bool {
     mute_file_path().exists()
 }
 
+fn seed_file_path() -> std::path::PathBuf {
+    daemon_dir().join("seed")
+}
+
+fn get_seed() -> Option<String> {
+    std::fs::read_to_string(seed_file_path()).ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Pack event category into u8 for atomic storage
 fn category_to_u8(cat: EventCategory) -> u8 {
     match cat {
@@ -2594,6 +2625,81 @@ fn run_unmute() -> Result<()> {
         println!("Already unmuted");
     }
     Ok(())
+}
+
+/// Curated seed presets: each shifts the entire sonic palette.
+/// The name, description, and character were matched by computing what each
+/// seed produces across reference repos (root, scale, preset, octave, mode).
+const SEED_PRESETS: &[(&str, &str)] = &[
+    ("shadow",    "Dark minor, heavy detuned saws — noir undertones"),
+    ("bloom",     "Bright Lydian, wavy textures — raised-4th shimmer"),
+    ("obsidian",  "Suspended tension, massive saws — volcanic pressure"),
+    ("gossamer",  "Light Mixolydian, warm Juno chorus — weightless drift"),
+    ("monolith",  "Dark minor, raw and stripped — brutalist concrete"),
+    ("ember",     "Dorian warmth, dense stacked Supersaws — smoldering"),
+    ("void",      "Hollow suspended chords, bare raw signal — deep space"),
+    ("meridian",  "Bright Maj7 spread, clean digital M1 — crystalline"),
+    ("undertow",  "Deep C minor, heavy Bulldozer saws — pulling current"),
+    ("reverie",   "Dreamy suspended, warm Juno wash — half-sleep"),
+    ("basalt",    "Deep minor 9th, clean digital — cooled magma"),
+    ("canopy",    "Rich Mixolydian, dense layered saws — thick foliage"),
+    ("solstice",  "Bright Maj7 spread, raw signal — seasonal contrast"),
+    ("lichen",    "Deep minor 9th, slow warm analog — patient growth"),
+    ("tundra",    "Bright pentatonic, cold Iceman filter — frozen air"),
+    ("mycelium",  "Dark minor pentatonic, complex WaveStation — root network"),
+];
+
+fn run_seed(name: Option<String>, clear: bool, list: bool) -> Result<()> {
+    if list {
+        println!("Available seeds:\n");
+        for (name, desc) in SEED_PRESETS {
+            println!("  {:<12} {}", name, desc);
+        }
+        println!("\n  Use any string as a seed — these are just curated starting points.");
+        println!("  Current: {}", get_seed().unwrap_or_else(|| "(default)".into()));
+        return Ok(());
+    }
+
+    if clear {
+        let path = seed_file_path();
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+            println!("Seed cleared — restored to default sound");
+        } else {
+            println!("Already using default seed");
+        }
+        return Ok(());
+    }
+
+    match name {
+        Some(seed) => {
+            let path = seed_file_path();
+            let _ = std::fs::create_dir_all(path.parent().unwrap());
+            std::fs::write(&path, &seed)?;
+
+            // Show what this seed does to a reference repo
+            let voice = RepoVoice::from_repo("branch-tone");
+            let preset = &SYNTH_PRESETS[voice.synth_preset_idx.min(SYNTH_PRESETS.len() - 1)];
+            println!("Seed set to \"{}\"", seed);
+            if let Some((_, desc)) = SEED_PRESETS.iter().find(|(n, _)| *n == seed) {
+                println!("  {}", desc);
+            }
+            println!("  Preview (branch-tone repo): {} {} — {}", voice.root_name, voice.scale_name, preset.name);
+            Ok(())
+        }
+        None => {
+            match get_seed() {
+                Some(seed) => {
+                    println!("Current seed: \"{}\"", seed);
+                    if let Some((_, desc)) = SEED_PRESETS.iter().find(|(n, _)| *n == seed) {
+                        println!("  {}", desc);
+                    }
+                }
+                None => println!("No seed set (using default)"),
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Socket listener: accept connections, parse event JSON, dispatch to voice slots
