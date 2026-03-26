@@ -2951,14 +2951,45 @@ fn handle_daemon_connection(stream: std::os::unix::net::UnixStream, state: &Daem
                         }
                     }
                 }
-                // Tonal/structural events → play immediately with full synthesis
+                // Tonal/structural events → queue as a sequential riff (not a chord)
                 _ => {
-                    slot.oneshot_category.store(category_to_u8(cat), Relaxed);
-                    slot.oneshot_duration_ms.store(args.duration as u32, Relaxed);
-                    slot.oneshot_volume.store(args.volume.to_bits(), Relaxed);
                     slot.oneshot_chorus.store(args.chorus, Relaxed);
-                    slot.oneshot_sample.store(state.global_sample.load(Relaxed), Relaxed);
-                    slot.oneshot_pending.store(true, Relaxed);
+
+                    // Ensure grid step is computed
+                    if slot.grid_step_samples.load(Relaxed) == 0 {
+                        let sr = state.sample_rate.load(Relaxed) as f32;
+                        if let Ok(voice_guard) = slot.voice_data.lock() {
+                            if let Some(ref voice) = *voice_guard {
+                                if let Ok(melody_guard) = slot.melody_data.lock() {
+                                    if let Some(ref melody) = *melody_guard {
+                                        let bpm = CLASSIC_BREAKS[voice.drum_pattern_idx % CLASSIC_BREAKS.len()].bpm;
+                                        let grid = (sixteenth_samples(bpm, sr) * melody.quantize_subdiv).round() as u32;
+                                        slot.grid_step_samples.store(grid.max(1), Relaxed);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Queue individual notes as a riff, not a simultaneous chord
+                    let n_notes = cat.effective_steps(3) as usize;
+                    let per_note_ms = (args.duration as usize / n_notes.max(1)) as u32;
+                    if let Ok(notes) = slot.notes.lock() {
+                        if let Ok(mut q) = slot.note_queue.lock() {
+                            for ni in 0..n_notes.min(notes.len()) {
+                                let idx = slot.note_counter.fetch_add(1, Relaxed) as usize;
+                                let freq = notes[idx % notes.len()];
+                                if q.len() < 16 {
+                                    q.push_back(QueuedNote {
+                                        category: category_to_u8(cat),
+                                        volume: args.volume,
+                                        duration_ms: per_note_ms.max(150),
+                                        note_freq: freq,
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
