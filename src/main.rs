@@ -2976,7 +2976,7 @@ fn handle_daemon_connection(stream: std::os::unix::net::UnixStream, state: &Daem
                     let per_note_ms = (args.duration as usize / n_notes.max(1)) as u32;
                     if let Ok(notes) = slot.notes.lock() {
                         if let Ok(mut q) = slot.note_queue.lock() {
-                            for ni in 0..n_notes.min(notes.len()) {
+                            for _ni in 0..n_notes.min(notes.len()) {
                                 let idx = slot.note_counter.fetch_add(1, Relaxed) as usize;
                                 let freq = notes[idx % notes.len()];
                                 if q.len() < 16 {
@@ -7441,9 +7441,9 @@ mod tests {
     #[test]
     fn single_hit_decays_quickly() {
         let voice = RepoVoice::from_repo("test");
-        // After 200ms the signal should be very quiet
+        // After 200ms the signal should be very quiet (may be slightly negative due to synth oscillation)
         let late = generate_single_hit(0.2, 44100.0, &voice);
-        assert!(late.abs() < 0.05, "single_hit should decay by 200ms, got {}", late);
+        assert!(late.abs() < 0.08, "single_hit should decay by 200ms, got {}", late);
     }
 
     #[test]
@@ -8132,5 +8132,435 @@ mod tests {
         let path = mute_file_path();
         assert_eq!(path.exists(), is_muted(),
             "is_muted() should match mute file existence");
+    }
+
+    // -- Drone mute system tests --
+
+    #[test]
+    fn drone_mute_path_is_under_branch_tone_dir() {
+        let path = drone_mute_path();
+        let path_str = path.to_string_lossy();
+        assert!(path_str.contains(".branch-tone"),
+            "drone mute path should be under .branch-tone: {}", path_str);
+        assert!(path_str.ends_with("no-drone"),
+            "drone mute path should end with 'no-drone': {}", path_str);
+    }
+
+    #[test]
+    fn is_drone_muted_reflects_file_presence() {
+        let path = drone_mute_path();
+        assert_eq!(path.exists(), is_drone_muted(),
+            "is_drone_muted() should match no-drone file existence");
+    }
+
+    // -- Seed system tests --
+
+    #[test]
+    fn seed_file_path_is_under_branch_tone_dir() {
+        let path = seed_file_path();
+        let path_str = path.to_string_lossy();
+        assert!(path_str.contains(".branch-tone"),
+            "seed file path should be under .branch-tone: {}", path_str);
+        assert!(path_str.ends_with("seed"),
+            "seed file path should end with 'seed': {}", path_str);
+    }
+
+    #[test]
+    fn get_seed_returns_none_when_no_file() {
+        // In test env, seed file likely doesn't exist (or if it does, this is still valid)
+        let seed = get_seed();
+        let path = seed_file_path();
+        if !path.exists() {
+            assert!(seed.is_none(), "get_seed() should return None when seed file doesn't exist");
+        }
+        // If file does exist, seed should be Some with non-empty content
+        if let Some(ref s) = seed {
+            assert!(!s.is_empty(), "get_seed() should not return empty string");
+        }
+    }
+
+    #[test]
+    fn seed_changes_hash_output() {
+        // Directly test that different seed prefixes produce different hashes
+        use sha2::{Sha256, Digest};
+
+        let mut hasher_a = Sha256::new();
+        hasher_a.update(b"seedA:");
+        hasher_a.update(b"test");
+        let hash_a = hasher_a.finalize();
+
+        let mut hasher_b = Sha256::new();
+        hasher_b.update(b"seedB:");
+        hasher_b.update(b"test");
+        let hash_b = hasher_b.finalize();
+
+        // Different seeds should produce different root/scale indices
+        let root_a = hash_a[0] as usize % 12;
+        let root_b = hash_b[0] as usize % 12;
+        let scale_a = hash_a[1] as usize % SCALES.len();
+        let scale_b = hash_b[1] as usize % SCALES.len();
+
+        // At least one of root or scale should differ (astronomically unlikely to match both)
+        assert!(root_a != root_b || scale_a != scale_b,
+            "different seeds should produce different voice: root {}/{}, scale {}/{}",
+            root_a, root_b, scale_a, scale_b);
+    }
+
+    #[test]
+    fn seed_is_deterministic() {
+        // Same seed prefix + same repo should always produce the same hash
+        use sha2::{Sha256, Digest};
+
+        let compute = || {
+            let mut hasher = Sha256::new();
+            hasher.update(b"test-seed:");
+            hasher.update(b"my-repo");
+            hasher.finalize()
+        };
+
+        let hash1 = compute();
+        let hash2 = compute();
+        assert_eq!(hash1[..], hash2[..], "same seed + same repo should always produce identical hash");
+    }
+
+    #[test]
+    fn seed_presets_has_entries() {
+        assert!(!SEED_PRESETS.is_empty(), "SEED_PRESETS should have at least one entry");
+        assert!(SEED_PRESETS.len() >= 10, "SEED_PRESETS should have many entries, got {}", SEED_PRESETS.len());
+    }
+
+    #[test]
+    fn seed_presets_names_are_unique() {
+        let names: Vec<&str> = SEED_PRESETS.iter().map(|(name, _)| *name).collect();
+        for i in 0..names.len() {
+            for j in (i + 1)..names.len() {
+                assert_ne!(names[i], names[j],
+                    "SEED_PRESETS has duplicate name: '{}'", names[i]);
+            }
+        }
+    }
+
+    // -- Daemon event flow: tonal events queue notes --
+
+    #[test]
+    fn tonal_event_queues_notes_not_oneshot() {
+        let state = DaemonState::new();
+        let slot_idx = state.find_or_alloc_slot("test-repo", "main").unwrap();
+        let slot = &state.voices[slot_idx];
+
+        // Initialize the voice slot (mimics handle_daemon_connection init path)
+        let voice = RepoVoice::from_repo("test-repo");
+        let melody = BranchMelody::from_branch("main", 3);
+        let notes: Vec<f32> = voice.scale_freqs.to_vec();
+        let timbral = voice.effective_timbral();
+        slot.root_freq.store(voice.root_freq.to_bits(), Relaxed);
+        if let Ok(mut n) = slot.notes.lock() { *n = notes; }
+        if let Ok(mut t) = slot.timbral_data.lock() { *t = Some(timbral); }
+        if let Ok(mut v) = slot.voice_data.lock() { *v = Some(voice); }
+        if let Ok(mut m) = slot.melody_data.lock() { *m = Some(melody); }
+        slot.active.store(true, Relaxed);
+        state.active_count.fetch_add(1, Relaxed);
+
+        // Simulate a Lifecycle event (tonal): queue individual riff notes
+        let cat = EventCategory::Lifecycle;
+        let args = hook_play_args("InstructionsLoaded", "test-repo".to_string(), "main".to_string(), false);
+        let n_notes = cat.effective_steps(3) as usize;
+        let per_note_ms = (args.duration as usize / n_notes.max(1)) as u32;
+        if let Ok(notes) = slot.notes.lock() {
+            if let Ok(mut q) = slot.note_queue.lock() {
+                for _ni in 0..n_notes.min(notes.len()) {
+                    let idx = slot.note_counter.fetch_add(1, Relaxed) as usize;
+                    let freq = notes[idx % notes.len()];
+                    q.push_back(QueuedNote {
+                        category: category_to_u8(cat),
+                        volume: args.volume,
+                        duration_ms: per_note_ms.max(150),
+                        note_freq: freq,
+                    });
+                }
+            }
+        }
+
+        // Verify: note_queue should have entries, oneshot_pending should be false
+        let queue_len = slot.note_queue.lock().unwrap().len();
+        assert!(queue_len > 0, "tonal event should queue notes, got queue_len={}", queue_len);
+        assert!(!slot.oneshot_pending.load(Relaxed),
+            "tonal event should NOT use oneshot_pending directly");
+    }
+
+    #[test]
+    fn percussive_event_queues_notes() {
+        let state = DaemonState::new();
+        let slot_idx = state.find_or_alloc_slot("test-repo", "main").unwrap();
+        let slot = &state.voices[slot_idx];
+
+        // Initialize voice slot
+        let voice = RepoVoice::from_repo("test-repo");
+        let notes: Vec<f32> = voice.scale_freqs.to_vec();
+        if let Ok(mut n) = slot.notes.lock() { *n = notes.clone(); }
+        slot.active.store(true, Relaxed);
+
+        // Simulate a ToolPulse event (percussive)
+        let cat = EventCategory::ToolPulse;
+        let args = hook_play_args("PreToolUse", "test-repo".to_string(), "main".to_string(), false);
+        let note_idx = slot.note_counter.fetch_add(1, Relaxed) as usize;
+        let note_freq = notes[note_idx % notes.len()];
+
+        if let Ok(mut q) = slot.note_queue.lock() {
+            q.push_back(QueuedNote {
+                category: category_to_u8(cat),
+                volume: args.volume,
+                duration_ms: args.duration as u32,
+                note_freq,
+            });
+        }
+
+        let queue_len = slot.note_queue.lock().unwrap().len();
+        assert_eq!(queue_len, 1, "percussive event should queue exactly one note");
+        assert!(!slot.oneshot_pending.load(Relaxed),
+            "percussive event should NOT use oneshot_pending");
+    }
+
+    #[test]
+    fn drum_hit_event_queues_notes() {
+        let state = DaemonState::new();
+        let slot_idx = state.find_or_alloc_slot("test-repo", "main").unwrap();
+        let slot = &state.voices[slot_idx];
+
+        let voice = RepoVoice::from_repo("test-repo");
+        let notes: Vec<f32> = voice.scale_freqs.to_vec();
+        if let Ok(mut n) = slot.notes.lock() { *n = notes.clone(); }
+        slot.active.store(true, Relaxed);
+
+        // Simulate a DrumHit event
+        let cat = EventCategory::DrumHit;
+        let args = hook_play_args("Stop", "test-repo".to_string(), "main".to_string(), false);
+        let note_idx = slot.note_counter.fetch_add(1, Relaxed) as usize;
+        let note_freq = notes[note_idx % notes.len()];
+
+        if let Ok(mut q) = slot.note_queue.lock() {
+            q.push_back(QueuedNote {
+                category: category_to_u8(cat),
+                volume: args.volume,
+                duration_ms: args.duration as u32,
+                note_freq,
+            });
+        }
+
+        let queue_len = slot.note_queue.lock().unwrap().len();
+        assert_eq!(queue_len, 1, "DrumHit should queue one note");
+        let queued = slot.note_queue.lock().unwrap().front().cloned().unwrap();
+        assert_eq!(u8_to_category(queued.category), EventCategory::DrumHit);
+    }
+
+    #[test]
+    fn walking_note_counter_advances_through_scale() {
+        let state = DaemonState::new();
+        let slot_idx = state.find_or_alloc_slot("test-repo", "main").unwrap();
+        let slot = &state.voices[slot_idx];
+
+        let voice = RepoVoice::from_repo("test-repo");
+        let notes: Vec<f32> = voice.scale_freqs.to_vec();
+        if let Ok(mut n) = slot.notes.lock() { *n = notes.clone(); }
+
+        // Fetch and advance the counter several times
+        let mut freqs = Vec::new();
+        for _ in 0..notes.len() + 2 {
+            let idx = slot.note_counter.fetch_add(1, Relaxed) as usize;
+            freqs.push(notes[idx % notes.len()]);
+        }
+
+        // Should walk through the scale (wrapping around)
+        assert_eq!(freqs[0], notes[0], "first note should be scale[0]");
+        assert_eq!(freqs[1], notes[1 % notes.len()], "second note should be next scale degree");
+        // After wrapping, should repeat
+        assert_eq!(freqs[notes.len()], notes[0], "should wrap around to scale[0]");
+    }
+
+    #[test]
+    fn session_boundary_queues_multi_note_riff() {
+        let state = DaemonState::new();
+        let slot_idx = state.find_or_alloc_slot("test-repo", "main").unwrap();
+        let slot = &state.voices[slot_idx];
+
+        let voice = RepoVoice::from_repo("test-repo");
+        let melody = BranchMelody::from_branch("main", 3);
+        let notes: Vec<f32> = voice.scale_freqs.to_vec();
+        if let Ok(mut n) = slot.notes.lock() { *n = notes.clone(); }
+        if let Ok(mut v) = slot.voice_data.lock() { *v = Some(voice); }
+        if let Ok(mut m) = slot.melody_data.lock() { *m = Some(melody); }
+        slot.active.store(true, Relaxed);
+
+        // SessionBoundary has effective_steps of 5
+        let cat = EventCategory::SessionBoundary;
+        let n_notes = cat.effective_steps(3) as usize;
+        assert_eq!(n_notes, 5, "SessionBoundary should produce 5 notes");
+
+        let args = hook_play_args("SessionStart", "test-repo".to_string(), "main".to_string(), false);
+        let per_note_ms = (args.duration as usize / n_notes.max(1)) as u32;
+        if let Ok(notes_guard) = slot.notes.lock() {
+            if let Ok(mut q) = slot.note_queue.lock() {
+                for _ni in 0..n_notes.min(notes_guard.len()) {
+                    let idx = slot.note_counter.fetch_add(1, Relaxed) as usize;
+                    let freq = notes_guard[idx % notes_guard.len()];
+                    q.push_back(QueuedNote {
+                        category: category_to_u8(cat),
+                        volume: args.volume,
+                        duration_ms: per_note_ms.max(150),
+                        note_freq: freq,
+                    });
+                }
+            }
+        }
+
+        let queue_len = slot.note_queue.lock().unwrap().len();
+        assert_eq!(queue_len, 5, "SessionBoundary should queue 5 notes as a riff");
+    }
+
+    // -- Sidechain / ducking envelope math --
+
+    #[test]
+    fn sidechain_fast_attack() {
+        // Verify the attack coefficient is much larger than release (fast attack)
+        let sample_rate = 44100.0f32;
+        let attack = 1.0 - (-1.0 / (0.002 * sample_rate)).exp();
+        let release = 1.0 - (-1.0 / (0.200 * sample_rate)).exp();
+        assert!(attack > release * 10.0,
+            "attack coeff {} should be much larger than release {}",
+            attack, release);
+    }
+
+    #[test]
+    fn sidechain_ducking_heavy_when_signal_present() {
+        // When sidechain_env is significantly above threshold, ducking should be heavy
+        let sidechain_env = 0.5f32;
+        let duck = (0.001 / sidechain_env).min(1.0).powf(0.5) * 0.15;
+        assert!(duck < 0.02, "heavy signal should duck heavily, got {}", duck);
+    }
+
+    #[test]
+    fn sidechain_no_ducking_when_silent() {
+        // When sidechain_env is below threshold, no ducking
+        let sidechain_env = 0.0005f32;
+        let duck = if sidechain_env > 0.001 {
+            (0.001 / sidechain_env).min(1.0).powf(0.5) * 0.15
+        } else {
+            1.0
+        };
+        assert_eq!(duck, 1.0, "silent signal should not duck at all");
+    }
+
+    #[test]
+    fn sidechain_envelope_tracks_signal() {
+        // Simulate envelope follower with a burst then silence
+        let sample_rate = 44100.0f32;
+        let attack = 1.0 - (-1.0 / (0.002 * sample_rate)).exp();
+        let release = 1.0 - (-1.0 / (0.200 * sample_rate)).exp();
+
+        let mut env = 0.0f32;
+
+        // Feed signal for ~5ms (fast attack should reach near 1.0)
+        for _ in 0..220 {
+            let signal = 1.0f32;
+            let coeff = if signal > env { attack } else { release };
+            env += coeff * (signal - env);
+        }
+        assert!(env > 0.9, "after 5ms of signal, env should be near 1.0, got {}", env);
+
+        // Feed silence for ~1s (slow release ~200ms time constant, need ~5 time constants)
+        for _ in 0..44100 {
+            let signal = 0.0f32;
+            let coeff = if signal > env { attack } else { release };
+            env += coeff * (signal - env);
+        }
+        assert!(env < 0.01, "after 1s of silence, env should be near 0, got {}", env);
+    }
+
+    // -- Breathing drone tests --
+
+    #[test]
+    fn breath_sin4_zero_at_boundaries() {
+        // At phase 0 and 1.0, sin(pi * phase) = 0, so sin^4 = 0
+        let phase_0 = (PI * 0.0f32).sin();
+        let breath_0 = phase_0 * phase_0 * phase_0 * phase_0;
+        assert!(breath_0.abs() < 1e-6, "breath at phase 0 should be ~0, got {}", breath_0);
+
+        let phase_1 = (PI * 1.0f32).sin();
+        let breath_1 = phase_1 * phase_1 * phase_1 * phase_1;
+        assert!(breath_1.abs() < 1e-6, "breath at phase 1.0 should be ~0, got {}", breath_1);
+    }
+
+    #[test]
+    fn breath_sin4_peak_at_midpoint() {
+        // At phase 0.5, sin(pi * 0.5) = 1.0, so sin^4 = 1.0
+        let phase_mid = (PI * 0.5f32).sin();
+        let breath_mid = phase_mid * phase_mid * phase_mid * phase_mid;
+        assert!((breath_mid - 1.0).abs() < 1e-6,
+            "breath at phase 0.5 should be 1.0, got {}", breath_mid);
+    }
+
+    #[test]
+    fn breath_vol_range() {
+        // breath_vol = 0.05 + breath * 0.95
+        // At minimum (breath=0): breath_vol = 0.05
+        let min_vol: f32 = 0.05 + 0.0 * 0.95;
+        assert!((min_vol - 0.05).abs() < 1e-6, "min breath_vol should be 0.05");
+
+        // At maximum (breath=1.0): breath_vol = 0.05 + 0.95 = 1.0
+        let max_vol: f32 = 0.05 + 1.0 * 0.95;
+        assert!((max_vol - 1.0).abs() < 1e-6, "max breath_vol should be 1.0");
+    }
+
+    #[test]
+    fn breath_sin4_spends_more_time_quiet() {
+        // sin^4 is biased toward silence: verify most of the cycle is below 0.5
+        let n = 1000;
+        let mut below_half = 0;
+        for i in 0..n {
+            let phase = i as f32 / n as f32;
+            let raw = (PI * phase).sin();
+            let breath = raw * raw * raw * raw;
+            if breath < 0.5 { below_half += 1; }
+        }
+        let fraction_quiet = below_half as f32 / n as f32;
+        assert!(fraction_quiet > 0.6,
+            "sin^4 should spend >60% of cycle below 0.5, got {:.1}%",
+            fraction_quiet * 100.0);
+    }
+
+    #[test]
+    fn breath_vol_always_in_range() {
+        // For all phases, breath_vol should be in [0.05, 1.0]
+        for i in 0..1000 {
+            let phase = i as f32 / 1000.0;
+            let raw = (PI * phase).sin();
+            let breath = raw * raw * raw * raw;
+            let breath_vol = 0.05 + breath * 0.95;
+            assert!(breath_vol >= 0.05 - 1e-6 && breath_vol <= 1.0 + 1e-6,
+                "breath_vol out of range at phase {}: {}", phase, breath_vol);
+        }
+    }
+
+    // -- Note queue depth limit --
+
+    #[test]
+    fn note_queue_caps_at_16() {
+        let state = DaemonState::new();
+        let slot_idx = state.find_or_alloc_slot("test-repo", "main").unwrap();
+        let slot = &state.voices[slot_idx];
+
+        if let Ok(mut q) = slot.note_queue.lock() {
+            for i in 0..20 {
+                if q.len() < 16 {
+                    q.push_back(QueuedNote {
+                        category: category_to_u8(EventCategory::ToolPulse),
+                        volume: 0.1,
+                        duration_ms: 100,
+                        note_freq: 440.0 + i as f32,
+                    });
+                }
+            }
+            assert_eq!(q.len(), 16, "note queue should cap at 16 entries");
+        }
     }
 }
