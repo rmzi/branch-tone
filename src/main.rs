@@ -2170,10 +2170,9 @@ struct VoiceSlot {
     voice_data: std::sync::Mutex<Option<RepoVoice>>,
     melody_data: std::sync::Mutex<Option<BranchMelody>>,
     notes: std::sync::Mutex<Vec<f32>>,
-    #[allow(dead_code)]
-    effects_bits: AtomicU8, // packed Effects (reserved for daemon v2)
-    #[allow(dead_code)]
-    pad_shape_idx: AtomicU8, // reserved for daemon v2
+    // Synthesis params for tonal one-shots
+    oneshot_chorus: AtomicBool,
+    timbral_data: std::sync::Mutex<Option<EffectiveTimbral>>,
     // Last activity timestamp
     last_event_secs: AtomicU64,
     // Note queue for temporal spreading (ToolPulse/DrumHit → pitched percussion)
@@ -2204,8 +2203,8 @@ impl VoiceSlot {
             voice_data: std::sync::Mutex::new(None),
             melody_data: std::sync::Mutex::new(None),
             notes: std::sync::Mutex::new(Vec::new()),
-            effects_bits: AtomicU8::new(0),
-            pad_shape_idx: AtomicU8::new(0),
+            oneshot_chorus: AtomicBool::new(false),
+            timbral_data: std::sync::Mutex::new(None),
             last_event_secs: AtomicU64::new(0),
             note_queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
             note_counter: AtomicU8::new(0),
@@ -2748,7 +2747,9 @@ fn handle_daemon_connection(stream: std::os::unix::net::UnixStream, state: &Daem
                 if let Ok(mut b) = slot.branch.lock() { *b = branch.to_string(); }
 
                 let notes: Vec<f32> = voice.scale_freqs.to_vec();
+                let timbral = voice.effective_timbral();
                 if let Ok(mut n) = slot.notes.lock() { *n = notes; }
+                if let Ok(mut t) = slot.timbral_data.lock() { *t = Some(timbral); }
                 if let Ok(mut v) = slot.voice_data.lock() { *v = Some(voice); }
                 if let Ok(mut m) = slot.melody_data.lock() { *m = Some(melody); }
 
@@ -2803,11 +2804,12 @@ fn handle_daemon_connection(stream: std::os::unix::net::UnixStream, state: &Daem
                         }
                     }
                 }
-                // Tonal/structural events → play immediately (existing behavior)
+                // Tonal/structural events → play immediately with full synthesis
                 _ => {
                     slot.oneshot_category.store(category_to_u8(cat), Relaxed);
                     slot.oneshot_duration_ms.store(args.duration as u32, Relaxed);
                     slot.oneshot_volume.store(args.volume.to_bits(), Relaxed);
+                    slot.oneshot_chorus.store(args.chorus, Relaxed);
                     slot.oneshot_sample.store(state.global_sample.load(Relaxed), Relaxed);
                     slot.oneshot_pending.store(true, Relaxed);
                 }
@@ -3016,29 +3018,36 @@ fn daemon_audio_engine(state: Arc<DaemonState>) -> Result<()> {
                                             drum + pitched
                                         }
                                         _ => {
-                                            // Tonal: simple pad-like oscillator from slot's notes
+                                            // Tonal: use full category-aware oscillator
+                                            let chorus = slot.oneshot_chorus.load(Relaxed);
                                             if let Ok(notes) = slot.notes.lock() {
-                                                if !notes.is_empty() {
-                                                    let mut sum = 0.0f32;
-                                                    for (ni, &freq) in notes.iter().take(3).enumerate() {
-                                                        let phase = 2.0 * PI * freq * time + ni as f32 * 0.2;
-                                                        sum += phase.sin() * 0.33;
-                                                    }
-                                                    // Envelope: fade in/out
-                                                    let env = if progress < 0.1 {
-                                                        progress / 0.1
-                                                    } else if progress > 0.8 {
-                                                        (1.0 - progress) / 0.2
-                                                    } else {
-                                                        1.0
-                                                    };
-                                                    sum * env
-                                                } else {
-                                                    0.0
-                                                }
-                                            } else {
-                                                0.0
-                                            }
+                                                if let Ok(melody_guard) = slot.melody_data.lock() {
+                                                    if let Ok(timbral_guard) = slot.timbral_data.lock() {
+                                                        if !notes.is_empty() {
+                                                            let melody = melody_guard.as_ref();
+                                                            let timbral = timbral_guard.as_ref();
+                                                            if let (Some(mel), Some(tim)) = (melody, timbral) {
+                                                                let mut sum = 0.0f32;
+                                                                let n_voices = notes.len().min(tim.num_voices.max(3));
+                                                                for (ni, &freq) in notes.iter().take(n_voices).enumerate() {
+                                                                    sum += generate_category_oscillator(
+                                                                        freq, time, chorus, ni, voice, mel, tim, cat,
+                                                                    ) / n_voices as f32;
+                                                                }
+                                                                // Envelope: smooth attack/release
+                                                                let env = if progress < 0.05 {
+                                                                    (progress / 0.05).sqrt()
+                                                                } else if progress > 0.75 {
+                                                                    ((1.0 - progress) / 0.25).sqrt()
+                                                                } else {
+                                                                    1.0
+                                                                };
+                                                                sum * env
+                                                            } else { 0.0 }
+                                                        } else { 0.0 }
+                                                    } else { 0.0 }
+                                                } else { 0.0 }
+                                            } else { 0.0 }
                                         }
                                     }
                                 } else {
