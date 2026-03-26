@@ -86,11 +86,12 @@ objc2 = { version = "0.6", optional = true }
 # objc2-app-kit - Direct bindings to macOS AppKit (NSStatusBar, NSMenu, etc.)
 objc2-app-kit = { version = "0.3", optional = true, features = [
     "NSApplication", "NSMenu", "NSMenuItem", "NSStatusBar",
-    "NSStatusItem", "NSWorkspace", "NSRunningApplication",
+    "NSStatusItem", "NSStatusBarButton", "NSButton", "NSImage",
+    "NSWorkspace", "NSRunningApplication",
     "objc2-core-foundation",
 ] }
 objc2-foundation = { version = "0.3", optional = true, features = [
-    "NSString", "NSThread",
+    "NSString", "NSThread", "NSData",
 ] }
 
 # =============================================================================

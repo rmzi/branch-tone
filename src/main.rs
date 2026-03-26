@@ -5365,11 +5365,25 @@ mod tray {
     use anyhow::{Context, Result};
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
-    use objc2::{define_class, msg_send, sel, MainThreadOnly};
+    use objc2::{define_class, msg_send, sel, AnyThread, MainThreadOnly};
     use objc2_app_kit::*;
     use objc2_foundation::*;
 
     use super::{daemon_dir, daemon_pid_path, daemon_socket_path, is_muted, mute_file_path};
+
+    // Embedded icon PNGs (template images: black on transparent)
+    const ICON_NORMAL: &[u8] = include_bytes!("../assets/icon@2x.png");
+    const ICON_MUTED: &[u8] = include_bytes!("../assets/icon-muted@2x.png");
+
+    /// Create an NSImage from embedded PNG bytes, marked as template for light/dark mode
+    fn icon_from_bytes(bytes: &[u8]) -> Option<Retained<NSImage>> {
+        let data = NSData::with_bytes(bytes);
+        let img = NSImage::initWithData(NSImage::alloc(), &data)?;
+        img.setTemplate(true);
+        // Menu bar icons should be 22x22 points; @2x PNG is 44x44 pixels
+        img.setSize(NSSize { width: 22.0, height: 22.0 });
+        Some(img)
+    }
 
     /// Parsed daemon status from `__status_json`
     #[derive(Default)]
@@ -5527,14 +5541,12 @@ mod tray {
                 let status_bar = NSStatusBar::systemStatusBar();
                 let status_item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
 
-                // Use deprecated but simple setTitle for text-only icon
-                #[allow(deprecated)]
-                if is_muted() {
-                    status_item.setTitle(Some(ns_string!("\u{1F507}")));
-                } else if is_daemon_running() {
-                    status_item.setTitle(Some(ns_string!("♫")));
-                } else {
-                    status_item.setTitle(Some(ns_string!("♩")));
+                // Set menu bar icon from embedded PNG template image
+                if let Some(button) = status_item.button(mtm) {
+                    let icon_bytes = if is_muted() { ICON_MUTED } else { ICON_NORMAL };
+                    if let Some(img) = icon_from_bytes(icon_bytes) {
+                        button.setImage(Some(&img));
+                    }
                 }
 
                 // Build the menu
@@ -5802,13 +5814,12 @@ mod tray {
         // Update status item icon
         unsafe {
             if let Some(ref item) = GLOBAL_STATUS_ITEM {
-                #[allow(deprecated)]
-                if muted {
-                    item.setTitle(Some(ns_string!("\u{1F507}")));
-                } else if status.running {
-                    item.setTitle(Some(ns_string!("♫")));
-                } else {
-                    item.setTitle(Some(ns_string!("♩")));
+                let mtm = MainThreadMarker::new().unwrap();
+                if let Some(button) = item.button(mtm) {
+                    let icon_bytes = if muted { ICON_MUTED } else { ICON_NORMAL };
+                    if let Some(img) = icon_from_bytes(icon_bytes) {
+                        button.setImage(Some(&img));
+                    }
                 }
             }
 
