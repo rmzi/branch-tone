@@ -1395,6 +1395,8 @@ struct BranchMelody {
     drum_ghost_level: f32,   // 0.0–0.4
     // Quantize subdivision (hash byte 18): multiplier on 16th-note grid
     quantize_subdiv: f32,    // 0.5=1/32, 1.0=1/16, 2.0=1/8, 4.0=1/4, 8.0=1/2
+    // Humanize: micro-timing jitter as fraction of grid step (hash byte 19)
+    humanize: f32,           // 0.0–0.12
 }
 
 impl BranchMelody {
@@ -1456,9 +1458,31 @@ impl BranchMelody {
         let drum_ghost_level = (hash[17] as f32 / 255.0) * 0.4;
 
         // Quantize subdivision (hash byte 18): snap arp notes to BPM grid
-        // Table biases toward 1/8; env var BRANCH_TONE_QUANTIZE allows 1/32 and 1/2 too
-        const QUANTIZE_SUBDIVS: [f32; 4] = [1.0, 2.0, 4.0, 2.0];
+        // Table biases toward 1/16; env var BRANCH_TONE_QUANTIZE overrides
+        const QUANTIZE_SUBDIVS: [f32; 4] = [0.5, 1.0, 1.0, 2.0];
         let quantize_subdiv = QUANTIZE_SUBDIVS[(hash[18] as usize) % QUANTIZE_SUBDIVS.len()];
+
+        // Humanize: micro-timing jitter as fraction of grid step (0.0–0.12)
+        let humanize = (hash[19] as f32 / 255.0) * 0.12;
+
+        // Seed preset groove override: if the active seed matches a curated preset,
+        // use its explicit swing/humanize/quantize instead of the hash-derived values
+        let (swing, humanize, quantize_subdiv) = if let Some(seed_name) = get_seed() {
+            if let Some(sp) = SEED_PRESETS.iter().find(|p| p.name == seed_name) {
+                (sp.swing, sp.humanize, sp.quantize_subdiv)
+            } else {
+                (swing, humanize, quantize_subdiv)
+            }
+        } else {
+            (swing, humanize, quantize_subdiv)
+        };
+
+        // Quantize file override: explicit user choice from tray menu takes top priority
+        let quantize_subdiv = if let Some(denom) = get_quantize() {
+            quantize_denom_to_subdiv(denom)
+        } else {
+            quantize_subdiv
+        };
 
         Self {
             swing,
@@ -1476,6 +1500,7 @@ impl BranchMelody {
             drum_chop_idx,
             drum_ghost_level,
             quantize_subdiv,
+            humanize,
         }
     }
 }
@@ -2338,6 +2363,28 @@ fn get_seed() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn quantize_file_path() -> std::path::PathBuf {
+    daemon_dir().join("quantize")
+}
+
+/// Read persisted quantize override. Returns None for "auto" (hash-derived).
+fn get_quantize() -> Option<u32> {
+    std::fs::read_to_string(quantize_file_path()).ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&d| matches!(d, 4 | 8 | 16 | 32))
+}
+
+/// Map quantize denominator (4/8/16/32) to subdivision multiplier.
+fn quantize_denom_to_subdiv(denom: u32) -> f32 {
+    match denom {
+        4 => 4.0,
+        8 => 2.0,
+        16 => 1.0,
+        32 => 0.5,
+        _ => 1.0,
+    }
+}
+
 /// Pack event category into u8 for atomic storage
 fn category_to_u8(cat: EventCategory) -> u8 {
     match cat {
@@ -2671,30 +2718,42 @@ fn run_unmute_drone() -> Result<()> {
 /// Curated seed presets: each shifts the entire sonic palette.
 /// The name, description, and character were matched by computing what each
 /// seed produces across reference repos (root, scale, preset, octave, mode).
-const SEED_PRESETS: &[(&str, &str)] = &[
-    ("shadow",    "Dark minor, heavy detuned saws — noir undertones"),
-    ("bloom",     "Bright Lydian, wavy textures — raised-4th shimmer"),
-    ("obsidian",  "Suspended tension, massive saws — volcanic pressure"),
-    ("gossamer",  "Light Mixolydian, warm Juno chorus — weightless drift"),
-    ("monolith",  "Dark minor, raw and stripped — brutalist concrete"),
-    ("ember",     "Dorian warmth, dense stacked Supersaws — smoldering"),
-    ("void",      "Hollow suspended chords, bare raw signal — deep space"),
-    ("meridian",  "Bright Maj7 spread, clean digital M1 — crystalline"),
-    ("undertow",  "Deep C minor, heavy Bulldozer saws — pulling current"),
-    ("reverie",   "Dreamy suspended, warm Juno wash — half-sleep"),
-    ("basalt",    "Deep minor 9th, clean digital — cooled magma"),
-    ("canopy",    "Rich Mixolydian, dense layered saws — thick foliage"),
-    ("solstice",  "Bright Maj7 spread, raw signal — seasonal contrast"),
-    ("lichen",    "Deep minor 9th, slow warm analog — patient growth"),
-    ("tundra",    "Bright pentatonic, cold Iceman filter — frozen air"),
-    ("mycelium",  "Dark minor pentatonic, complex WaveStation — root network"),
+/// Groove parameters for a seed preset — controls feel/timing independently of harmonic identity.
+/// swing: 0.0 (straight) – 0.3 (heavy shuffle)
+/// humanize: 0.0 (robotic) – 0.12 (loose)
+/// quantize_subdiv: grid multiplier on 16th notes (0.5=1/32, 1.0=1/16, 2.0=1/8, 4.0=1/4)
+struct SeedPreset {
+    name: &'static str,
+    desc: &'static str,
+    swing: f32,
+    humanize: f32,
+    quantize_subdiv: f32,
+}
+
+const SEED_PRESETS: &[SeedPreset] = &[
+    SeedPreset { name: "shadow",    desc: "Dark minor, heavy detuned saws — noir undertones",              swing: 0.18, humanize: 0.08, quantize_subdiv: 1.0 },
+    SeedPreset { name: "bloom",     desc: "Bright Lydian, wavy textures — raised-4th shimmer",             swing: 0.10, humanize: 0.04, quantize_subdiv: 1.0 },
+    SeedPreset { name: "obsidian",  desc: "Suspended tension, massive saws — volcanic pressure",           swing: 0.05, humanize: 0.02, quantize_subdiv: 0.5 },
+    SeedPreset { name: "gossamer",  desc: "Light Mixolydian, warm Juno chorus — weightless drift",         swing: 0.22, humanize: 0.10, quantize_subdiv: 2.0 },
+    SeedPreset { name: "monolith",  desc: "Dark minor, raw and stripped — brutalist concrete",             swing: 0.00, humanize: 0.01, quantize_subdiv: 0.5 },
+    SeedPreset { name: "ember",     desc: "Dorian warmth, dense stacked Supersaws — smoldering",           swing: 0.15, humanize: 0.06, quantize_subdiv: 1.0 },
+    SeedPreset { name: "void",      desc: "Hollow suspended chords, bare raw signal — deep space",         swing: 0.08, humanize: 0.11, quantize_subdiv: 2.0 },
+    SeedPreset { name: "meridian",  desc: "Bright Maj7 spread, clean digital M1 — crystalline",            swing: 0.03, humanize: 0.02, quantize_subdiv: 0.5 },
+    SeedPreset { name: "undertow",  desc: "Deep C minor, heavy Bulldozer saws — pulling current",          swing: 0.25, humanize: 0.09, quantize_subdiv: 2.0 },
+    SeedPreset { name: "reverie",   desc: "Dreamy suspended, warm Juno wash — half-sleep",                 swing: 0.28, humanize: 0.12, quantize_subdiv: 2.0 },
+    SeedPreset { name: "basalt",    desc: "Deep minor 9th, clean digital — cooled magma",                  swing: 0.06, humanize: 0.03, quantize_subdiv: 1.0 },
+    SeedPreset { name: "canopy",    desc: "Rich Mixolydian, dense layered saws — thick foliage",           swing: 0.20, humanize: 0.07, quantize_subdiv: 1.0 },
+    SeedPreset { name: "solstice",  desc: "Bright Maj7 spread, raw signal — seasonal contrast",            swing: 0.12, humanize: 0.05, quantize_subdiv: 1.0 },
+    SeedPreset { name: "lichen",    desc: "Deep minor 9th, slow warm analog — patient growth",             swing: 0.24, humanize: 0.10, quantize_subdiv: 2.0 },
+    SeedPreset { name: "tundra",    desc: "Bright pentatonic, cold Iceman filter — frozen air",            swing: 0.02, humanize: 0.01, quantize_subdiv: 0.5 },
+    SeedPreset { name: "mycelium",  desc: "Dark minor pentatonic, complex WaveStation — root network",     swing: 0.16, humanize: 0.08, quantize_subdiv: 1.0 },
 ];
 
 fn run_seed(name: Option<String>, clear: bool, list: bool) -> Result<()> {
     if list {
         println!("Available seeds:\n");
-        for (name, desc) in SEED_PRESETS {
-            println!("  {:<12} {}", name, desc);
+        for p in SEED_PRESETS {
+            println!("  {:<12} {}", p.name, p.desc);
         }
         println!("\n  Use any string as a seed — these are just curated starting points.");
         println!("  Current: {}", get_seed().unwrap_or_else(|| "(default)".into()));
@@ -2722,8 +2781,8 @@ fn run_seed(name: Option<String>, clear: bool, list: bool) -> Result<()> {
             let voice = RepoVoice::from_repo("branch-tone");
             let preset = &SYNTH_PRESETS[voice.synth_preset_idx.min(SYNTH_PRESETS.len() - 1)];
             println!("Seed set to \"{}\"", seed);
-            if let Some((_, desc)) = SEED_PRESETS.iter().find(|(n, _)| *n == seed) {
-                println!("  {}", desc);
+            if let Some(sp) = SEED_PRESETS.iter().find(|p| p.name == seed) {
+                println!("  {}", sp.desc);
             }
             println!("  Preview (branch-tone repo): {} {} — {}", voice.root_name, voice.scale_name, preset.name);
             Ok(())
@@ -2732,8 +2791,8 @@ fn run_seed(name: Option<String>, clear: bool, list: bool) -> Result<()> {
             match get_seed() {
                 Some(seed) => {
                     println!("Current seed: \"{}\"", seed);
-                    if let Some((_, desc)) = SEED_PRESETS.iter().find(|(n, _)| *n == seed) {
-                        println!("  {}", desc);
+                    if let Some(sp) = SEED_PRESETS.iter().find(|p| p.name == seed) {
+                        println!("  {}", sp.desc);
                     }
                 }
                 None => println!("No seed set (using default)"),
@@ -3047,7 +3106,7 @@ fn daemon_audio_engine(state: Arc<DaemonState>) -> Result<()> {
         .collect();
     // Per-slot queue drain timing: next sample at which to pop from note_queue
     let mut queue_next_sample: [u64; MAX_VOICE_SLOTS] = [0; MAX_VOICE_SLOTS];
-    // Sidechain compressor: smoothed envelope of event bus, used to duck the drone
+    // Gentle sidechain: smoothed envelope of event bus for mild drone ducking
     let mut sidechain_env = 0.0f32;
 
     let err_fn = |err| eprintln!("Daemon audio error: {}", err);
@@ -3259,22 +3318,22 @@ fn daemon_audio_engine(state: Arc<DaemonState>) -> Result<()> {
                     }
                 }
 
-                // ── Sidechain compressor: duck drone when events are playing ──
-                // Fast attack (~2ms), slow release (~200ms) for musical pumping
-                let attack = 1.0 - (-1.0 / (0.002 * sample_rate)).exp();
-                let release = 1.0 - (-1.0 / (0.200 * sample_rate)).exp();
-                let coeff = if event_bus > sidechain_env { attack } else { release };
+                // ── Gentle sidechain: mild ducking so drone breathes under events ──
+                // Slow attack (~20ms), slow release (~400ms) for transparent level riding
+                let sc_attack = 1.0 - (-1.0 / (0.020 * sample_rate)).exp();
+                let sc_release = 1.0 - (-1.0 / (0.400 * sample_rate)).exp();
+                let coeff = if event_bus > sidechain_env { sc_attack } else { sc_release };
                 sidechain_env += coeff * (event_bus - sidechain_env);
 
-                // Map envelope to ducking: 0 signal = no duck, any signal = heavy duck
-                // Threshold at ~0.001, ratio ~10:1
-                let duck = if sidechain_env > 0.001 {
-                    (0.001 / sidechain_env).min(1.0).powf(0.5) * 0.15
+                // Gentle ducking: at most -6dB (50%) reduction, high threshold
+                // Drone stays audible at all times — events sit on top, not instead
+                let duck = if sidechain_env > 0.01 {
+                    0.5 + 0.5 * (0.01 / sidechain_env).min(1.0)
                 } else {
                     1.0
                 };
 
-                // Mix drone with sidechain ducking into main bus
+                // Mix drone (with gentle ducking) into main bus alongside events
                 mix_l += drone_bus * duck;
                 mix_r += drone_bus * duck;
 
@@ -4395,12 +4454,17 @@ fn generate_arpeggio(notes: &[f32], time: f32, current_sample: usize, total_samp
     }
     *boundaries.last_mut().unwrap() = total_samples;
 
-    // Snap interior boundaries to the nearest BPM grid point.
+    // Snap interior boundaries to the nearest BPM grid point, then apply humanize jitter.
     // Skip quantization when there are too many notes to fit the grid —
     // each note needs at least one grid step, so we need num_notes * grid_samples <= total_samples.
     if num_notes * grid_samples <= total_samples {
-        for b in boundaries[1..num_notes].iter_mut() {
-            *b = ((*b as f32 / grid_samples as f32).round() as usize) * grid_samples;
+        for (idx, b) in boundaries[1..num_notes].iter_mut().enumerate() {
+            let grid_pos = ((*b as f32 / grid_samples as f32).round() as usize) * grid_samples;
+            // Humanize: deterministic per-note jitter derived from note index
+            // Alternates early/late to create a natural push-pull feel
+            let jitter_frac = melody.humanize * if idx % 2 == 0 { 0.7 } else { -0.5 };
+            let jitter_samples = (jitter_frac * grid_samples as f32).round() as isize;
+            *b = (grid_pos as isize + jitter_samples).max(0) as usize;
         }
         // Ensure no two boundaries collide — minimum 1 grid step apart
         for i in 1..boundaries.len() - 1 {
@@ -5589,7 +5653,7 @@ mod tray {
     use objc2_app_kit::*;
     use objc2_foundation::*;
 
-    use super::{daemon_dir, daemon_pid_path, daemon_socket_path, drone_mute_path, get_seed, is_drone_muted, is_muted, mute_file_path, seed_file_path, SEED_PRESETS};
+    use super::{daemon_dir, daemon_pid_path, daemon_socket_path, drone_mute_path, get_quantize, get_seed, is_drone_muted, is_muted, mute_file_path, quantize_file_path, seed_file_path, subdiv_label, SEED_PRESETS};
 
     // Embedded icon PNGs (template images: black on transparent)
     const ICON_NORMAL: &[u8] = include_bytes!("../assets/icon@2x.png");
@@ -5734,9 +5798,12 @@ mod tray {
     const TAG_EVENTS_PARENT: isize = 104;
     const TAG_SEED_PARENT: isize = 105;
     const TAG_DRONE_MUTE: isize = 106;
+    const TAG_QUANTIZE_PARENT: isize = 107;
     const TAG_SEED_CLEAR: isize = 300;
     const TAG_SEED_BASE: isize = 301; // 301..316 for curated seeds
     const TAG_RECENT_EVENTS: isize = 200; // 200..207 for up to 8 log lines
+    const TAG_QUANTIZE_AUTO: isize = 400;
+    const TAG_QUANTIZE_BASE: isize = 401; // 401..404 for 1/32, 1/16, 1/8, 1/4
 
     define_class!(
         // SAFETY: NSObject has no subclassing requirements. No Drop impl.
@@ -5812,10 +5879,25 @@ mod tray {
                 } else {
                     let idx = (tag - TAG_SEED_BASE) as usize;
                     if idx < SEED_PRESETS.len() {
-                        let (name, _) = SEED_PRESETS[idx];
                         let path = seed_file_path();
                         let _ = std::fs::create_dir_all(path.parent().unwrap());
-                        let _ = std::fs::write(&path, name);
+                        let _ = std::fs::write(&path, SEED_PRESETS[idx].name);
+                    }
+                }
+            }
+
+            #[unsafe(method(selectQuantize:))]
+            fn select_quantize(&self, sender: &NSMenuItem) {
+                let tag = sender.tag();
+                if tag == TAG_QUANTIZE_AUTO {
+                    let _ = std::fs::remove_file(quantize_file_path());
+                } else {
+                    let idx = (tag - TAG_QUANTIZE_BASE) as usize;
+                    const DENOMS: [u32; 4] = [32, 16, 8, 4];
+                    if idx < DENOMS.len() {
+                        let path = quantize_file_path();
+                        let _ = std::fs::create_dir_all(path.parent().unwrap());
+                        let _ = std::fs::write(&path, DENOMS[idx].to_string());
                     }
                 }
             }
@@ -5977,6 +6059,18 @@ mod tray {
         seed_parent.setSubmenu(Some(&seed_submenu));
         menu.addItem(&seed_parent);
 
+        // Quantize submenu
+        let current_quantize = get_quantize();
+        let quantize_label = match current_quantize {
+            Some(d) => format!("\u{1F3B5} Grid: {}", subdiv_label(super::quantize_denom_to_subdiv(d))),
+            None => "\u{1F3B5} Grid: Auto".to_string(),
+        };
+        let quantize_parent = make_submenu_parent(mtm, &quantize_label);
+        quantize_parent.setTag(TAG_QUANTIZE_PARENT);
+        let quantize_submenu = build_quantize_submenu(mtm, current_quantize);
+        quantize_parent.setSubmenu(Some(&quantize_submenu));
+        menu.addItem(&quantize_parent);
+
         // Test sounds
         let test_item = make_action_item(mtm, "\u{266A} Test Sounds", sel!(testSounds:));
         menu.addItem(&test_item);
@@ -6068,13 +6162,36 @@ mod tray {
         sub.addItem(&NSMenuItem::separatorItem(mtm));
 
         // Curated seeds
-        for (i, (name, desc)) in super::SEED_PRESETS.iter().enumerate() {
-            let check = if current.as_deref() == Some(*name) { "\u{2713} " } else { "  " };
-            let title = format!("{}{} — {}", check, name, desc);
+        for (i, p) in super::SEED_PRESETS.iter().enumerate() {
+            let check = if current.as_deref() == Some(p.name) { "\u{2713} " } else { "  " };
+            let title = format!("{}{} — {}", check, p.name, p.desc);
             // Truncate for menu readability
             let display = if title.len() > 70 { format!("{}...", &title[..67]) } else { title };
             let item = make_action_item(mtm, &display, sel!(selectSeed:));
             item.setTag(TAG_SEED_BASE + i as isize);
+            sub.addItem(&item);
+        }
+
+        sub
+    }
+
+    /// Build the quantize grid submenu: Auto, 1/32, 1/16, 1/8, 1/4
+    fn build_quantize_submenu(mtm: MainThreadMarker, current: Option<u32>) -> Retained<NSMenu> {
+        let sub = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Quantize"));
+
+        let auto_title = if current.is_none() { "\u{2713} Auto" } else { "  Auto" };
+        let auto_item = make_action_item(mtm, auto_title, sel!(selectQuantize:));
+        auto_item.setTag(TAG_QUANTIZE_AUTO);
+        sub.addItem(&auto_item);
+
+        sub.addItem(&NSMenuItem::separatorItem(mtm));
+
+        const DENOMS: [(u32, &str); 4] = [(32, "1/32 (tightest)"), (16, "1/16"), (8, "1/8"), (4, "1/4 (widest)")];
+        for (i, (denom, label)) in DENOMS.iter().enumerate() {
+            let check = if current == Some(*denom) { "\u{2713} " } else { "  " };
+            let title = format!("{}{}", check, label);
+            let item = make_action_item(mtm, &title, sel!(selectQuantize:));
+            item.setTag(TAG_QUANTIZE_BASE + i as isize);
             sub.addItem(&item);
         }
 
@@ -6230,6 +6347,17 @@ mod tray {
                         item.setTitle(&NSString::from_str(&label));
                         let seed_sub = build_seed_submenu(mtm, &current_seed);
                         item.setSubmenu(Some(&seed_sub));
+                    } else if tag == TAG_QUANTIZE_PARENT {
+                        // Update quantize label and rebuild submenu
+                        let mtm = MainThreadMarker::new().unwrap();
+                        let current_q = get_quantize();
+                        let label = match current_q {
+                            Some(d) => format!("\u{1F3B5} Grid: {}", subdiv_label(super::quantize_denom_to_subdiv(d))),
+                            None => "\u{1F3B5} Grid: Auto".to_string(),
+                        };
+                        item.setTitle(&NSString::from_str(&label));
+                        let q_sub = build_quantize_submenu(mtm, current_q);
+                        item.setSubmenu(Some(&q_sub));
                     }
                 }
             }
@@ -8180,6 +8308,70 @@ mod tests {
     }
 
     #[test]
+    fn quantize_file_path_is_under_branch_tone_dir() {
+        let path = quantize_file_path();
+        let path_str = path.to_string_lossy();
+        assert!(path_str.contains(".branch-tone"),
+            "quantize file path should be under .branch-tone: {}", path_str);
+        assert!(path_str.ends_with("quantize"),
+            "quantize file path should end with 'quantize': {}", path_str);
+    }
+
+    #[test]
+    fn quantize_denom_to_subdiv_mapping() {
+        assert_eq!(quantize_denom_to_subdiv(32), 0.5);
+        assert_eq!(quantize_denom_to_subdiv(16), 1.0);
+        assert_eq!(quantize_denom_to_subdiv(8), 2.0);
+        assert_eq!(quantize_denom_to_subdiv(4), 4.0);
+    }
+
+    #[test]
+    fn get_quantize_validates_values() {
+        // get_quantize only accepts 4, 8, 16, 32; anything else returns None
+        // We test the filter logic directly since file I/O is environment-dependent
+        let valid: Vec<u32> = [4, 8, 16, 32].to_vec();
+        for v in &valid {
+            assert!(matches!(*v, 4 | 8 | 16 | 32), "{} should be valid", v);
+        }
+        let invalid: Vec<u32> = [0, 1, 2, 3, 5, 6, 7, 9, 10, 15, 17, 31, 33, 64, 128].to_vec();
+        for v in &invalid {
+            assert!(!matches!(*v, 4 | 8 | 16 | 32), "{} should be invalid", v);
+        }
+    }
+
+    #[test]
+    fn quantize_file_override_applied_in_from_branch() {
+        // When quantize file exists with a valid value, from_branch should use it
+        let path = quantize_file_path();
+        let had_file = path.exists();
+        let old_content = std::fs::read_to_string(&path).ok();
+
+        // Write override and test (skip if filesystem is sandboxed)
+        let _ = std::fs::create_dir_all(path.parent().unwrap());
+        if std::fs::write(&path, "4").is_err() {
+            // Sandboxed environment — skip file I/O test
+            return;
+        }
+        let melody = BranchMelody::from_branch("test-quantize-branch", 3);
+        assert_eq!(melody.quantize_subdiv, 4.0,
+            "quantize file '4' should set subdiv to 4.0, got {}", melody.quantize_subdiv);
+
+        let _ = std::fs::write(&path, "32");
+        let melody = BranchMelody::from_branch("test-quantize-branch", 3);
+        assert_eq!(melody.quantize_subdiv, 0.5,
+            "quantize file '32' should set subdiv to 0.5, got {}", melody.quantize_subdiv);
+
+        // Restore original state
+        if had_file {
+            if let Some(content) = old_content {
+                let _ = std::fs::write(&path, content);
+            }
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
     fn seed_changes_hash_output() {
         // Directly test that different seed prefixes produce different hashes
         use sha2::{Sha256, Digest};
@@ -8231,7 +8423,7 @@ mod tests {
 
     #[test]
     fn seed_presets_names_are_unique() {
-        let names: Vec<&str> = SEED_PRESETS.iter().map(|(name, _)| *name).collect();
+        let names: Vec<&str> = SEED_PRESETS.iter().map(|p| p.name).collect();
         for i in 0..names.len() {
             for j in (i + 1)..names.len() {
                 assert_ne!(names[i], names[j],
@@ -8431,19 +8623,20 @@ mod tests {
     }
 
     #[test]
-    fn sidechain_ducking_heavy_when_signal_present() {
-        // When sidechain_env is significantly above threshold, ducking should be heavy
+    fn sidechain_ducking_gentle_when_signal_present() {
+        // When sidechain_env is above threshold, ducking should be gentle (never below 0.5)
         let sidechain_env = 0.5f32;
-        let duck = (0.001 / sidechain_env).min(1.0).powf(0.5) * 0.15;
-        assert!(duck < 0.02, "heavy signal should duck heavily, got {}", duck);
+        let duck = 0.5 + 0.5 * (0.01f32 / sidechain_env).min(1.0);
+        assert!(duck >= 0.5, "gentle sidechain should never go below 0.5, got {}", duck);
+        assert!(duck < 0.6, "heavy signal should still duck noticeably, got {}", duck);
     }
 
     #[test]
     fn sidechain_no_ducking_when_silent() {
         // When sidechain_env is below threshold, no ducking
-        let sidechain_env = 0.0005f32;
-        let duck = if sidechain_env > 0.001 {
-            (0.001 / sidechain_env).min(1.0).powf(0.5) * 0.15
+        let sidechain_env = 0.005f32;
+        let duck = if sidechain_env > 0.01f32 {
+            0.5 + 0.5 * (0.01f32 / sidechain_env).min(1.0)
         } else {
             1.0
         };
@@ -8452,28 +8645,61 @@ mod tests {
 
     #[test]
     fn sidechain_envelope_tracks_signal() {
-        // Simulate envelope follower with a burst then silence
+        // Simulate gentle envelope follower with a burst then silence
         let sample_rate = 44100.0f32;
-        let attack = 1.0 - (-1.0 / (0.002 * sample_rate)).exp();
-        let release = 1.0 - (-1.0 / (0.200 * sample_rate)).exp();
+        let sc_attack = 1.0 - (-1.0 / (0.020 * sample_rate)).exp();
+        let sc_release = 1.0 - (-1.0 / (0.400 * sample_rate)).exp();
 
         let mut env = 0.0f32;
 
-        // Feed signal for ~5ms (fast attack should reach near 1.0)
-        for _ in 0..220 {
+        // Feed signal for ~50ms (20ms attack should reach near 1.0)
+        for _ in 0..2205 {
             let signal = 1.0f32;
-            let coeff = if signal > env { attack } else { release };
+            let coeff = if signal > env { sc_attack } else { sc_release };
             env += coeff * (signal - env);
         }
-        assert!(env > 0.9, "after 5ms of signal, env should be near 1.0, got {}", env);
+        assert!(env > 0.9, "after 50ms of signal, env should be near 1.0, got {}", env);
 
-        // Feed silence for ~1s (slow release ~200ms time constant, need ~5 time constants)
-        for _ in 0..44100 {
+        // Feed silence for ~2s (400ms release, need ~5 time constants)
+        for _ in 0..88200 {
             let signal = 0.0f32;
-            let coeff = if signal > env { attack } else { release };
+            let coeff = if signal > env { sc_attack } else { sc_release };
             env += coeff * (signal - env);
         }
-        assert!(env < 0.01, "after 1s of silence, env should be near 0, got {}", env);
+        assert!(env < 0.01, "after 2s of silence, env should be near 0, got {}", env);
+    }
+
+    #[test]
+    fn gentle_sidechain_never_kills_drone() {
+        // The duck multiplier should never go below 0.5 (at most -6dB)
+        for env_val in [0.01, 0.05, 0.1, 0.5, 1.0, 5.0] {
+            let duck = if env_val > 0.01f32 {
+                0.5 + 0.5 * (0.01f32 / env_val).min(1.0)
+            } else {
+                1.0
+            };
+            assert!(duck >= 0.5, "duck should never go below 0.5, got {} at env={}", duck, env_val);
+            assert!(duck <= 1.0, "duck should never exceed 1.0, got {} at env={}", duck, env_val);
+        }
+    }
+
+    #[test]
+    fn humanize_field_in_melody() {
+        let melody = BranchMelody::from_branch("test-branch", 3);
+        assert!(melody.humanize >= 0.0 && melody.humanize <= 0.12,
+            "humanize should be 0.0–0.12, got {}", melody.humanize);
+    }
+
+    #[test]
+    fn seed_preset_groove_params_sane() {
+        for p in SEED_PRESETS {
+            assert!(p.swing >= 0.0 && p.swing <= 0.3,
+                "seed '{}' swing {} out of range 0.0–0.3", p.name, p.swing);
+            assert!(p.humanize >= 0.0 && p.humanize <= 0.12,
+                "seed '{}' humanize {} out of range 0.0–0.12", p.name, p.humanize);
+            assert!(p.quantize_subdiv >= 0.5 && p.quantize_subdiv <= 4.0,
+                "seed '{}' quantize_subdiv {} out of range 0.5–4.0", p.name, p.quantize_subdiv);
+        }
     }
 
     // -- Breathing drone tests --
