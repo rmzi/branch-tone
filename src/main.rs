@@ -3565,7 +3565,11 @@ fn run_init(scope: &str, legacy: bool) -> Result<()> {
 
     println!();
     println!("✓ branch-tone plugin installed ({} scope)", scope);
-    print_init_summary();
+
+    // Always patch settings.json to ensure all hook events are registered —
+    // the plugin system may not register all 18 events
+    run_init_legacy()?;
+
     Ok(())
 }
 
