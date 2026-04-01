@@ -7,10 +7,10 @@ Single-file Rust application (`src/main.rs`, ~7000 lines). Everything — CLI, h
 ## Build & Test
 
 ```bash
-cargo test                              # 105 tests, must pass with zero warnings
+cargo test                              # 139 tests, must pass with zero warnings
 cargo build --release                   # Optimized binary
 cargo install --path .                  # Install to ~/.cargo/bin/
-cargo test --features tray              # Tray tests also pass (106 total)
+cargo test --features tray              # Tray tests also pass (140 total)
 cargo build --release --features tray   # Build with macOS menu bar support
 cargo install --path . --features tray  # Install with tray support
 ```
@@ -21,6 +21,22 @@ cargo install --path . --features tray  # Install with tray support
 - **Event seeds**: each Claude Code hook event gets a unique seed that rotates pattern, pad shape, and drum hit type — same repo sounds different per event
 - **Deterministic**: same inputs always produce the same sound
 - **Tray app** (macOS, `--features tray`): menu bar icon for daemon monitoring/control via `objc2-app-kit`. Separate process communicating over the daemon's Unix socket. Feature-gated to keep default build lean
+
+## Runtime Files
+
+All daemon state lives in `~/.branch-tone/`:
+
+| File | Purpose |
+|------|---------|
+| `pid` | Daemon process ID |
+| `socket` | Unix socket for hook → daemon communication |
+| `seed` | Active sound seed name (e.g. "shadow") |
+| `mute` | Presence = global mute (all audio silenced) |
+| `no-drone` | Presence = drone muted (event sounds still play) |
+| `quantize` | Grid override: "4", "8", "16", or "32" (absent = auto) |
+| `log` | Recent hook event log |
+
+Seed presets carry groove parameters (swing, humanize, quantize subdivision) that shape timing feel independently of harmonic identity. Custom seed strings use hash-derived groove defaults.
 
 ## After Code Changes
 
