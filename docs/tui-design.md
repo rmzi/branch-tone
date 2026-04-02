@@ -53,13 +53,13 @@ means you can open and close the TUI without affecting playback.
 │ █▇▅▃▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▂▃▅█▇▅▃▂▁▁▁▁▁▁▂▅█▇▅ │
 │ ■tool ■prompt ■session ■agent         60 min │ 234 events  │
 ├─ Stream ───────────────────────────────────────────────────┤
-│░ 21:58:28 TOOL    branch-tone/tui                          │
-│░ 21:58:29 TOOL    universe/issue_improvements              │
+│░ 21:58:28 READ    branch-tone/tui [Read]                    │
+│░ 21:58:29 BASH    universe/issue_improvements [Bash]       │
 │▒ 21:58:30 PROMPT  branch-tone/tui                          │
-│▒ 21:58:31 TOOL    universe/issue_improvements              │
-│▓ 21:58:32 TOOL    branch-tone/tui                          │
-│▓ 21:58:33 AGENT+  universe/issue_improvements              │
-│█ 21:58:34 TOOL    branch-tone/tui                          │
+│▒ 21:58:31 WRITE   universe/issue_improvements [Edit]       │
+│▓ 21:58:32 READ    branch-tone/tui [Grep]                   │
+│▓ 21:58:33 AGENT+  universe/issue_improvements <worker>     │
+│█ 21:58:34 FAIL    branch-tone/tui [Bash]                   │
 │                                              28/80 [r]eset │
 ├────────────────────────────────────────────────────────────┤
 │ [m]ute [d]rone [S]top [g]rid:1/16 [p]alette [q]uit        │
@@ -140,10 +140,10 @@ for (category, buckets) in &state.activity.per_category {
 
 | Category | Color | Events |
 |----------|-------|--------|
-| Tool | Green | PreToolUse, PostToolUse, PostToolUseFailure |
-| Prompt | Yellow | UserPromptSubmit |
-| Session | Cyan | SessionStart, SessionEnd |
-| Agent | Blue | SubagentStart, SubagentStop, TaskCompleted |
+| Tool | Green | PreToolUse, PostToolUse, PostToolUseFailure, FileChanged |
+| Prompt | Yellow | UserPromptSubmit, Elicitation, ElicitationResult |
+| Session | Cyan | SessionStart, SessionEnd, Setup |
+| Agent | Blue | SubagentStart, SubagentStop, TaskCompleted, TaskCreated, TeammateIdle |
 | Other | DarkGray | Everything else |
 
 This is one of the few places where ratatui's immediate-mode buffer is
@@ -181,7 +181,39 @@ appends one line per hook invocation:
 
 ```
 2026-04-01T21:58:29 PreToolUse branch-tone tui
+2026-04-01T21:58:30 PreToolUse branch-tone tui	Read	
+2026-04-01T21:58:31 SubagentStart branch-tone feat		worker
 ```
+
+The format is backward-compatible: 4 space-delimited fields (`timestamp
+event repo branch`), with optional tab-delimited enrichment after the branch
+(`\ttool_name\tagent_type`). Old parsers see `"branch\ttool\tagent"` as
+the branch field (harmless); new parsers split on tab to extract tool and
+agent context.
+
+### Tool & Agent Badges
+
+When enrichment is present, the Stream panel appends colored badges:
+
+- **Tool badges** `[Read]` `[Bash]` `[Edit]` — color-coded by tool family
+  (Cyan for reads, Yellow for writes, Red for Bash, Blue for Agent, Magenta
+  for web tools)
+- **Agent badges** `<worker>` `<researcher>` — Blue, showing which agent
+  type spawned
+
+### Tool-Aware Labels
+
+ToolPulse events (PreToolUse/PostToolUse) show tool-specific labels instead
+of generic `TOOL`:
+
+| Tool | Label |
+|------|-------|
+| Read, Glob, Grep | `READ` |
+| Write, Edit | `WRITE` |
+| Bash | `BASH` |
+| Agent | `AGENT` |
+| WebSearch, WebFetch | `WEB` |
+| (other) | `TOOL` |
 
 The TUI reads the last 500 lines for the activity histogram and displays
 the most recent 80 in the Stream panel. Press `[r]` to reset the view
@@ -259,3 +291,36 @@ Redesigned from the ground up:
 - Moved seeds to a **popup overlay** ([p] to open, Esc to close)
 - Added **[r]eset** to clear the view and start fresh
 - 155 tests total with TUI feature
+
+### Session 2: Deep Hook Integration (2026-04-02)
+
+**Goal**: Extract and surface the 30+ fields in Claude Code hook JSON that
+were being thrown away. Each tool type should sound different, each agent
+type should occupy a different register, and errors should sound dissonant.
+
+**6 work streams** across extraction → protocol → dispatch → synthesis:
+
+1. **HookContext struct** — extracts `tool_name`, `agent_type`, `error_msg`,
+   `session_id` from hook JSON. All fields default to "" for backward compat.
+
+2. **27 events** — expanded from 18. Added `StopFailure`, `PermissionDenied`,
+   `PostCompact`, `Setup`, `TaskCreated`, `CwdChanged`, `FileChanged`,
+   `Elicitation`, `ElicitationResult`. Each with unique seed (19–27).
+
+3. **Socket protocol** — `send_to_daemon` now serializes all HookContext
+   fields. Daemon extracts `tool_name`, `agent_type`, `error` with backward
+   compat for old clients.
+
+4. **TUI enrichment** — ParsedEvent parses tab-delimited enrichment from
+   logs. Stream shows `[Read]` tool badges and `<worker>` agent badges.
+   Tool-aware labels: `READ`, `WRITE`, `BASH` instead of generic `TOOL`.
+
+5. **Dispatch wiring** — QueuedNote carries `tool_filter`, `tool_detune`,
+   `tool_harmonics`, `is_error`. VoiceSlot gets matching atomics. Agent
+   octave shift applied to bass event frequencies.
+
+6. **Audio synthesis** — ToolPulse branch reads new atomics: applies filter
+   multiplier, detuned second voice, conditional harmonics/saw boost per
+   tool type. Error dissonance: tritone + minor 2nd + pitch drop.
+
+**Result**: 169 tests (22 new), zero new warnings, all build targets pass

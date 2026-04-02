@@ -7,13 +7,13 @@ Single-file Rust application (`src/main.rs`, ~8000 lines). Everything — CLI, h
 ## Build & Test
 
 ```bash
-cargo test                              # 141 tests, must pass with zero warnings
+cargo test                              # 147 tests, must pass with zero warnings
 cargo build --release                   # Optimized binary
 cargo install --path .                  # Install to ~/.cargo/bin/
-cargo test --features tray              # Tray tests also pass (142 total)
+cargo test --features tray              # Tray tests also pass (148 total)
 cargo build --release --features tray   # Build with macOS menu bar support
 cargo install --path . --features tray  # Install with tray support
-cargo test --features tui               # TUI tests (147 total)
+cargo test --features tui               # TUI tests (169 total)
 cargo build --release --features tui    # Build with terminal dashboard
 cargo install --path . --features tui   # Install with TUI support
 ```

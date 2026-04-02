@@ -272,14 +272,39 @@ const OCTAVES: [f32; 5] = [0.5, 0.75, 1.0, 1.5, 2.0];
 const MODE_NAMES: [&str; 5] = ["Arpeggio", "Chorus Arp", "Pad", "Bulldozer", "Tremolo Arp"];
 
 /// All Claude Code hook events we register and handle
-const HOOK_EVENTS: [&str; 18] = [
+const HOOK_EVENTS: [&str; 27] = [
     "SessionStart", "SessionEnd", "Stop", "UserPromptSubmit",
     "PermissionRequest", "Notification",
     "SubagentStart", "SubagentStop", "PreCompact", "TeammateIdle",
     "PreToolUse", "PostToolUse", "PostToolUseFailure",
     "InstructionsLoaded", "ConfigChange", "TaskCompleted",
     "WorktreeCreate", "WorktreeRemove",
+    "StopFailure", "PermissionDenied", "PostCompact", "Setup",
+    "TaskCreated", "CwdChanged", "FileChanged",
+    "Elicitation", "ElicitationResult",
 ];
+
+/// Enriched context extracted from Claude Code hook JSON payloads.
+/// All fields default to "" when absent (backward compat with older Claude Code versions).
+struct HookContext {
+    event: String,
+    repo: String,
+    branch: String,
+    tool_name: String,
+    agent_type: String,
+    error_msg: String,
+    session_id: String,
+}
+
+impl Default for HookContext {
+    fn default() -> Self {
+        Self {
+            event: String::new(), repo: String::new(), branch: String::new(),
+            tool_name: String::new(), agent_type: String::new(),
+            error_msg: String::new(), session_id: String::new(),
+        }
+    }
+}
 
 /// Arpeggio patterns - 3 note (intervals from root in scale degrees)
 const PATTERNS_3: [[i32; 3]; 8] = [
@@ -2180,11 +2205,67 @@ fn hook_play_args(event: &str, repo: String, branch: String, spooky: bool) -> Pl
             EventCategory::Lifecycle, 10,
         ),
 
+        // ── Error/Attention ────────────────────────────────────────
+        "StopFailure" => tonal(
+            repo, branch, spooky, mode_effects, mode_steps,
+            3000, 0.30, 5, true, false, false,
+            EventCategory::Attention, 19,
+        ),
+        "PermissionDenied" => tonal(
+            repo, branch, spooky, mode_effects, mode_steps,
+            1500, 0.25, 3, true, false, false,
+            EventCategory::Attention, 20,
+        ),
+        "PostCompact" => tonal(
+            repo, branch, spooky, mode_effects, mode_steps,
+            2000, 0.15, 3, true, false, false,
+            EventCategory::Lifecycle, 21,
+        ),
+        "Setup" => tonal(
+            repo, branch, spooky, mode_effects, mode_steps,
+            1500, 0.12, 3, false, false, false,
+            EventCategory::SessionBoundary, 22,
+        ),
+        "TaskCreated" => tonal(
+            repo, branch, spooky, mode_effects, mode_steps,
+            2000, 0.18, 3, true, false, false,
+            EventCategory::Lifecycle, 23,
+        ),
+        "CwdChanged" => tonal(
+            repo, branch, spooky, mode_effects, mode_steps,
+            800, 0.10, 3, false, false, false,
+            EventCategory::Lifecycle, 24,
+        ),
+        "FileChanged" => PlayArgs {
+            branch: Some(branch), repo: Some(repo),
+            duration: 100, volume: 0.06,
+            pad: false, chorus: false, tremolo: false, bulldozer: false,
+            steps: 1, spooky, reverse: false, randomize: false,
+            drums: false, dub_delay: false, melody_over_drums: false,
+            single_hit: true, event_category: EventCategory::ToolPulse,
+            event_seed: 25,
+            break_pattern: None, dry_run: false, quiet: true, event_density: 0,
+        },
+        "Elicitation" => tonal(
+            repo, branch, spooky, mode_effects, mode_steps,
+            2000, 0.22, 3, true, false, false,
+            EventCategory::Attention, 26,
+        ),
+        "ElicitationResult" => PlayArgs {
+            branch: Some(branch), repo: Some(repo),
+            duration: 350, volume: 0.12,
+            pad: false, chorus: false, tremolo: false, bulldozer: false,
+            steps: 1, spooky, reverse: false, randomize: false,
+            drums: false, dub_delay: false, melody_over_drums: false,
+            single_hit: true, event_category: EventCategory::DrumHit,
+            event_seed: 27,
+            break_pattern: None, dry_run: false, quiet: true, event_density: 0,
+        },
+
         // ── Unknown events ─────────────────────────────────────────
         _ => tonal(
             repo, branch, spooky, mode_effects, mode_steps,
-            300, 0.18, 3,
-            false, false, false,
+            300, 0.18, 3, false, false, false,
             EventCategory::Default, 0,
         ),
     }
@@ -2209,6 +2290,10 @@ struct QueuedNote {
     volume: f32,
     duration_ms: u32,
     note_freq: f32,     // pitched percussion frequency (from scale)
+    tool_filter: f32,   // filter cutoff multiplier (1.0 = neutral)
+    tool_detune: f32,   // extra detune in cents
+    tool_harmonics: u8, // bit flags: b0=2nd harmonic, b1=3rd, b2=saw boost
+    is_error: bool,     // true = apply dissonance (tritone + minor 2nd)
 }
 
 struct VoiceSlot {
@@ -2244,6 +2329,11 @@ struct VoiceSlot {
     oneshot_note_freq: std::sync::atomic::AtomicU32,
     // Precomputed grid step in samples (for queue drain timing)
     grid_step_samples: std::sync::atomic::AtomicU32,
+    // Tool-aware synthesis params (set per note from QueuedNote)
+    oneshot_tool_filter: std::sync::atomic::AtomicU32,    // f32 bits: filter cutoff multiplier
+    oneshot_tool_detune: std::sync::atomic::AtomicU32,    // f32 bits: extra detune in cents
+    oneshot_tool_harmonics: AtomicU8,                     // bit flags
+    oneshot_error_flag: AtomicBool,                       // true = apply dissonance
 }
 
 impl VoiceSlot {
@@ -2271,6 +2361,10 @@ impl VoiceSlot {
             note_counter: AtomicU8::new(0),
             oneshot_note_freq: std::sync::atomic::AtomicU32::new(0),
             grid_step_samples: std::sync::atomic::AtomicU32::new(0),
+            oneshot_tool_filter: std::sync::atomic::AtomicU32::new(f32::to_bits(1.0)),
+            oneshot_tool_detune: std::sync::atomic::AtomicU32::new(f32::to_bits(0.0)),
+            oneshot_tool_harmonics: AtomicU8::new(0),
+            oneshot_error_flag: AtomicBool::new(false),
         }
     }
 }
@@ -2422,6 +2516,34 @@ fn u8_to_category(v: u8) -> EventCategory {
 
 /// Conductor: choose a harmonically compatible interval for ambient bed transposition.
 /// Given active root frequencies, transpose new_root to prefer unisons, fifths, fourths.
+/// Tool-specific timbral parameters for synthesis differentiation.
+/// Returns (filter_mult, detune_cents, harmonics_flags).
+/// harmonics_flags: bit0=2nd harmonic, bit1=3rd harmonic, bit2=saw boost
+fn tool_timbral_params(tool_name: &str) -> (f32, f32, u8) {
+    match tool_name {
+        "Read" | "Glob" | "Grep" => (1.4, 2.0, 0b001),   // bright, investigative
+        "Write" | "Edit"         => (0.7, 1.0, 0b000),    // warm, creative
+        "Bash"                   => (1.0, 6.0, 0b100),    // aggressive, saw boost
+        "Agent"                  => (0.9, 4.0, 0b011),    // airy, 2nd+3rd harmonics
+        "WebSearch" | "WebFetch" => (1.3, 2.0, 0b010),    // distant, 3rd harmonic
+        _                        => (1.0, 0.0, 0b000),    // neutral
+    }
+}
+
+/// Agent-type octave shift for register separation in bass events.
+fn agent_octave_shift(agent_type: &str) -> f32 {
+    match agent_type {
+        "researcher"  => 0.75,
+        "worker"      => 1.0,
+        "validator"   => 1.25,
+        "reviewer"    => 0.875,
+        "scout"       => 1.5,
+        "documenter"  => 0.9,
+        "auditor"     => 1.125,
+        _             => 1.0,
+    }
+}
+
 fn conductor_transpose(new_root: f32, active_roots: &[f32]) -> f32 {
     if active_roots.is_empty() {
         return new_root;
@@ -2460,12 +2582,11 @@ fn conductor_transpose(new_root: f32, active_roots: &[f32]) -> f32 {
 
 /// Try to send an event to the running daemon via Unix socket.
 /// Returns Ok(()) if the daemon handled it, Err if no daemon or send failed.
-fn send_to_daemon(event: &str, repo: &str, branch: &str) -> Result<()> {
+fn send_to_daemon(ctx: &HookContext) -> Result<()> {
     use std::os::unix::net::UnixStream;
     use std::io::Write;
 
     let sock_path = daemon_socket_path();
-    // 50ms connect timeout for imperceptible fallback
     let stream = UnixStream::connect(&sock_path)
         .map_err(|e| anyhow::anyhow!("daemon connect: {}", e))?;
     stream.set_write_timeout(Some(Duration::from_millis(50)))
@@ -2473,12 +2594,20 @@ fn send_to_daemon(event: &str, repo: &str, branch: &str) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_millis(100)))
         .map_err(|e| anyhow::anyhow!("set timeout: {}", e))?;
 
-    let msg = format!("{{\"event\":\"{}\",\"repo\":\"{}\",\"branch\":\"{}\"}}\n", event, repo, branch);
+    let json = serde_json::json!({
+        "event": ctx.event,
+        "repo": ctx.repo,
+        "branch": ctx.branch,
+        "tool_name": ctx.tool_name,
+        "agent_type": ctx.agent_type,
+        "error": ctx.error_msg,
+        "session_id": ctx.session_id,
+    });
+    let msg = format!("{}\n", json);
     let mut stream = stream;
     stream.write_all(msg.as_bytes())
         .map_err(|e| anyhow::anyhow!("daemon write: {}", e))?;
 
-    // Read ACK
     let mut buf = [0u8; 32];
     use std::io::Read as StdRead;
     let _ = stream.read(&mut buf);
@@ -2931,6 +3060,11 @@ fn handle_daemon_connection(stream: std::os::unix::net::UnixStream, state: &Daem
         let repo = json.get("repo").and_then(|v| v.as_str()).unwrap_or("unknown");
         let branch = json.get("branch").and_then(|v| v.as_str()).unwrap_or("main");
 
+        // Extract enriched context (backward compat: old clients send only event/repo/branch)
+        let tool_name = json.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_type = json.get("agent_type").and_then(|v| v.as_str()).unwrap_or("");
+        let error_msg = json.get("error").and_then(|v| v.as_str()).unwrap_or("");
+
         // Update activity timestamp
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2940,6 +3074,14 @@ fn handle_daemon_connection(stream: std::os::unix::net::UnixStream, state: &Daem
 
         // Get play args for this event
         let args = hook_play_args(event, repo.to_string(), branch.to_string(), false);
+
+        // Compute tool timbral params and error flag for synthesis
+        let (tool_filter, tool_detune, tool_harmonics) = tool_timbral_params(tool_name);
+        let is_error = !error_msg.is_empty()
+            || event == "PostToolUseFailure"
+            || event == "StopFailure"
+            || event == "PermissionDenied";
+        let agent_shift = agent_octave_shift(agent_type);
 
         // Find or allocate voice slot
         if let Some(slot_idx) = state.find_or_alloc_slot(repo, branch) {
@@ -3009,13 +3151,13 @@ fn handle_daemon_connection(stream: std::os::unix::net::UnixStream, state: &Daem
                     }
 
                     if let Ok(mut q) = slot.note_queue.lock() {
-                        // Cap queue depth to avoid unbounded growth (16 notes max)
                         if q.len() < 16 {
                             q.push_back(QueuedNote {
                                 category: category_to_u8(cat),
                                 volume: args.volume,
                                 duration_ms: args.duration as u32,
                                 note_freq,
+                                tool_filter, tool_detune, tool_harmonics, is_error,
                             });
                         }
                     }
@@ -3047,13 +3189,14 @@ fn handle_daemon_connection(stream: std::os::unix::net::UnixStream, state: &Daem
                         if let Ok(mut q) = slot.note_queue.lock() {
                             for _ni in 0..n_notes.min(notes.len()) {
                                 let idx = slot.note_counter.fetch_add(1, Relaxed) as usize;
-                                let freq = notes[idx % notes.len()];
+                                let freq = notes[idx % notes.len()] * agent_shift;
                                 if q.len() < 16 {
                                     q.push_back(QueuedNote {
                                         category: category_to_u8(cat),
                                         volume: args.volume,
                                         duration_ms: per_note_ms.max(150),
                                         note_freq: freq,
+                                        tool_filter, tool_detune, tool_harmonics, is_error,
                                     });
                                 }
                             }
@@ -3228,6 +3371,11 @@ fn daemon_audio_engine(state: Arc<DaemonState>) -> Result<()> {
                                 slot.oneshot_duration_ms.store(note.duration_ms, Relaxed);
                                 slot.oneshot_volume.store(note.volume.to_bits(), Relaxed);
                                 slot.oneshot_note_freq.store(note.note_freq.to_bits(), Relaxed);
+                                // Copy tool-aware synthesis params to slot atomics
+                                slot.oneshot_tool_filter.store(note.tool_filter.to_bits(), Relaxed);
+                                slot.oneshot_tool_detune.store(note.tool_detune.to_bits(), Relaxed);
+                                slot.oneshot_tool_harmonics.store(note.tool_harmonics, Relaxed);
+                                slot.oneshot_error_flag.store(note.is_error, Relaxed);
                                 oneshot_active[i] = true;
                                 oneshot_start_sample[i] = global;
                                 // Schedule next drain at grid boundary
@@ -3257,28 +3405,46 @@ fn daemon_audio_engine(state: Arc<DaemonState>) -> Result<()> {
                                 1.0
                             };
 
-                            // Generate one-shot sound based on category
+                            // Read tool-aware synthesis params from slot atomics
+                            let t_filter = f32::from_bits(slot.oneshot_tool_filter.load(Relaxed));
+                            let t_detune = f32::from_bits(slot.oneshot_tool_detune.load(Relaxed));
+                            let t_harmonics = slot.oneshot_tool_harmonics.load(Relaxed);
+                            let t_error = slot.oneshot_error_flag.load(Relaxed);
+
                             let cat = u8_to_category(slot.oneshot_category.load(Relaxed));
                             let oneshot_out = if let Ok(voice_guard) = slot.voice_data.lock() {
                                 if let Some(ref voice) = *voice_guard {
                                     match cat {
                                         EventCategory::ToolPulse => {
-                                            // Pitched percussion: kalimba note from scale
                                             let freq = f32::from_bits(slot.oneshot_note_freq.load(Relaxed));
-                                            let pitched = generate_pitched_hit(time, if freq > 0.0 { freq } else { voice.root_freq });
-                                            // Light drum ghost underneath (10%) for texture
+                                            let base_freq = if freq > 0.0 { freq } else { voice.root_freq };
+                                            let pitched = generate_pitched_hit(time, base_freq) * t_filter;
+                                            let detune_voice = if t_detune > 0.1 {
+                                                let ratio = (2.0f32).powf(t_detune / 1200.0);
+                                                generate_pitched_hit(time, base_freq * ratio) * 0.3
+                                            } else { 0.0 };
+                                            let h2 = if t_harmonics & 0b001 != 0 {
+                                                (2.0 * PI * base_freq * 2.0 * time).sin() * 0.15 * (-12.0 * time).exp()
+                                            } else { 0.0 };
+                                            let h3 = if t_harmonics & 0b010 != 0 {
+                                                (2.0 * PI * base_freq * 3.0 * time).sin() * 0.08 * (-15.0 * time).exp()
+                                            } else { 0.0 };
+                                            let saw = if t_harmonics & 0b100 != 0 {
+                                                let phase = base_freq * time;
+                                                let mut s = 0.0f32;
+                                                for k in 1..=6 { s += (2.0 * PI * phase * k as f32).sin() / k as f32; }
+                                                s * 0.12 * (-10.0 * time).exp()
+                                            } else { 0.0 };
                                             let drum = generate_single_hit(time, sample_rate, voice) * 0.1;
-                                            pitched + drum
+                                            pitched + detune_voice + h2 + h3 + saw + drum
                                         }
                                         EventCategory::DrumHit => {
-                                            // Kick/snare with pitched note layered on top (30%)
                                             let freq = f32::from_bits(slot.oneshot_note_freq.load(Relaxed));
                                             let drum = generate_single_hit(time, sample_rate, voice);
                                             let pitched = generate_pitched_hit(time, if freq > 0.0 { freq } else { voice.root_freq }) * 0.3;
                                             drum + pitched
                                         }
                                         _ => {
-                                            // Tonal: use full category-aware oscillator
                                             let chorus = slot.oneshot_chorus.load(Relaxed);
                                             if let Ok(notes) = slot.notes.lock() {
                                                 if let Ok(melody_guard) = slot.melody_data.lock() {
@@ -3294,14 +3460,11 @@ fn daemon_audio_engine(state: Arc<DaemonState>) -> Result<()> {
                                                                         freq, time, chorus, ni, voice, mel, tim, cat,
                                                                     ) / n_voices as f32;
                                                                 }
-                                                                // Envelope: smooth attack/release
                                                                 let env = if progress < 0.05 {
                                                                     (progress / 0.05).sqrt()
                                                                 } else if progress > 0.75 {
                                                                     ((1.0 - progress) / 0.25).sqrt()
-                                                                } else {
-                                                                    1.0
-                                                                };
+                                                                } else { 1.0 };
                                                                 sum * env
                                                             } else { 0.0 }
                                                         } else { 0.0 }
@@ -3310,14 +3473,23 @@ fn daemon_audio_engine(state: Arc<DaemonState>) -> Result<()> {
                                             } else { 0.0 }
                                         }
                                     }
-                                } else {
-                                    0.0
-                                }
-                            } else {
-                                0.0
-                            };
+                                } else { 0.0 }
+                            } else { 0.0 };
 
-                            let raw = oneshot_out * vol * global_fade;
+                            // Error dissonance: tritone + minor 2nd + pitch drop
+                            let error_layer = if t_error {
+                                let freq = f32::from_bits(slot.oneshot_note_freq.load(Relaxed));
+                                let base = if freq > 0.0 { freq } else { 440.0 };
+                                let tritone = (2.0 * PI * base * (2.0f32).powf(6.0 / 12.0) * time).sin()
+                                    * 0.25 * (-8.0 * time).exp();
+                                let minor2 = (2.0 * PI * base * (2.0f32).powf(1.0 / 12.0) * time).sin()
+                                    * 0.10 * (-10.0 * time).exp();
+                                let drop = (2.0 * PI * base * (1.0 - progress * 0.3).max(0.5) * time).sin()
+                                    * 0.15 * (-6.0 * time).exp();
+                                tritone + minor2 + drop
+                            } else { 0.0 };
+
+                            let raw = (oneshot_out + error_layer) * vol * global_fade;
                             // Light reverb per slot
                             let wet = slot_reverbs[i].process(raw);
                             let with_reverb = raw * 0.88 + wet * 0.12;
@@ -3442,30 +3614,47 @@ fn parse_log_timestamp(ts: &str) -> Option<u64> {
     Some(days * 86400 + hour * 3600 + min * 60 + sec)
 }
 
-fn run_hook() -> Result<()> {
-    // Read stdin JSON from Claude Code hook, extract cwd, detect branch/repo, play tone.
-    // Never fails — every fallible op is silently absorbed so we never block Claude Code.
+/// Extract a string field from JSON, defaulting to "" if absent.
+fn json_str_field(json: &serde_json::Value, key: &str) -> String {
+    json.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
+}
 
+fn run_hook() -> Result<()> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input).ok();
 
-    let mut hook_type = "unknown".to_string();
+    let mut ctx = HookContext::default();
+    ctx.event = "unknown".to_string();
 
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&input) {
         let cwd = json.get("cwd").and_then(|v| v.as_str()).unwrap_or(".");
         let _ = std::env::set_current_dir(cwd);
-        // Plugin system sends "hook_event_name"; legacy sends "hook_type"
         if let Some(ht) = json.get("hook_event_name").and_then(|v| v.as_str())
             .or_else(|| json.get("hook_type").and_then(|v| v.as_str()))
         {
-            hook_type = ht.to_string();
+            ctx.event = ht.to_string();
         }
+
+        ctx.session_id = json_str_field(&json, "session_id");
+        ctx.tool_name = json.get("tool_input")
+            .and_then(|t| t.get("tool_name").and_then(|v| v.as_str()))
+            .or_else(|| json.get("tool_name").and_then(|v| v.as_str()))
+            .unwrap_or("").to_string();
+        ctx.agent_type = json.get("subagent_type")
+            .and_then(|v| v.as_str())
+            .or_else(|| json.get("agent_type").and_then(|v| v.as_str()))
+            .unwrap_or("").to_string();
+        ctx.error_msg = json.get("error")
+            .and_then(|v| v.as_str())
+            .or_else(|| json.get("error_message").and_then(|v| v.as_str()))
+            .unwrap_or("").to_string();
     }
 
     let branch = get_current_branch().unwrap_or_else(|_| "claude".to_string());
     let repo = get_repo_name().unwrap_or_else(|_| "unknown".to_string());
+    ctx.repo = repo.clone();
+    ctx.branch = branch.clone();
 
-    // Append to event log (~/.branch-tone/events.log) — never fail
     if let Some(home) = dirs::home_dir() {
         let log_dir = home.join(".branch-tone");
         let _ = std::fs::create_dir_all(&log_dir);
@@ -3474,34 +3663,34 @@ fn run_hook() -> Result<()> {
             use std::time::SystemTime;
             let dur = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
             let secs = dur.as_secs();
-            // Format as ISO-ish timestamp (UTC)
             let s = secs % 60;
             let m = (secs / 60) % 60;
             let h = (secs / 3600) % 24;
             let days = secs / 86400;
-            // Simple date from days since epoch
             let (y, mo, d) = days_to_ymd(days);
             format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", y, mo, d, h, m, s)
         };
-        let line = format!("{} {} {} {}\n", now, hook_type, repo, branch);
+        let enrichment = if !ctx.tool_name.is_empty() || !ctx.agent_type.is_empty() {
+            format!("\t{}\t{}", ctx.tool_name, ctx.agent_type)
+        } else {
+            String::new()
+        };
+        let line = format!("{} {} {} {}{}\n", now, ctx.event, repo, branch, enrichment);
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
             let _ = f.write_all(line.as_bytes());
         }
     }
 
-    // Muted? Log was written above; skip all sound.
     if is_muted() {
         return Ok(());
     }
 
-    // Try daemon first: if running, send event via socket (zero-latency)
-    if send_to_daemon(&hook_type, &repo, &branch).is_ok() {
+    if send_to_daemon(&ctx).is_ok() {
         return Ok(());
     }
 
-    // Fallback: fire-and-forget (current behavior)
-    let mut args = hook_play_args(&hook_type, repo, branch, false);
+    let mut args = hook_play_args(&ctx.event, repo, branch, false);
 
     // Density-aware modulation: events in last 10s window
     // Busy bursts → richer echoes; quiet periods → sparser, more ambient
@@ -6736,75 +6925,117 @@ mod tui_app {
 
     // ── Event parsing & coloring ────────────────────────────────────────────
 
-    /// Parsed event log line
+    /// Parsed event log line with optional enrichment (tool_name, agent_type)
     struct ParsedEvent {
         timestamp: String,
         event_type: String,
         repo: String,
         branch: String,
+        tool_name: Option<String>,
+        agent_type: Option<String>,
     }
 
     impl ParsedEvent {
         fn parse(line: &str) -> Self {
+            // Log format: "timestamp event repo branch\ttool\tagent"
+            // Tab delimiter separates original 4 fields from enrichment
             let parts: Vec<&str> = line.splitn(4, ' ').collect();
+            let branch_and_enrichment = parts.get(3).unwrap_or(&"").to_string();
+
+            // Split field 4 on tab for enrichment
+            let mut tab_parts = branch_and_enrichment.splitn(3, '\t');
+            let branch = tab_parts.next().unwrap_or("").to_string();
+            let tool_name = tab_parts.next().map(|s| s.to_string()).filter(|s| !s.is_empty());
+            let agent_type = tab_parts.next().map(|s| s.to_string()).filter(|s| !s.is_empty());
+
             Self {
                 timestamp: parts.first().unwrap_or(&"").to_string(),
                 event_type: parts.get(1).unwrap_or(&"").to_string(),
                 repo: parts.get(2).unwrap_or(&"").to_string(),
-                branch: parts.get(3).unwrap_or(&"").to_string(),
+                branch,
+                tool_name,
+                agent_type,
             }
         }
 
         fn type_color(&self) -> Color {
             match self.event_type.as_str() {
-                "SessionStart" => Color::Cyan,
+                "SessionStart" | "Setup" => Color::Cyan,
                 "SessionEnd" => Color::Blue,
-                "PreToolUse" => Color::Green,
-                "PostToolUse" => Color::Green,
-                "PostToolUseFailure" => Color::Red,
+                "PreToolUse" | "PostToolUse" | "FileChanged" => Color::Green,
+                "PostToolUseFailure" | "StopFailure" | "PermissionDenied" => Color::Red,
                 "UserPromptSubmit" => Color::Yellow,
-                "Notification" => Color::Yellow,
+                "Notification" | "Elicitation" | "ElicitationResult" => Color::Yellow,
                 "Stop" => Color::Magenta,
                 "SubagentStart" | "SubagentStop" => Color::Blue,
-                "TaskCompleted" => Color::Cyan,
-                "PreCompact" => Color::DarkGray,
-                "ConfigChange" | "InstructionsLoaded" => Color::DarkGray,
+                "TaskCompleted" | "TaskCreated" => Color::Cyan,
+                "PreCompact" | "PostCompact" => Color::DarkGray,
+                "ConfigChange" | "InstructionsLoaded" | "CwdChanged" => Color::DarkGray,
                 "PermissionRequest" => Color::Yellow,
                 "TeammateIdle" => Color::DarkGray,
                 _ => Color::White,
             }
         }
 
-        /// Short label for compact display
+        /// Short label for compact display — tool-aware for ToolPulse events
         fn type_label(&self) -> &str {
             match self.event_type.as_str() {
                 "SessionStart" => "START",
                 "SessionEnd" => "END",
-                "PreToolUse" => "TOOL",
-                "PostToolUse" => "TOOL",
+                "PreToolUse" | "PostToolUse" => {
+                    match self.tool_name.as_deref() {
+                        Some("Read" | "Glob" | "Grep") => "READ",
+                        Some("Write" | "Edit") => "WRITE",
+                        Some("Bash") => "BASH",
+                        Some("Agent") => "AGENT",
+                        Some("WebSearch" | "WebFetch") => "WEB",
+                        Some(_) => "TOOL",
+                        None => "TOOL",
+                    }
+                }
                 "PostToolUseFailure" => "FAIL",
                 "UserPromptSubmit" => "PROMPT",
                 "Notification" => "NOTIF",
                 "Stop" => "STOP",
+                "StopFailure" => "STOP!",
                 "SubagentStart" => "AGENT+",
                 "SubagentStop" => "AGENT-",
-                "TaskCompleted" => "TASK",
-                "PreCompact" => "COMPACT",
+                "TaskCompleted" => "TASK\u{2713}",
+                "TaskCreated" => "TASK+",
+                "PreCompact" | "PostCompact" => "COMPACT",
                 "ConfigChange" => "CONFIG",
                 "InstructionsLoaded" => "INIT",
+                "Setup" => "SETUP",
                 "PermissionRequest" => "PERM",
+                "PermissionDenied" => "DENY",
                 "TeammateIdle" => "IDLE",
+                "CwdChanged" => "CWD",
+                "FileChanged" => "FILE",
+                "Elicitation" => "ASK",
+                "ElicitationResult" => "ANSWER",
                 _ => &self.event_type,
+            }
+        }
+
+        /// Color for tool badge based on tool family
+        fn tool_badge_color(&self) -> Option<Color> {
+            match self.tool_name.as_deref()? {
+                "Read" | "Glob" | "Grep" => Some(Color::Cyan),
+                "Write" | "Edit" => Some(Color::Yellow),
+                "Bash" => Some(Color::Red),
+                "Agent" => Some(Color::Blue),
+                "WebSearch" | "WebFetch" => Some(Color::Magenta),
+                _ => Some(Color::DarkGray),
             }
         }
 
         /// Event type category for activity bucketing
         fn type_category(&self) -> EventTypeCategory {
             match self.event_type.as_str() {
-                "PreToolUse" | "PostToolUse" | "PostToolUseFailure" => EventTypeCategory::Tool,
-                "UserPromptSubmit" => EventTypeCategory::Prompt,
-                "SessionStart" | "SessionEnd" => EventTypeCategory::Session,
-                "SubagentStart" | "SubagentStop" | "TaskCompleted" | "TeammateIdle" => EventTypeCategory::Agent,
+                "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "FileChanged" => EventTypeCategory::Tool,
+                "UserPromptSubmit" | "Elicitation" | "ElicitationResult" => EventTypeCategory::Prompt,
+                "SessionStart" | "SessionEnd" | "Setup" => EventTypeCategory::Session,
+                "SubagentStart" | "SubagentStop" | "TaskCompleted" | "TaskCreated" | "TeammateIdle" => EventTypeCategory::Agent,
                 _ => EventTypeCategory::Other,
             }
         }
@@ -7601,16 +7832,28 @@ mod tui_app {
         }
 
         let max_val = state.activity.total.iter().copied().max().unwrap_or(1).max(1);
-        let col_height = inner.height as u64;
+        // Reserve bottom row for timestamp labels
+        let bar_height = inner.height.saturating_sub(1) as u64;
+        if bar_height == 0 { return; }
 
+        // ── Y-axis scale: max count at top-left ──
+        let scale_str = format!("{}", max_val);
+        for (ci, ch) in scale_str.chars().enumerate() {
+            let x = inner.x + ci as u16;
+            if x < inner.x + inner.width {
+                frame.buffer_mut()[(x, inner.y)].set_char(ch).set_fg(Color::DarkGray);
+            }
+        }
+
+        // ── Bars ──
         for col in 0..inner.width as usize {
             if col >= state.activity.total.len() { break; }
-            let mut y_cursor = inner.y + inner.height;
+            let mut y_cursor = inner.y + inner.height - 1; // leave bottom row for timestamps
             for (cat, buckets) in &state.activity.per_category {
                 if col >= buckets.len() { continue; }
                 let val = buckets[col];
                 if val == 0 { continue; }
-                let bar_h = ((val * col_height) / max_val).max(if val > 0 { 1 } else { 0 }) as u16;
+                let bar_h = ((val * bar_height) / max_val).max(if val > 0 { 1 } else { 0 }) as u16;
                 for _dy in 0..bar_h {
                     if y_cursor == inner.y { break; }
                     y_cursor -= 1;
@@ -7618,6 +7861,38 @@ mod tui_app {
                     if x < inner.x + inner.width && y_cursor >= inner.y {
                         frame.buffer_mut()[(x, y_cursor)].set_char('█').set_fg(cat.color());
                     }
+                }
+            }
+        }
+
+        // ── X-axis timestamps ──
+        let num_cols = inner.width as usize;
+        let bucket_secs = state.timescale.bucket_secs(num_cols as u64);
+        let offset_secs = state.time_offset as u64 * bucket_secs;
+        let y_label = inner.y + inner.height - 1;
+
+        // Place ~4-5 evenly spaced time labels
+        let label_count = (num_cols / 12).max(2).min(6);
+        for li in 0..label_count {
+            let col = if label_count <= 1 { num_cols - 1 }
+                else { li * (num_cols - 1) / (label_count - 1) };
+            // Time for this column: rightmost col = now - offset, leftmost = now - offset - window
+            let cols_from_right = (num_cols - 1).saturating_sub(col) as u64;
+            let secs_ago = offset_secs + cols_from_right * bucket_secs;
+            let label = if secs_ago == 0 {
+                "now".to_string()
+            } else if secs_ago < 60 {
+                format!("-{}s", secs_ago)
+            } else if secs_ago < 3600 {
+                format!("-{}m", secs_ago / 60)
+            } else {
+                format!("-{}h", secs_ago / 3600)
+            };
+            let start_x = inner.x + col as u16;
+            for (ci, ch) in label.chars().enumerate() {
+                let x = start_x + ci as u16;
+                if x < inner.x + inner.width {
+                    frame.buffer_mut()[(x, y_label)].set_char(ch).set_fg(Color::DarkGray);
                 }
             }
         }
@@ -7664,13 +7939,29 @@ mod tui_app {
             let time_color = if is_newest { Color::White } else { Color::DarkGray };
             let branch_color = if is_newest { Color::White } else { Color::DarkGray };
 
-            Line::from(vec![
+            let mut spans = vec![
                 Span::styled(lane_char, Style::default().fg(lane_color)),
                 Span::styled(format!(" {} ", time_str), Style::default().fg(time_color)),
                 Span::styled(format!("{:<7}", evt.type_label()), Style::default().fg(type_color).add_modifier(if is_newest { Modifier::BOLD } else { Modifier::empty() })),
                 Span::styled(format!(" {}", evt.repo), Style::default().fg(repo_color)),
                 Span::styled(format!("/{}", evt.branch), Style::default().fg(branch_color)),
-            ])
+            ];
+            // Tool badge: [Read], [Bash], etc.
+            if let Some(tool) = &evt.tool_name {
+                let badge_color = evt.tool_badge_color().unwrap_or(Color::DarkGray);
+                spans.push(Span::styled(
+                    format!(" [{}]", tool),
+                    Style::default().fg(if is_newest { Color::White } else { badge_color }),
+                ));
+            }
+            // Agent badge: <worker>, <researcher>, etc.
+            if let Some(agent) = &evt.agent_type {
+                spans.push(Span::styled(
+                    format!(" <{}>", agent),
+                    Style::default().fg(if is_newest { Color::White } else { Color::Blue }),
+                ));
+            }
+            Line::from(spans)
         }).collect();
 
         let scroll_hint = if state.stream_scroll > 0 {
@@ -7880,6 +8171,71 @@ mod tui_app {
             assert_eq!(voice_color_for_repo("repo-a", &voices), VOICE_COLORS[0]);
             assert_eq!(voice_color_for_repo("repo-b", &voices), VOICE_COLORS[1]);
             assert_eq!(voice_color_for_repo("unknown", &voices), Color::DarkGray);
+        }
+
+        #[test]
+        fn parsed_event_enrichment() {
+            // Old format: no tab enrichment
+            let old = ParsedEvent::parse("2026-04-02T12:00:00 PreToolUse my-repo main");
+            assert_eq!(old.branch, "main");
+            assert!(old.tool_name.is_none());
+            assert!(old.agent_type.is_none());
+
+            // New format: tab-delimited enrichment
+            let new = ParsedEvent::parse("2026-04-02T12:00:00 PreToolUse my-repo main\tRead\t");
+            assert_eq!(new.branch, "main");
+            assert_eq!(new.tool_name.as_deref(), Some("Read"));
+            assert!(new.agent_type.is_none()); // empty string filtered
+
+            // Full enrichment
+            let full = ParsedEvent::parse("2026-04-02T12:00:00 SubagentStart my-repo feat\t\tworker");
+            assert_eq!(full.branch, "feat");
+            assert!(full.tool_name.is_none()); // empty tool
+            assert_eq!(full.agent_type.as_deref(), Some("worker"));
+        }
+
+        #[test]
+        fn tool_aware_type_labels() {
+            let read_evt = ParsedEvent {
+                timestamp: String::new(), event_type: "PreToolUse".into(),
+                repo: "r".into(), branch: "b".into(),
+                tool_name: Some("Read".into()), agent_type: None,
+            };
+            assert_eq!(read_evt.type_label(), "READ");
+
+            let bash_evt = ParsedEvent {
+                timestamp: String::new(), event_type: "PostToolUse".into(),
+                repo: "r".into(), branch: "b".into(),
+                tool_name: Some("Bash".into()), agent_type: None,
+            };
+            assert_eq!(bash_evt.type_label(), "BASH");
+
+            let no_tool = ParsedEvent {
+                timestamp: String::new(), event_type: "PreToolUse".into(),
+                repo: "r".into(), branch: "b".into(),
+                tool_name: None, agent_type: None,
+            };
+            assert_eq!(no_tool.type_label(), "TOOL");
+        }
+
+        #[test]
+        fn new_event_type_colors() {
+            let setup = ParsedEvent::parse("2026-04-02T12:00:00 Setup r b");
+            assert_eq!(setup.type_color(), Color::Cyan);
+            let stop_fail = ParsedEvent::parse("2026-04-02T12:00:00 StopFailure r b");
+            assert_eq!(stop_fail.type_color(), Color::Red);
+            let elicit = ParsedEvent::parse("2026-04-02T12:00:00 Elicitation r b");
+            assert_eq!(elicit.type_color(), Color::Yellow);
+        }
+
+        #[test]
+        fn new_event_categories() {
+            let file = ParsedEvent::parse("2026-04-02T12:00:00 FileChanged r b");
+            assert_eq!(file.type_category(), EventTypeCategory::Tool);
+            let task = ParsedEvent::parse("2026-04-02T12:00:00 TaskCreated r b");
+            assert_eq!(task.type_category(), EventTypeCategory::Agent);
+            let setup = ParsedEvent::parse("2026-04-02T12:00:00 Setup r b");
+            assert_eq!(setup.type_category(), EventTypeCategory::Session);
         }
 
         #[test]
@@ -8961,6 +9317,98 @@ mod tests {
         }
     }
 
+    // -- Tool timbral mapping tests --
+
+    #[test]
+    fn tool_timbral_params_differentiated() {
+        let read = tool_timbral_params("Read");
+        let bash = tool_timbral_params("Bash");
+        let write = tool_timbral_params("Write");
+        let agent = tool_timbral_params("Agent");
+        let unknown = tool_timbral_params("UnknownTool");
+
+        // Read: bright (high filter), 2nd harmonic
+        assert!(read.0 > 1.0, "Read should have high filter");
+        assert_eq!(read.2 & 0b001, 0b001, "Read should have 2nd harmonic");
+
+        // Bash: saw boost
+        assert_eq!(bash.2 & 0b100, 0b100, "Bash should have saw boost");
+        assert!(bash.1 > write.1, "Bash should have more detune than Write");
+
+        // Write: warm (low filter)
+        assert!(write.0 < 1.0, "Write should have low filter");
+
+        // Agent: 2nd+3rd harmonics
+        assert_eq!(agent.2 & 0b011, 0b011, "Agent should have 2nd+3rd harmonics");
+
+        // Unknown: neutral
+        assert_eq!(unknown.0, 1.0);
+        assert_eq!(unknown.1, 0.0);
+        assert_eq!(unknown.2, 0);
+    }
+
+    #[test]
+    fn agent_octave_shift_covers_register_range() {
+        let researcher = agent_octave_shift("researcher");
+        let worker = agent_octave_shift("worker");
+        let validator = agent_octave_shift("validator");
+        let scout = agent_octave_shift("scout");
+        let unknown = agent_octave_shift("whatever");
+
+        // Researcher lowest, scout highest
+        assert!(researcher < worker, "researcher should be below worker");
+        assert!(worker < validator, "worker should be below validator");
+        assert!(validator < scout, "validator should be below scout");
+        assert_eq!(unknown, 1.0, "unknown agent should be center");
+    }
+
+    #[test]
+    fn hook_context_default_all_empty() {
+        let ctx = HookContext::default();
+        assert!(ctx.event.is_empty());
+        assert!(ctx.tool_name.is_empty());
+        assert!(ctx.agent_type.is_empty());
+        assert!(ctx.error_msg.is_empty());
+        assert!(ctx.session_id.is_empty());
+    }
+
+    #[test]
+    fn all_27_events_have_play_args() {
+        assert_eq!(HOOK_EVENTS.len(), 27, "should have 27 hook events");
+        for event in HOOK_EVENTS {
+            let args = hook_play_args(event, "r".into(), "b".into(), false);
+            assert!(args.volume > 0.0, "{} should have positive volume", event);
+            assert!(args.duration > 0, "{} should have positive duration", event);
+        }
+    }
+
+    #[test]
+    fn error_events_get_attention_category() {
+        let stop_fail = hook_play_args("StopFailure", "r".into(), "b".into(), false);
+        let perm_denied = hook_play_args("PermissionDenied", "r".into(), "b".into(), false);
+        assert_eq!(stop_fail.event_category, EventCategory::Attention);
+        assert_eq!(perm_denied.event_category, EventCategory::Attention);
+    }
+
+    #[test]
+    fn queued_note_carries_tool_params() {
+        let note = QueuedNote {
+            category: category_to_u8(EventCategory::ToolPulse),
+            volume: 0.1, duration_ms: 100, note_freq: 440.0,
+            tool_filter: 1.4, tool_detune: 2.0, tool_harmonics: 0b001, is_error: false,
+        };
+        assert_eq!(note.tool_filter, 1.4);
+        assert_eq!(note.tool_harmonics & 0b001, 0b001);
+        assert!(!note.is_error);
+
+        let err_note = QueuedNote {
+            category: category_to_u8(EventCategory::ToolPulse),
+            volume: 0.1, duration_ms: 100, note_freq: 440.0,
+            tool_filter: 1.0, tool_detune: 0.0, tool_harmonics: 0, is_error: true,
+        };
+        assert!(err_note.is_error);
+    }
+
     // -- Init CLI arg tests --
 
     #[test]
@@ -9684,6 +10132,7 @@ mod tests {
                         volume: args.volume,
                         duration_ms: per_note_ms.max(150),
                         note_freq: freq,
+                        tool_filter: 1.0, tool_detune: 0.0, tool_harmonics: 0, is_error: false,
                     });
                 }
             }
@@ -9720,6 +10169,7 @@ mod tests {
                 volume: args.volume,
                 duration_ms: args.duration as u32,
                 note_freq,
+                tool_filter: 1.0, tool_detune: 0.0, tool_harmonics: 0, is_error: false,
             });
         }
 
@@ -9752,6 +10202,7 @@ mod tests {
                 volume: args.volume,
                 duration_ms: args.duration as u32,
                 note_freq,
+                tool_filter: 1.0, tool_detune: 0.0, tool_harmonics: 0, is_error: false,
             });
         }
 
@@ -9816,6 +10267,7 @@ mod tests {
                         volume: args.volume,
                         duration_ms: per_note_ms.max(150),
                         note_freq: freq,
+                        tool_filter: 1.0, tool_detune: 0.0, tool_harmonics: 0, is_error: false,
                     });
                 }
             }
@@ -9999,6 +10451,7 @@ mod tests {
                         volume: 0.1,
                         duration_ms: 100,
                         note_freq: 440.0 + i as f32,
+                        tool_filter: 1.0, tool_detune: 0.0, tool_harmonics: 0, is_error: false,
                     });
                 }
             }
