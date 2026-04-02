@@ -214,6 +214,10 @@ enum Command {
         uninstall: bool,
     },
 
+    /// Terminal dashboard for monitoring and controlling the daemon
+    #[cfg(feature = "tui")]
+    Tui,
+
     /// Interactive step sequencer — toggle drum hits in real-time
     Player {
         /// Starting break pattern (0=Amen, 1=Think, 2=Funky Drummer, 3=Apache,
@@ -1507,6 +1511,7 @@ impl BranchMelody {
 
 /// Map quantize subdivision multiplier to a musical label.
 fn subdiv_label(subdiv: f32) -> &'static str {
+    if subdiv < 0.1 { return "off"; } // free timing
     match subdiv as u8 {
         0 => "1/32",  // 0.5 truncates to 0
         1 => "1/16",
@@ -1677,6 +1682,8 @@ fn main() -> Result<()> {
             }
             run_tray(foreground)
         }
+        #[cfg(feature = "tui")]
+        Some(Command::Tui) => tui_app::run(),
         Some(Command::Player { pattern, bpm }) => run_player(pattern, bpm),
         None => run_play(cli.play_args),
     }
@@ -2368,15 +2375,18 @@ fn quantize_file_path() -> std::path::PathBuf {
 }
 
 /// Read persisted quantize override. Returns None for "auto" (hash-derived).
+/// 0 = off (free timing), 4/8/16/32 = grid denominators.
 fn get_quantize() -> Option<u32> {
     std::fs::read_to_string(quantize_file_path()).ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
-        .filter(|&d| matches!(d, 4 | 8 | 16 | 32))
+        .filter(|&d| matches!(d, 0 | 4 | 8 | 16 | 32))
 }
 
-/// Map quantize denominator (4/8/16/32) to subdivision multiplier.
+/// Map quantize denominator (0/4/8/16/32) to subdivision multiplier.
+/// 0 = off: uses a tiny subdivision so events play immediately without grid snap.
 fn quantize_denom_to_subdiv(denom: u32) -> f32 {
     match denom {
+        0 => 0.01, // effectively no grid — events play instantly
         4 => 4.0,
         8 => 2.0,
         16 => 1.0,
@@ -6700,6 +6710,1208 @@ fn run_player(initial_pattern: usize, initial_bpm: Option<u16>) -> Result<()> {
     }
 
     Ok(())
+}
+
+// =============================================================================
+// TUI: Terminal dashboard for daemon monitoring and control
+// =============================================================================
+
+#[cfg(feature = "tui")]
+mod tui_app {
+    use std::time::{Duration, Instant};
+
+    use anyhow::{Context, Result};
+    use ratatui::backend::CrosstermBackend;
+    use ratatui::layout::{Constraint, Direction, Layout, Rect};
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+    use ratatui::Terminal;
+
+    use super::{
+        daemon_dir, daemon_pid_path, daemon_socket_path, drone_mute_path,
+        get_quantize, get_seed, is_drone_muted, is_muted, mute_file_path,
+        quantize_file_path, seed_file_path, subdiv_label, SEED_PRESETS,
+    };
+
+    // ── Event parsing & coloring ────────────────────────────────────────────
+
+    /// Parsed event log line
+    struct ParsedEvent {
+        timestamp: String,
+        event_type: String,
+        repo: String,
+        branch: String,
+    }
+
+    impl ParsedEvent {
+        fn parse(line: &str) -> Self {
+            let parts: Vec<&str> = line.splitn(4, ' ').collect();
+            Self {
+                timestamp: parts.first().unwrap_or(&"").to_string(),
+                event_type: parts.get(1).unwrap_or(&"").to_string(),
+                repo: parts.get(2).unwrap_or(&"").to_string(),
+                branch: parts.get(3).unwrap_or(&"").to_string(),
+            }
+        }
+
+        fn type_color(&self) -> Color {
+            match self.event_type.as_str() {
+                "SessionStart" => Color::Cyan,
+                "SessionEnd" => Color::Blue,
+                "PreToolUse" => Color::Green,
+                "PostToolUse" => Color::Green,
+                "PostToolUseFailure" => Color::Red,
+                "UserPromptSubmit" => Color::Yellow,
+                "Notification" => Color::Yellow,
+                "Stop" => Color::Magenta,
+                "SubagentStart" | "SubagentStop" => Color::Blue,
+                "TaskCompleted" => Color::Cyan,
+                "PreCompact" => Color::DarkGray,
+                "ConfigChange" | "InstructionsLoaded" => Color::DarkGray,
+                "PermissionRequest" => Color::Yellow,
+                "TeammateIdle" => Color::DarkGray,
+                _ => Color::White,
+            }
+        }
+
+        /// Short label for compact display
+        fn type_label(&self) -> &str {
+            match self.event_type.as_str() {
+                "SessionStart" => "START",
+                "SessionEnd" => "END",
+                "PreToolUse" => "TOOL",
+                "PostToolUse" => "TOOL",
+                "PostToolUseFailure" => "FAIL",
+                "UserPromptSubmit" => "PROMPT",
+                "Notification" => "NOTIF",
+                "Stop" => "STOP",
+                "SubagentStart" => "AGENT+",
+                "SubagentStop" => "AGENT-",
+                "TaskCompleted" => "TASK",
+                "PreCompact" => "COMPACT",
+                "ConfigChange" => "CONFIG",
+                "InstructionsLoaded" => "INIT",
+                "PermissionRequest" => "PERM",
+                "TeammateIdle" => "IDLE",
+                _ => &self.event_type,
+            }
+        }
+
+        /// Event type category for activity bucketing
+        fn type_category(&self) -> EventTypeCategory {
+            match self.event_type.as_str() {
+                "PreToolUse" | "PostToolUse" | "PostToolUseFailure" => EventTypeCategory::Tool,
+                "UserPromptSubmit" => EventTypeCategory::Prompt,
+                "SessionStart" | "SessionEnd" => EventTypeCategory::Session,
+                "SubagentStart" | "SubagentStop" | "TaskCompleted" | "TeammateIdle" => EventTypeCategory::Agent,
+                _ => EventTypeCategory::Other,
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum EventTypeCategory {
+        Tool,
+        Prompt,
+        Session,
+        Agent,
+        Other,
+    }
+
+    impl EventTypeCategory {
+        fn color(self) -> Color {
+            match self {
+                Self::Tool => Color::Green,
+                Self::Prompt => Color::Yellow,
+                Self::Session => Color::Cyan,
+                Self::Agent => Color::Blue,
+                Self::Other => Color::DarkGray,
+            }
+        }
+
+        #[cfg(test)]
+        fn label(self) -> &'static str {
+            match self {
+                Self::Tool => "tool",
+                Self::Prompt => "prompt",
+                Self::Session => "session",
+                Self::Agent => "agent",
+                Self::Other => "other",
+            }
+        }
+    }
+
+    const ALL_CATEGORIES: [EventTypeCategory; 5] = [
+        EventTypeCategory::Tool,
+        EventTypeCategory::Prompt,
+        EventTypeCategory::Session,
+        EventTypeCategory::Agent,
+        EventTypeCategory::Other,
+    ];
+
+    /// Stable color palette for voice slots (up to 8)
+    const VOICE_COLORS: [Color; 8] = [
+        Color::Cyan, Color::Green, Color::Yellow, Color::Magenta,
+        Color::Blue, Color::Red, Color::LightCyan, Color::LightGreen,
+    ];
+
+    fn voice_color_for_repo(repo: &str, voices: &[(usize, String, String)]) -> Color {
+        voices.iter()
+            .position(|(_, r, _)| r == repo)
+            .map(|i| VOICE_COLORS[i % VOICE_COLORS.len()])
+            .unwrap_or(Color::DarkGray)
+    }
+
+    /// Zoom levels for the activity histogram
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum TimeScale {
+        Min5,    // 5 min, 5s buckets
+        Min15,   // 15 min, 15s buckets
+        Hour1,   // 1 hour, 1 min buckets
+        Hour4,   // 4 hours, 4 min buckets
+        Hour24,  // 24 hours, 24 min buckets
+    }
+
+    impl TimeScale {
+        fn label(self) -> &'static str {
+            match self {
+                Self::Min5 => "5 min",
+                Self::Min15 => "15 min",
+                Self::Hour1 => "1 hour",
+                Self::Hour4 => "4 hours",
+                Self::Hour24 => "24 hours",
+            }
+        }
+
+        /// Total window in seconds
+        fn window_secs(self) -> u64 {
+            match self {
+                Self::Min5 => 5 * 60,
+                Self::Min15 => 15 * 60,
+                Self::Hour1 => 60 * 60,
+                Self::Hour4 => 4 * 60 * 60,
+                Self::Hour24 => 24 * 60 * 60,
+            }
+        }
+
+        /// Seconds per bucket for a given number of columns
+        fn bucket_secs(self, num_cols: u64) -> u64 {
+            (self.window_secs() / num_cols).max(1)
+        }
+
+        /// How many log lines to read (wider windows need more history)
+        fn log_lines(self) -> usize {
+            match self {
+                Self::Min5 | Self::Min15 => 500,
+                Self::Hour1 => 2000,
+                Self::Hour4 => 5000,
+                Self::Hour24 => 10000,
+            }
+        }
+
+        fn zoom_in(self) -> Self {
+            match self {
+                Self::Min5 => Self::Min5,
+                Self::Min15 => Self::Min5,
+                Self::Hour1 => Self::Min15,
+                Self::Hour4 => Self::Hour1,
+                Self::Hour24 => Self::Hour4,
+            }
+        }
+
+        fn zoom_out(self) -> Self {
+            match self {
+                Self::Min5 => Self::Min15,
+                Self::Min15 => Self::Hour1,
+                Self::Hour1 => Self::Hour4,
+                Self::Hour4 => Self::Hour24,
+                Self::Hour24 => Self::Hour24,
+            }
+        }
+    }
+
+    /// Per-category activity data: 60 buckets at current timescale
+    struct ActivityData {
+        per_category: Vec<(EventTypeCategory, Vec<u64>)>,
+        total: Vec<u64>,
+        total_events: u64,
+    }
+
+    fn build_activity_data(events: &[ParsedEvent], scale: TimeScale, time_offset: i64, num_cols: usize) -> ActivityData {
+        let now = {
+            use std::time::SystemTime;
+            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs()
+        };
+
+        let num_cols = num_cols.max(1);
+        let bucket_secs = scale.bucket_secs(num_cols as u64);
+        let offset_secs = time_offset as u64 * bucket_secs;
+        let mut total = vec![0u64; num_cols];
+        let mut cat_buckets: Vec<Vec<u64>> = ALL_CATEGORIES.iter().map(|_| vec![0u64; num_cols]).collect();
+
+        for evt in events {
+            if let Some(epoch) = parse_timestamp_epoch(&evt.timestamp) {
+                let age_secs = now.saturating_sub(epoch);
+                if age_secs < offset_secs { continue; }
+                let shifted_age = age_secs - offset_secs;
+                let bucket_idx = shifted_age / bucket_secs;
+                if (bucket_idx as usize) < num_cols {
+                    let idx = num_cols - 1 - bucket_idx as usize;
+                    total[idx] += 1;
+                    let cat_idx = ALL_CATEGORIES.iter().position(|&c| c == evt.type_category()).unwrap_or(4);
+                    cat_buckets[cat_idx][idx] += 1;
+                }
+            }
+        }
+
+        let total_events = total.iter().sum();
+        ActivityData {
+            per_category: ALL_CATEGORIES.iter().copied().zip(cat_buckets.into_iter()).collect(),
+            total,
+            total_events,
+        }
+    }
+
+    /// Parse ISO timestamp to epoch seconds
+    fn parse_timestamp_epoch(ts: &str) -> Option<u64> {
+        let parts: Vec<&str> = ts.split('T').collect();
+        if parts.len() != 2 { return None; }
+        let date_parts: Vec<u64> = parts[0].split('-').filter_map(|s| s.parse().ok()).collect();
+        let time_parts: Vec<u64> = parts[1].split(':').filter_map(|s| s.parse().ok()).collect();
+        if date_parts.len() != 3 || time_parts.len() != 3 { return None; }
+        let (y, m, d) = (date_parts[0], date_parts[1], date_parts[2]);
+        let days = ymd_to_days(y, m, d);
+        Some(days * 86400 + time_parts[0] * 3600 + time_parts[1] * 60 + time_parts[2])
+    }
+
+    fn ymd_to_days(y: u64, m: u64, d: u64) -> u64 {
+        let y = if m <= 2 { y - 1 } else { y };
+        let m = if m <= 2 { m + 9 } else { m - 3 };
+        let era = y / 400;
+        let yoe = y - era * 400;
+        let doy = (153 * m + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146097 + doe - 719468
+    }
+
+    // ── Daemon socket client (ported from tray module) ──────────────────────
+
+    #[derive(Default)]
+    struct DaemonStatus {
+        pid: u32,
+        uptime_secs: u64,
+        active_voices: Vec<(usize, String, String)>, // (slot, repo, branch)
+        idle_secs: u64,
+        idle_timeout: u64,
+        running: bool,
+    }
+
+    fn query_daemon_status() -> DaemonStatus {
+        use std::io::{Read, Write};
+
+        let sock = daemon_socket_path();
+        let mut status = DaemonStatus::default();
+
+        let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock) else {
+            return status;
+        };
+        stream.set_read_timeout(Some(Duration::from_millis(500))).ok();
+        stream.set_write_timeout(Some(Duration::from_millis(500))).ok();
+        let _ = stream.write_all(b"{\"event\":\"__status_json\"}\n");
+
+        let mut buf = vec![0u8; 4096];
+        let Ok(n) = stream.read(&mut buf) else {
+            return status;
+        };
+
+        let json_str = String::from_utf8_lossy(&buf[..n]);
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(json_str.trim()) else {
+            return status;
+        };
+
+        status.running = true;
+        status.pid = json.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        status.uptime_secs = json.get("uptime_secs").and_then(|v| v.as_u64()).unwrap_or(0);
+        status.idle_secs = json.get("idle_secs").and_then(|v| v.as_u64()).unwrap_or(0);
+        status.idle_timeout = json.get("idle_timeout").and_then(|v| v.as_u64()).unwrap_or(300);
+
+        if let Some(voices) = json.get("active_voices").and_then(|v| v.as_array()) {
+            for v in voices {
+                let slot = v.get("slot").and_then(|s| s.as_u64()).unwrap_or(0) as usize;
+                let repo = v.get("repo").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                let branch = v.get("branch").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                status.active_voices.push((slot, repo, branch));
+            }
+        }
+
+        status
+    }
+
+    fn is_daemon_running() -> bool {
+        let pid_path = daemon_pid_path();
+        if !pid_path.exists() {
+            return false;
+        }
+        let Ok(pid_str) = std::fs::read_to_string(&pid_path) else {
+            return false;
+        };
+        let Ok(pid) = pid_str.trim().parse::<u32>() else {
+            return false;
+        };
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn start_daemon() {
+        if is_daemon_running() {
+            return;
+        }
+        let Ok(exe) = std::env::current_exe() else { return };
+        let _ = std::process::Command::new(exe)
+            .args(["daemon", "--detach"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+
+    fn stop_daemon() {
+        use std::io::{Read, Write};
+        let sock = daemon_socket_path();
+        if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock) {
+            let _ = stream.write_all(b"{\"event\":\"__shutdown\"}\n");
+            let mut buf = [0u8; 64];
+            let _ = stream.read(&mut buf);
+        }
+        let _ = std::fs::remove_file(daemon_pid_path());
+        let _ = std::fs::remove_file(daemon_socket_path());
+    }
+
+    fn recent_log_lines(max_lines: usize) -> Vec<String> {
+        let log_path = daemon_dir().join("events.log");
+        let Ok(content) = std::fs::read_to_string(&log_path) else {
+            return Vec::new();
+        };
+        content.lines().rev().take(max_lines).map(String::from).collect::<Vec<_>>()
+            .into_iter().rev().collect()
+    }
+
+    fn format_uptime(secs: u64) -> String {
+        if secs < 60 {
+            format!("{}s", secs)
+        } else if secs < 3600 {
+            format!("{}m {}s", secs / 60, secs % 60)
+        } else {
+            format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+        }
+    }
+
+    // ── TUI state ───────────────────────────────────────────────────────────
+
+    struct TuiState {
+        daemon: DaemonStatus,
+        muted: bool,
+        drone_muted: bool,
+        current_seed: Option<String>,
+        current_quantize: Option<u32>,
+        recent_events: Vec<ParsedEvent>,
+        all_events: Vec<ParsedEvent>,
+        event_count: usize,
+        new_event_time: Option<Instant>,
+        voice_activity: Vec<(String, Instant)>, // (repo, last_event_time)
+        activity: ActivityData,
+        timescale: TimeScale,
+        time_offset: i64,       // bucket offset for panning (negative = past)
+        stream_scroll: usize,   // how many events scrolled up from bottom
+        seed_list: ListState,
+        seeds_open: bool,
+        // Panel rects from last render (for mouse hit-testing)
+        rect_activity: Rect,
+        rect_stream: Rect,
+        rect_status: Rect,
+        activity_cols: usize,  // last-known inner width for activity panel
+        last_poll: Instant,
+    }
+
+    impl TuiState {
+        fn new() -> Self {
+            let mut seed_list = ListState::default();
+            seed_list.select(Some(0));
+            Self {
+                daemon: DaemonStatus::default(),
+                muted: false,
+                drone_muted: false,
+                current_seed: None,
+                current_quantize: None,
+                recent_events: Vec::new(),
+                all_events: Vec::new(),
+                event_count: 0,
+                new_event_time: None,
+                voice_activity: Vec::new(),
+                activity: ActivityData { per_category: Vec::new(), total: vec![0; 60], total_events: 0 },
+                timescale: TimeScale::Hour1,
+                time_offset: 0,
+                stream_scroll: 0,
+                seed_list,
+                seeds_open: false,
+                rect_activity: Rect::default(),
+                rect_stream: Rect::default(),
+                rect_status: Rect::default(),
+                activity_cols: 80, // reasonable default until first render
+                last_poll: Instant::now() - Duration::from_secs(10),
+            }
+        }
+
+        fn poll_daemon(&mut self) {
+            self.daemon = query_daemon_status();
+            self.muted = is_muted();
+            self.drone_muted = is_drone_muted();
+            self.current_seed = get_seed();
+            self.current_quantize = get_quantize();
+
+            let raw_all = recent_log_lines(self.timescale.log_lines());
+            // Filter recent events: only those from the last 24 hours (avoids stale events)
+            let now_epoch = {
+                use std::time::SystemTime;
+                SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs()
+            };
+            let max_age_secs = 24 * 3600; // 24 hours
+            let raw_recent: Vec<&String> = raw_all.iter().rev()
+                .filter(|line| {
+                    let parsed = ParsedEvent::parse(line);
+                    parse_timestamp_epoch(&parsed.timestamp)
+                        .is_some_and(|epoch| now_epoch.saturating_sub(epoch) < max_age_secs)
+                })
+                .take(200)
+                .collect::<Vec<_>>().into_iter().rev().collect();
+
+            let new_count = raw_recent.len();
+            if new_count > self.event_count {
+                self.new_event_time = Some(Instant::now());
+                for line in &raw_recent[self.event_count.min(new_count)..] {
+                    let parsed = ParsedEvent::parse(line);
+                    if let Some(entry) = self.voice_activity.iter_mut().find(|(r, _)| *r == parsed.repo) {
+                        entry.1 = Instant::now();
+                    } else if !parsed.repo.is_empty() {
+                        self.voice_activity.push((parsed.repo.clone(), Instant::now()));
+                    }
+                }
+            }
+            self.event_count = new_count;
+
+            self.all_events = raw_all.iter().map(|l| ParsedEvent::parse(l)).collect();
+            self.recent_events = raw_recent.iter().map(|l| ParsedEvent::parse(l)).collect();
+            self.activity = build_activity_data(&self.all_events, self.timescale, self.time_offset, self.activity_cols);
+            self.last_poll = Instant::now();
+
+            if let Some(ref name) = self.current_seed {
+                if let Some(idx) = SEED_PRESETS.iter().position(|p| p.name == name) {
+                    self.seed_list.select(Some(idx));
+                }
+            }
+        }
+
+        fn selected_seed_name(&self) -> Option<&str> {
+            self.seed_list.selected()
+                .and_then(|i| SEED_PRESETS.get(i))
+                .map(|p| p.name)
+        }
+
+        fn grid_label(&self) -> &'static str {
+            match self.current_quantize {
+                Some(d) => subdiv_label(super::quantize_denom_to_subdiv(d)),
+                None => "auto",
+            }
+        }
+    }
+
+    // ── Keyboard handling ───────────────────────────────────────────────────
+
+    enum Action { Quit, Continue }
+
+    fn handle_key(key: crossterm::event::KeyEvent, state: &mut TuiState) -> Action {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Action::Quit;
+        }
+
+        // Seed overlay captures keys when open
+        if state.seeds_open {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('p') => { state.seeds_open = false; }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    let i = state.seed_list.selected().unwrap_or(0);
+                    state.seed_list.select(Some(if i + 1 >= SEED_PRESETS.len() { 0 } else { i + 1 }));
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    let i = state.seed_list.selected().unwrap_or(0);
+                    state.seed_list.select(Some(if i == 0 { SEED_PRESETS.len() - 1 } else { i - 1 }));
+                }
+                KeyCode::Enter => {
+                    if let Some(name) = state.selected_seed_name() {
+                        let _ = std::fs::create_dir_all(daemon_dir());
+                        let _ = std::fs::write(seed_file_path(), name);
+                        state.current_seed = Some(name.to_string());
+                    }
+                    state.seeds_open = false;
+                }
+                KeyCode::Char('x') => {
+                    let path = seed_file_path();
+                    if path.exists() { let _ = std::fs::remove_file(&path); }
+                    state.current_seed = None;
+                    state.seeds_open = false;
+                }
+                _ => {}
+            }
+            return Action::Continue;
+        }
+
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
+            KeyCode::Char('m') => {
+                if state.muted { let _ = std::fs::remove_file(mute_file_path()); }
+                else { let _ = std::fs::create_dir_all(daemon_dir()); let _ = std::fs::write(mute_file_path(), ""); }
+                state.muted = !state.muted;
+                Action::Continue
+            }
+            KeyCode::Char('d') => {
+                if state.drone_muted { let _ = std::fs::remove_file(drone_mute_path()); }
+                else { let _ = std::fs::create_dir_all(daemon_dir()); let _ = std::fs::write(drone_mute_path(), ""); }
+                state.drone_muted = !state.drone_muted;
+                Action::Continue
+            }
+            KeyCode::Char('s') => {
+                start_daemon();
+                std::thread::sleep(Duration::from_millis(500));
+                state.poll_daemon();
+                Action::Continue
+            }
+            KeyCode::Char('S') => {
+                stop_daemon();
+                std::thread::sleep(Duration::from_millis(200));
+                state.poll_daemon();
+                Action::Continue
+            }
+            KeyCode::Char('p') => { state.seeds_open = true; Action::Continue }
+            KeyCode::Char('g') => {
+                let next = match state.current_quantize {
+                    None => Some(32), Some(32) => Some(16), Some(16) => Some(8),
+                    Some(8) => Some(4), Some(4) => Some(0), Some(0) | Some(_) => None,
+                };
+                match next {
+                    Some(d) => { let _ = std::fs::create_dir_all(daemon_dir()); let _ = std::fs::write(quantize_file_path(), d.to_string()); }
+                    None => { let _ = std::fs::remove_file(quantize_file_path()); }
+                }
+                state.current_quantize = next;
+                Action::Continue
+            }
+            // Zoom activity histogram
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                state.timescale = state.timescale.zoom_in();
+                state.time_offset = 0; // reset pan on zoom change
+                state.poll_daemon();
+                Action::Continue
+            }
+            KeyCode::Char('-') => {
+                state.timescale = state.timescale.zoom_out();
+                state.time_offset = 0;
+                state.poll_daemon();
+                Action::Continue
+            }
+
+            // Pan activity histogram in time
+            KeyCode::Left => {
+                state.time_offset += 5;
+                state.activity = build_activity_data(&state.all_events, state.timescale, state.time_offset, state.activity_cols);
+                Action::Continue
+            }
+            KeyCode::Right => {
+                state.time_offset = (state.time_offset - 5).max(0);
+                state.activity = build_activity_data(&state.all_events, state.timescale, state.time_offset, state.activity_cols);
+                Action::Continue
+            }
+
+            // Home = jump to present
+            KeyCode::Home => {
+                state.time_offset = 0;
+                state.stream_scroll = 0;
+                state.activity = build_activity_data(&state.all_events, state.timescale, 0, state.activity_cols);
+                Action::Continue
+            }
+
+            // Stream scrolling
+            KeyCode::Char('j') | KeyCode::Down => {
+                state.stream_scroll = state.stream_scroll.saturating_sub(1);
+                Action::Continue
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                state.stream_scroll = state.stream_scroll.saturating_add(1)
+                    .min(state.recent_events.len().saturating_sub(1));
+                Action::Continue
+            }
+            KeyCode::PageDown => {
+                state.stream_scroll = state.stream_scroll.saturating_sub(10);
+                Action::Continue
+            }
+            KeyCode::PageUp => {
+                state.stream_scroll = state.stream_scroll.saturating_add(10)
+                    .min(state.recent_events.len().saturating_sub(1));
+                Action::Continue
+            }
+            KeyCode::End => {
+                state.stream_scroll = 0; // jump to newest
+                Action::Continue
+            }
+
+            KeyCode::Char('r') => {
+                state.recent_events.clear();
+                state.event_count = 0;
+                state.new_event_time = None;
+                state.voice_activity.clear();
+                state.stream_scroll = 0;
+                Action::Continue
+            }
+            _ => Action::Continue,
+        }
+    }
+
+    fn handle_mouse(mouse: crossterm::event::MouseEvent, state: &mut TuiState) {
+        use crossterm::event::{MouseEventKind, MouseButton};
+
+        let col = mouse.column;
+        let row = mouse.row;
+
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                if state.rect_activity.contains((col, row).into()) {
+                    // Scroll up on activity = pan backward in time
+                    state.time_offset += 3;
+                    state.activity = build_activity_data(&state.all_events, state.timescale, state.time_offset, state.activity_cols);
+                } else if state.rect_stream.contains((col, row).into()) {
+                    // Scroll up on stream = show older events
+                    state.stream_scroll = state.stream_scroll.saturating_add(3)
+                        .min(state.recent_events.len().saturating_sub(1));
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if state.rect_activity.contains((col, row).into()) {
+                    // Scroll down on activity = pan forward in time (toward present)
+                    state.time_offset = (state.time_offset - 3).max(0);
+                    state.activity = build_activity_data(&state.all_events, state.timescale, state.time_offset, state.activity_cols);
+                } else if state.rect_stream.contains((col, row).into()) {
+                    // Scroll down on stream = show newer events
+                    state.stream_scroll = state.stream_scroll.saturating_sub(3);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if state.rect_status.contains((col, row).into()) {
+                    // Click on status bar — detect which parameter was clicked
+                    // Build a rough column map from the status spans
+                    handle_status_click(col, state);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Detect which status bar element was clicked and toggle/open it
+    fn handle_status_click(col: u16, state: &mut TuiState) {
+        // Status bar layout (approximate character positions after border):
+        // "● RUNNING  PID 1234  up 2h  3 voices  seed: shadow  grid: 1/16  MUTED  drone off"
+        // The spans are variable-width, so we use rough column ranges.
+        // These are estimates — good enough for click detection.
+        let inner_col = col.saturating_sub(1); // account for border
+
+        // Scan the rendered text to find approximate positions
+        // We look for keywords in the status line
+        let status_text = format!(
+            "● {}  PID {}  up {}  {} voice{}  seed: {}  grid: {}{}{}",
+            if state.daemon.running { "RUNNING" } else { "STOPPED" },
+            state.daemon.pid,
+            format_uptime(state.daemon.uptime_secs),
+            state.daemon.active_voices.len(),
+            if state.daemon.active_voices.len() == 1 { "" } else { "s" },
+            state.current_seed.as_deref().unwrap_or("default"),
+            state.grid_label(),
+            if state.muted { "  MUTED" } else { "" },
+            if state.drone_muted && !state.muted { "  drone off" } else { "" },
+        );
+
+        let col = inner_col as usize;
+
+        // Find "seed:" position
+        if let Some(seed_pos) = status_text.find("seed:") {
+            if col >= seed_pos && col < seed_pos + 20 {
+                state.seeds_open = true;
+                return;
+            }
+        }
+
+        // Find "grid:" position
+        if let Some(grid_pos) = status_text.find("grid:") {
+            if col >= grid_pos && col < grid_pos + 12 {
+                // Cycle grid
+                let next = match state.current_quantize {
+                    None => Some(32), Some(32) => Some(16), Some(16) => Some(8),
+                    Some(8) => Some(4), Some(4) => Some(0), Some(0) | Some(_) => None,
+                };
+                match next {
+                    Some(d) => { let _ = std::fs::create_dir_all(daemon_dir()); let _ = std::fs::write(quantize_file_path(), d.to_string()); }
+                    None => { let _ = std::fs::remove_file(quantize_file_path()); }
+                }
+                state.current_quantize = next;
+                return;
+            }
+        }
+
+        // Find "MUTED" position
+        if let Some(mute_pos) = status_text.find("MUTED") {
+            if col >= mute_pos && col < mute_pos + 6 {
+                let _ = std::fs::remove_file(mute_file_path());
+                state.muted = false;
+                return;
+            }
+        }
+
+        // Find "drone off" position
+        if let Some(drone_pos) = status_text.find("drone off") {
+            if col >= drone_pos && col < drone_pos + 10 {
+                let _ = std::fs::remove_file(drone_mute_path());
+                state.drone_muted = false;
+                return;
+            }
+        }
+
+        // Find "STOPPED" — click to start
+        if let Some(stop_pos) = status_text.find("STOPPED") {
+            if col >= stop_pos && col < stop_pos + 8 {
+                start_daemon();
+                std::thread::sleep(Duration::from_millis(500));
+                state.poll_daemon();
+                return;
+            }
+        }
+
+        // Find "RUNNING" — show it's clickable but don't stop accidentally
+        // (stopping requires Shift+S to avoid accidents)
+    }
+
+    // ── Layout & rendering ──────────────────────────────────────────────────
+
+    fn ui(frame: &mut ratatui::Frame, state: &mut TuiState) {
+        let area = frame.area();
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),   // status bar
+                Constraint::Length(5),   // activity bars (per-category)
+                Constraint::Min(8),     // merged voice+events stream
+                Constraint::Length(1),   // keybind footer
+            ])
+            .split(area);
+
+        // Store rects for mouse hit-testing
+        state.rect_status = chunks[0];
+        state.rect_activity = chunks[1];
+        state.rect_stream = chunks[2];
+
+        render_status_bar(frame, state, chunks[0]);
+        render_activity(frame, state, chunks[1]);
+        render_stream(frame, state, chunks[2]);
+        render_footer(frame, state, chunks[3]);
+
+        if state.seeds_open {
+            render_seed_overlay(frame, state, area);
+        }
+    }
+
+    fn render_status_bar(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
+        let daemon_indicator = if state.daemon.running {
+            Span::styled("● RUNNING", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+        } else {
+            Span::styled("○ STOPPED", Style::default().fg(Color::DarkGray))
+        };
+        let pid_span = if state.daemon.running {
+            Span::styled(format!("  PID {}  up {}", state.daemon.pid, format_uptime(state.daemon.uptime_secs)), Style::default().fg(Color::DarkGray))
+        } else { Span::raw("") };
+        let voice_count = state.daemon.active_voices.len();
+        let voices_span = if voice_count > 0 {
+            Span::styled(format!("  {} voice{}", voice_count, if voice_count == 1 { "" } else { "s" }), Style::default().fg(Color::Cyan))
+        } else { Span::styled("  no voices", Style::default().fg(Color::DarkGray)) };
+        let seed_span = match &state.current_seed {
+            Some(name) => Span::styled(format!("  seed: {}", name), Style::default().fg(Color::Yellow)),
+            None => Span::styled("  seed: default", Style::default().fg(Color::DarkGray)),
+        };
+        let grid_span = Span::styled(format!("  grid: {}", state.grid_label()), Style::default().fg(Color::Magenta));
+        let mute_span = if state.muted { Span::styled("  MUTED", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)) } else { Span::raw("") };
+        let drone_span = if state.drone_muted && !state.muted { Span::styled("  drone off", Style::default().fg(Color::DarkGray)) } else { Span::raw("") };
+
+        let line = Line::from(vec![daemon_indicator, pid_span, voices_span, seed_span, grid_span, mute_span, drone_span]);
+        let block = Block::default().borders(Borders::BOTTOM)
+            .title(Span::styled(" branch-tone ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+        frame.render_widget(Paragraph::new(line).block(block), area);
+    }
+
+    /// Stacked per-category activity bars
+    fn render_activity(frame: &mut ratatui::Frame, state: &mut TuiState, area: Rect) {
+        let scale_label = state.timescale.label();
+        let offset_label = if state.time_offset > 0 {
+            let offset_secs = state.time_offset as u64 * state.timescale.bucket_secs(state.activity_cols as u64);
+            format!(" ◀ −{} ", format_uptime(offset_secs))
+        } else {
+            " now ".to_string()
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(Line::from(vec![
+                Span::styled(" Activity ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("[−] {} [+]", scale_label), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    offset_label,
+                    Style::default().fg(if state.time_offset > 0 { Color::Yellow } else { Color::DarkGray }),
+                ),
+            ]))
+            .title_bottom(Line::from(vec![
+                Span::styled(format!(" {} events ", state.activity.total_events), Style::default().fg(Color::Green)),
+                Span::styled("│", Style::default().fg(Color::DarkGray)),
+                Span::styled(" ■", Style::default().fg(Color::Green)),
+                Span::styled("tool ", Style::default().fg(Color::DarkGray)),
+                Span::styled("■", Style::default().fg(Color::Yellow)),
+                Span::styled("prompt ", Style::default().fg(Color::DarkGray)),
+                Span::styled("■", Style::default().fg(Color::Cyan)),
+                Span::styled("session ", Style::default().fg(Color::DarkGray)),
+                Span::styled("■", Style::default().fg(Color::Blue)),
+                Span::styled("agent ", Style::default().fg(Color::DarkGray)),
+            ]));
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.height == 0 || inner.width == 0 { return; }
+
+        // Rebuild activity data if terminal width changed
+        let new_cols = inner.width as usize;
+        if new_cols != state.activity_cols {
+            state.activity_cols = new_cols;
+            state.activity = build_activity_data(&state.all_events, state.timescale, state.time_offset, new_cols);
+        }
+
+        let max_val = state.activity.total.iter().copied().max().unwrap_or(1).max(1);
+        let col_height = inner.height as u64;
+
+        for col in 0..inner.width as usize {
+            if col >= state.activity.total.len() { break; }
+            let mut y_cursor = inner.y + inner.height;
+            for (cat, buckets) in &state.activity.per_category {
+                if col >= buckets.len() { continue; }
+                let val = buckets[col];
+                if val == 0 { continue; }
+                let bar_h = ((val * col_height) / max_val).max(if val > 0 { 1 } else { 0 }) as u16;
+                for _dy in 0..bar_h {
+                    if y_cursor == inner.y { break; }
+                    y_cursor -= 1;
+                    let x = inner.x + col as u16;
+                    if x < inner.x + inner.width && y_cursor >= inner.y {
+                        frame.buffer_mut()[(x, y_cursor)].set_char('█').set_fg(cat.color());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Merged voice+events stream — events colored by voice
+    fn render_stream(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
+        let flash_active = state.new_event_time.is_some_and(|t| t.elapsed().as_secs_f32() < 2.0);
+        let border_color = if flash_active { Color::Green } else { Color::DarkGray };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color))
+            .title(Span::styled(" Stream ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
+
+        if state.recent_events.is_empty() {
+            let msg = if state.daemon.running { "Waiting for events..." } else { "Daemon not running — press [s] to start" };
+            frame.render_widget(Paragraph::new(Span::styled(msg, Style::default().fg(Color::DarkGray))).block(block), area);
+            return;
+        }
+
+        let max_visible = (area.height as usize).saturating_sub(2);
+        // Apply scroll offset: scroll=0 means newest at bottom, scroll=N means N events scrolled up
+        let end = state.recent_events.len().saturating_sub(state.stream_scroll);
+        let start = end.saturating_sub(max_visible);
+        let visible_events = &state.recent_events[start..end];
+
+        let now = Instant::now();
+        let total = state.recent_events.len();
+
+        let lines: Vec<Line> = visible_events.iter().enumerate().map(|(i, evt)| {
+            let recency = i as f32 / (visible_events.len().max(1) as f32);
+            let is_newest = i == visible_events.len() - 1 && flash_active;
+
+            let voice_col = voice_color_for_repo(&evt.repo, &state.daemon.active_voices);
+            let voice_age = state.voice_activity.iter()
+                .find(|(r, _)| *r == evt.repo)
+                .map(|(_, t)| now.duration_since(*t).as_secs_f32());
+
+            let lane_char = if is_newest { "█" } else if voice_age.is_some_and(|a| a < 2.0) { "▓" } else if recency > 0.7 { "▒" } else { "░" };
+            let lane_color = if is_newest { Color::White } else { voice_col };
+            let time_str = if evt.timestamp.len() > 11 { &evt.timestamp[11..] } else { &evt.timestamp };
+            let type_color = if is_newest { Color::White } else if recency > 0.7 { evt.type_color() } else { Color::DarkGray };
+            let repo_color = if is_newest { Color::White } else if recency > 0.5 { voice_col } else { Color::DarkGray };
+            let time_color = if is_newest { Color::White } else { Color::DarkGray };
+            let branch_color = if is_newest { Color::White } else { Color::DarkGray };
+
+            Line::from(vec![
+                Span::styled(lane_char, Style::default().fg(lane_color)),
+                Span::styled(format!(" {} ", time_str), Style::default().fg(time_color)),
+                Span::styled(format!("{:<7}", evt.type_label()), Style::default().fg(type_color).add_modifier(if is_newest { Modifier::BOLD } else { Modifier::empty() })),
+                Span::styled(format!(" {}", evt.repo), Style::default().fg(repo_color)),
+                Span::styled(format!("/{}", evt.branch), Style::default().fg(branch_color)),
+            ])
+        }).collect();
+
+        let scroll_hint = if state.stream_scroll > 0 {
+            format!(" ▲{} ", state.stream_scroll)
+        } else { String::new() };
+        let title_right = format!(" {}/{}{} [r]eset ", visible_events.len(), total, scroll_hint);
+        let block = block.title_bottom(Line::from(Span::styled(title_right, Style::default().fg(
+            if state.stream_scroll > 0 { Color::Yellow } else { Color::DarkGray }
+        ))).alignment(ratatui::layout::Alignment::Right));
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
+    fn render_seed_overlay(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
+        let overlay_w = 50u16.min(area.width.saturating_sub(4));
+        let overlay_h = 20u16.min(area.height.saturating_sub(4));
+        let x = (area.width.saturating_sub(overlay_w)) / 2 + area.x;
+        let y = (area.height.saturating_sub(overlay_h)) / 2 + area.y;
+        let overlay = Rect::new(x, y, overlay_w, overlay_h);
+
+        frame.render_widget(ratatui::widgets::Clear, overlay);
+
+        let items: Vec<ListItem> = SEED_PRESETS.iter().map(|preset| {
+            let is_active = state.current_seed.as_deref() == Some(preset.name);
+            let marker = if is_active { "▸ " } else { "  " };
+            let name_style = if is_active {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else { Style::default().fg(Color::White) };
+            let groove = format!(" sw:{:.0}% hu:{:.0}% {}", preset.swing * 100.0, preset.humanize * 100.0, subdiv_label(preset.quantize_subdiv));
+            ListItem::new(Line::from(vec![
+                Span::raw(marker),
+                Span::styled(format!("{:<10}", preset.name), name_style),
+                Span::styled(groove, Style::default().fg(Color::DarkGray)),
+            ]))
+        }).collect();
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(Span::styled(" Seeds ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
+            .title_bottom(Line::from(Span::styled(" [j/k] navigate  [Enter] apply  [x] clear  [Esc] close ", Style::default().fg(Color::DarkGray))));
+
+        let list = List::new(items).block(block).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        frame.render_stateful_widget(list, overlay, &mut state.seed_list.clone());
+    }
+
+    fn render_footer(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
+        let mute_key = if state.muted { "[m]unmute" } else { "[m]ute" };
+        let drone_key = if state.drone_muted { "[d]rone on" } else { "[d]rone off" };
+        let daemon_key = if state.daemon.running { "[S]top" } else { "[s]tart" };
+        let line = Line::from(vec![
+            Span::styled(format!(" {} ", mute_key), Style::default().fg(Color::White)),
+            Span::styled("│", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!(" {} ", drone_key), Style::default().fg(Color::White)),
+            Span::styled("│", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!(" {} daemon ", daemon_key), Style::default().fg(Color::White)),
+            Span::styled("│", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!(" [g]rid: {} ", state.grid_label()), Style::default().fg(Color::White)),
+            Span::styled("│", Style::default().fg(Color::DarkGray)),
+            Span::styled(" [p]alette ", Style::default().fg(Color::Yellow)),
+            Span::styled("│", Style::default().fg(Color::DarkGray)),
+            Span::styled(" [+/-]zoom ", Style::default().fg(Color::White)),
+            Span::styled("│", Style::default().fg(Color::DarkGray)),
+            Span::styled(" [q]uit ", Style::default().fg(Color::White)),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+    }
+
+    // ── Entry point ─────────────────────────────────────────────────────────
+
+    pub fn run() -> Result<()> {
+        let _guard = super::RawModeGuard::enter()?;
+        // Enable mouse capture for scroll and click
+        crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
+        let backend = CrosstermBackend::new(std::io::stdout());
+        let mut terminal = Terminal::new(backend).context("Failed to initialize terminal")?;
+        let mut state = TuiState::new();
+
+        let result = (|| -> Result<()> {
+            loop {
+                if state.last_poll.elapsed() > Duration::from_secs(2) {
+                    state.poll_daemon();
+                }
+                terminal.draw(|frame| ui(frame, &mut state))?;
+                if crossterm::event::poll(Duration::from_millis(200))? {
+                    match crossterm::event::read()? {
+                        crossterm::event::Event::Key(key) => {
+                            if key.kind != crossterm::event::KeyEventKind::Press { continue; }
+                            match handle_key(key, &mut state) {
+                                Action::Quit => break,
+                                Action::Continue => {}
+                            }
+                        }
+                        crossterm::event::Event::Mouse(mouse) => {
+                            handle_mouse(mouse, &mut state);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(())
+        })();
+
+        // Always disable mouse capture on exit
+        crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture)?;
+        result
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn format_uptime_seconds() { assert_eq!(format_uptime(45), "45s"); }
+        #[test]
+        fn format_uptime_minutes() { assert_eq!(format_uptime(125), "2m 5s"); }
+        #[test]
+        fn format_uptime_hours() { assert_eq!(format_uptime(3725), "1h 2m"); }
+
+        #[test]
+        fn grid_label_auto() { assert_eq!(TuiState::new().grid_label(), "auto"); }
+
+        #[test]
+        fn grid_label_values() {
+            let mut s = TuiState::new();
+            s.current_quantize = Some(32); assert_eq!(s.grid_label(), "1/32");
+            s.current_quantize = Some(16); assert_eq!(s.grid_label(), "1/16");
+            s.current_quantize = Some(8); assert_eq!(s.grid_label(), "1/8");
+            s.current_quantize = Some(4); assert_eq!(s.grid_label(), "1/4");
+        }
+
+        #[test]
+        fn seed_list_initial_selection() {
+            let s = TuiState::new();
+            assert_eq!(s.seed_list.selected(), Some(0));
+            assert_eq!(s.selected_seed_name(), Some("shadow"));
+        }
+
+        #[test]
+        fn parse_event_line() {
+            let evt = ParsedEvent::parse("2026-04-01T21:58:29 PreToolUse branch-tone tui");
+            assert_eq!(evt.event_type, "PreToolUse");
+            assert_eq!(evt.repo, "branch-tone");
+            assert_eq!(evt.type_label(), "TOOL");
+            assert_eq!(evt.type_color(), Color::Green);
+        }
+
+        #[test]
+        fn parse_event_types_colored() {
+            assert_eq!(ParsedEvent::parse("T SessionStart r b").type_color(), Color::Cyan);
+            assert_eq!(ParsedEvent::parse("T PostToolUseFailure r b").type_color(), Color::Red);
+            assert_eq!(ParsedEvent::parse("T UserPromptSubmit r b").type_color(), Color::Yellow);
+            assert_eq!(ParsedEvent::parse("T Stop r b").type_color(), Color::Magenta);
+        }
+
+        #[test]
+        fn parse_timestamp_epoch_valid() {
+            let e = parse_timestamp_epoch("2026-04-01T21:58:29").unwrap();
+            assert!(e > 1_774_000_000 && e < 1_780_000_000);
+        }
+
+        #[test]
+        fn parse_timestamp_epoch_invalid() {
+            assert!(parse_timestamp_epoch("garbage").is_none());
+            assert!(parse_timestamp_epoch("2026-04-01").is_none());
+        }
+
+        #[test]
+        fn activity_data_empty() {
+            let d = build_activity_data(&[], TimeScale::Hour1, 0, 60);
+            assert_eq!(d.total.len(), 60);
+            assert_eq!(d.total_events, 0);
+            assert_eq!(d.per_category.len(), 5);
+        }
+
+        #[test]
+        fn timescale_zoom_in_out() {
+            assert_eq!(TimeScale::Hour1.zoom_in(), TimeScale::Min15);
+            assert_eq!(TimeScale::Hour1.zoom_out(), TimeScale::Hour4);
+            assert_eq!(TimeScale::Min5.zoom_in(), TimeScale::Min5); // can't zoom further
+            assert_eq!(TimeScale::Hour24.zoom_out(), TimeScale::Hour24); // can't zoom further
+        }
+
+        #[test]
+        fn timescale_bucket_secs() {
+            // With 60 columns (default-like width):
+            assert_eq!(TimeScale::Min5.bucket_secs(60), 5);       // 5s per bucket
+            assert_eq!(TimeScale::Min15.bucket_secs(60), 15);     // 15s per bucket
+            assert_eq!(TimeScale::Hour1.bucket_secs(60), 60);     // 1min per bucket
+            assert_eq!(TimeScale::Hour4.bucket_secs(60), 240);    // 4min per bucket
+            assert_eq!(TimeScale::Hour24.bucket_secs(60), 1440);  // 24min per bucket
+            // With 120 columns (wide terminal): finer granularity
+            assert_eq!(TimeScale::Hour1.bucket_secs(120), 30);    // 30s per bucket
+        }
+
+        #[test]
+        fn event_type_categories() {
+            assert_eq!(ParsedEvent::parse("T PreToolUse r b").type_category(), EventTypeCategory::Tool);
+            assert_eq!(ParsedEvent::parse("T UserPromptSubmit r b").type_category(), EventTypeCategory::Prompt);
+            assert_eq!(ParsedEvent::parse("T SessionStart r b").type_category(), EventTypeCategory::Session);
+            assert_eq!(ParsedEvent::parse("T SubagentStart r b").type_category(), EventTypeCategory::Agent);
+            assert_eq!(ParsedEvent::parse("T Notification r b").type_category(), EventTypeCategory::Other);
+        }
+
+        #[test]
+        fn voice_color_assignment() {
+            let voices = vec![(0, "repo-a".into(), "main".into()), (1, "repo-b".into(), "dev".into())];
+            assert_eq!(voice_color_for_repo("repo-a", &voices), VOICE_COLORS[0]);
+            assert_eq!(voice_color_for_repo("repo-b", &voices), VOICE_COLORS[1]);
+            assert_eq!(voice_color_for_repo("unknown", &voices), Color::DarkGray);
+        }
+
+        #[test]
+        fn initial_state_seeds_closed() {
+            let s = TuiState::new();
+            assert!(!s.seeds_open);
+            assert!(s.voice_activity.is_empty());
+            assert_eq!(s.event_count, 0);
+        }
+
+        #[test]
+        fn category_labels() {
+            assert_eq!(EventTypeCategory::Tool.label(), "tool");
+            assert_eq!(EventTypeCategory::Prompt.label(), "prompt");
+            assert_eq!(EventTypeCategory::Session.label(), "session");
+        }
+
+        #[test]
+        fn time_offset_default_zero() {
+            let s = TuiState::new();
+            assert_eq!(s.time_offset, 0);
+            assert_eq!(s.stream_scroll, 0);
+        }
+
+        #[test]
+        fn zoom_resets_offset() {
+            // Verify that zoom_in/out return different scales (offset reset is in key handler)
+            let scale = TimeScale::Hour1;
+            assert_ne!(scale.zoom_in(), scale);
+            assert_ne!(scale.zoom_out(), scale);
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------

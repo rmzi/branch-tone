@@ -7,6 +7,8 @@ jungle/liquid DnB production techniques.
 > **See also**: [Jazz Ensemble](jazz-ensemble.md) — how 18 Claude Code hook
 > events map to a jazz ensemble (drums, bass, keys, horn, piano), including
 > the PDS lifecycle mapping and worktree-as-voice concept.
+> [TUI Design](tui-design.md) — terminal dashboard architecture, rendering
+> techniques, and development diary.
 
 ## Source Material: Blu Mar Ten JungleJungle Pack
 

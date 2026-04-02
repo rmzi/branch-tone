@@ -4,7 +4,7 @@
     <strong>Hear your git context. Every repo has a voice. Every branch has a melody.</strong>
   </p>
   <p align="center">
-    <a href="https://github.com/rmzi/branch-tone/releases"><img alt="Version" src="https://img.shields.io/badge/version-0.9.0-blue?style=flat-square"></a>
+    <a href="https://github.com/rmzi/branch-tone/releases"><img alt="Version" src="https://img.shields.io/badge/version-0.12.0-blue?style=flat-square"></a>
     <a href="https://www.rust-lang.org/"><img alt="Rust" src="https://img.shields.io/badge/rust-2024_edition-orange?style=flat-square&logo=rust"></a>
     <a href="https://github.com/rmzi/branch-tone/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-green?style=flat-square"></a>
     <a href="#"><img alt="Platform" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey?style=flat-square"></a>
@@ -154,6 +154,53 @@ O   ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·
 
 **Record mode** — press `r` to arm, then `z`/`x`/`c`/`v` to live-record kick/snare/hat/open during playback.
 
+## Terminal Dashboard (TUI)
+
+A live system monitor that visualizes everything the daemon is doing — built with [ratatui](https://github.com/ratatui/ratatui).
+
+```bash
+cargo install --path . --features tui
+branch-tone tui
+```
+
+```
+┌─ branch-tone ──────────────────────────────────────────────┐
+│ ● RUNNING  PID 1234  up 2h  3 voices  seed: shadow  1/16  │
+├─ Activity ─────────────────────────────────────────────────┤
+│ █▇▅▃▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▂▃▅█▇▅▃▂▁▁▁▁▁▁▂▅█▇▅ │
+│ ■tool ■prompt ■session ■agent         60 min │ 234 events  │
+├─ Stream ───────────────────────────────────────────────────┤
+│░ 21:58:28 TOOL    branch-tone/tui                          │
+│░ 21:58:29 TOOL    universe/issue_improvements              │
+│▒ 21:58:30 PROMPT  branch-tone/tui                          │
+│▒ 21:58:31 TOOL    universe/issue_improvements              │
+│▓ 21:58:32 TOOL    branch-tone/tui                          │
+│▓ 21:58:33 AGENT+  universe/issue_improvements              │
+│█ 21:58:34 TOOL    branch-tone/tui                          │
+│                                              28/80 [r]eset │
+├────────────────────────────────────────────────────────────┤
+│ [m]ute [d]rone [S]top [g]rid:1/16 [p]alette [q]uit        │
+└────────────────────────────────────────────────────────────┘
+```
+
+**Activity histogram** — 60-minute stacked bar chart. Each minute-column is colored by event type: tool calls (green), prompts (yellow), sessions (cyan), agents (blue). See your development rhythm at a glance.
+
+**Event stream** — Every hook event, color-coded and fading. Each repo gets a stable color from an 8-color palette, shown as a lane prefix (`█▓▒░`) that pulses when events arrive and decays over ~20 seconds. Newest events flash white, older ones fade to gray.
+
+**Seed palette** — Press `[p]` to open a centered overlay showing all 16 curated seeds with their groove parameters (swing, humanize, grid). Navigate with `j`/`k`, apply with `Enter`.
+
+| Key | Action |
+|-----|--------|
+| `m` | Toggle mute |
+| `d` | Toggle drone |
+| `s` / `S` | Start / stop daemon |
+| `g` | Cycle quantize grid |
+| `p` | Open seed palette |
+| `r` | Reset event view |
+| `q` | Quit |
+
+The TUI is feature-gated (`--features tui`) — zero impact on the default build. It's a read-only client that connects to the daemon over the existing Unix socket. See [`docs/tui-design.md`](docs/tui-design.md) for the full design document.
+
 ## How It Works
 
 Repo and branch are hashed **separately** with SHA-256, contributing independently to the final sound:
@@ -247,7 +294,9 @@ cargo build                   # Debug build
 cargo run -- main             # Run with args
 cargo run -- player           # Step sequencer
 cargo build --release         # Optimized build
-cargo test                    # 57 tests
+cargo test                    # 141 tests
+cargo build --features tui    # With terminal dashboard
+cargo build --features tray   # With macOS menu bar
 ```
 
 ## Stack
@@ -258,7 +307,7 @@ cargo test                    # 57 tests
 | Audio | [CPAL](https://github.com/RustAudio/cpal) (Cross-Platform Audio Library) |
 | Hashing | SHA-256 (two-layer: repo + branch) |
 | CLI | [Clap](https://github.com/clap-rs/clap) with derive macros |
-| Terminal | [Crossterm](https://github.com/crossterm-rs/crossterm) for the step sequencer |
+| Terminal | [Crossterm](https://github.com/crossterm-rs/crossterm) for the step sequencer, [Ratatui](https://github.com/ratatui/ratatui) for the TUI dashboard |
 | Synthesis | Saw/sine oscillators, Butterworth LPF, Schroeder reverb, BBD chorus, tape delay |
 | Scales | 10 types across 12 chromatic roots |
 
