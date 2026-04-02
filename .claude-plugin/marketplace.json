@@ -8,7 +8,7 @@
       "name": "branch-tone",
       "source": "./plugin",
       "description": "Hear your git context. Every repo has a voice. Every branch has a melody.",
-      "version": "0.9.0",
+      "version": "0.11.0",
       "author": { "name": "Ramzi Abdoch" },
       "homepage": "https://github.com/rmzi/branch-tone",
       "repository": "https://github.com/rmzi/branch-tone",
