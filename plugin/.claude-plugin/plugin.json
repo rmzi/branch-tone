@@ -25,7 +25,16 @@
     "ConfigChange": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
     "TaskCompleted": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
     "WorktreeCreate": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
-    "WorktreeRemove": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }]
+    "WorktreeRemove": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "StopFailure": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "PermissionDenied": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "PostCompact": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "Setup": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "TaskCreated": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "CwdChanged": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "FileChanged": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "Elicitation": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "ElicitationResult": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }]
   },
   "settings": {
     "permissions": { "allow": ["Bash(branch-tone*)"] },

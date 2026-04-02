@@ -8,16 +8,20 @@ voice signals a different aspect of the agent lifecycle.
 ```
 Voice             Hook Events                        Character
 ────────────────  ─────────────────────────────────── ──────────────────────
-Drums (kick/snr)  UserPromptSubmit, Stop              Downbeat / backbeat
-Hi-Hat (tools)    PreToolUse, PostToolUse,            Rapid micro-clicks
-                  PostToolUseFailure
+Drums (kick/snr)  UserPromptSubmit, Stop,             Downbeat / backbeat
+                  ElicitationResult
+Hi-Hat (tools)    PreToolUse, PostToolUse,            Rapid micro-clicks,
+                  PostToolUseFailure, FileChanged     tool-specific timbre
 Bass (agents)     SubagentStart, SubagentStop,        Ascending / descending
-                  WorktreeCreate, WorktreeRemove      notes (voices enter/leave)
-Keys/Pad (sess)   SessionStart, SessionEnd            Full chord bloom / fade
-Horn (attention)  PermissionRequest, Notification     Melodic phrase, look here
+                  WorktreeCreate, WorktreeRemove      notes (agent register shift)
+Keys/Pad (sess)   SessionStart, SessionEnd, Setup     Full chord bloom / fade
+Horn (attention)  PermissionRequest, Notification,    Melodic phrase, look here
+                  StopFailure, PermissionDenied,
+                  Elicitation
 Piano (lifecycle) InstructionsLoaded, ConfigChange,   Arpeggios, chord shifts,
-                  TaskCompleted, PreCompact,           resolution cadences
-                  TeammateIdle
+                  TaskCompleted, TaskCreated,          resolution cadences
+                  PreCompact, PostCompact,
+                  TeammateIdle, CwdChanged
 ```
 
 ## Event Categories
@@ -41,25 +45,82 @@ Default          1.0x    0          base    Center — fallback
 ```
 Event                Dur(ms)  Vol    Voice           Effects                      Seed
 ───────────────────  ───────  ─────  ──────────────  ───────────────────────────── ────
-SessionStart         3500     0.30   Keys/Pad        bulldozer+chorus+dub         1
-SessionEnd           3500     0.25   Keys/Pad        bulldozer+chorus+dub+reverse 4
-Stop                 400      0.12   Drums (snare)   single_hit                   3
-UserPromptSubmit     350      0.08   Drums (kick)    single_hit                   5
-PreToolUse           120      0.05   Hi-Hat (closed) single_hit                   11
-PostToolUse          150      0.05   Hi-Hat (open)   single_hit                   12
-PostToolUseFailure   250      0.08   Hi-Hat (rim)    single_hit                   13
-PermissionRequest    2500     0.18   Horn            bulldozer+chorus+dub         2
-Notification         2000     0.15   Horn            bulldozer+chorus+dub         6
-SubagentStart        1000     0.10   Bass (ascend)   pad+dub                      7
-SubagentStop         1000     0.10   Bass (descend)  pad+chorus+dub+reverse       8
-WorktreeCreate       1200     0.10   Bass (ascend)   pad+dub                      14
-WorktreeRemove       1200     0.10   Bass (descend)  pad+dub+reverse              15
-InstructionsLoaded   1500     0.10   Piano (arp)     pad+chorus+dub               16
-ConfigChange         1800     0.10   Piano (shift)   pad+tremolo+dub              17
-TaskCompleted        2500     0.15   Piano (resolve) pad+chorus+dub               18
-PreCompact           2000     0.10   Piano (sweep)   pad+chorus+dub+reverse       9
-TeammateIdle         1500     0.08   Piano (hold)    pad+chorus+dub               10
+SessionStart         3500     0.35   Keys/Pad        chorus+dub                   1
+SessionEnd           3500     0.30   Keys/Pad        chorus+dub+reverse           4
+Stop                 400      0.18   Drums (snare)   single_hit                   3
+UserPromptSubmit     350      0.12   Drums (kick)    single_hit                   5
+PreToolUse           120      0.08   Hi-Hat (closed) single_hit, tool timbre      11
+PostToolUse          150      0.08   Hi-Hat (open)   single_hit, tool timbre      12
+PostToolUseFailure   250      0.12   Hi-Hat (rim)    single_hit, error dissonance 13
+PermissionRequest    2500     0.28   Horn            chorus+dub                   2
+Notification         2000     0.22   Horn            chorus+dub                   6
+SubagentStart        1000     0.25   Bass (ascend)   dub+randomize, agent shift   7
+SubagentStop         1000     0.25   Bass (descend)  dub+reverse+randomize        8
+WorktreeCreate       1200     0.25   Bass (ascend)   dub                          14
+WorktreeRemove       1200     0.25   Bass (descend)  dub+reverse                  15
+InstructionsLoaded   1500     0.15   Piano (arp)     dub                          16
+ConfigChange         1800     0.15   Piano (shift)   dub                          17
+TaskCompleted        2500     0.22   Piano (resolve) dub                          18
+PreCompact           2000     0.15   Piano (sweep)   dub+reverse                  9
+TeammateIdle         1500     0.12   Piano (hold)    dub                          10
+StopFailure          3000     0.30   Horn (error)    dub, error dissonance        19
+PermissionDenied     1500     0.25   Horn (error)    dub, error dissonance        20
+PostCompact          2000     0.15   Piano (resolve) dub                          21
+Setup                1500     0.12   Keys/Pad        quiet opening                22
+TaskCreated          2000     0.18   Piano (ascend)  dub                          23
+CwdChanged           800      0.10   Piano (pivot)   quick                        24
+FileChanged          100      0.06   Hi-Hat (ghost)  single_hit, softest          25
+Elicitation          2000     0.22   Horn (question) dub, rising                  26
+ElicitationResult    350      0.12   Drums (answer)  single_hit                   27
 ```
+
+## Tool Timbral Mapping
+
+In the daemon, each tool type gets a unique spectral fingerprint via filter
+multiplier, detune, and harmonic flags. Every tool call stays in the repo's
+key but sounds different:
+
+```
+Tool Family        Filter   Detune  Harmonics       Character
+─────────────────  ───────  ──────  ──────────────  ────────────────────
+Read/Glob/Grep     1.4x     2¢      2nd             Bright, investigative
+Write/Edit         0.7x     1¢      fundamental     Warm, creative
+Bash               1.0x     6¢      saw boost       Aggressive, execution
+Agent              0.9x     4¢      2nd+3rd         Airy, delegation
+WebSearch/Fetch    1.3x     2¢      3rd             Distant, ethereal
+(unknown)          1.0x     0¢      none            Neutral
+```
+
+## Agent Register Mapping
+
+When bass events (SubagentStart/Stop) carry an `agent_type`, the note
+frequency is shifted to place different agents in different registers:
+
+```
+Agent Type    Shift   Register          Character
+────────────  ──────  ────────────────  ───────────────────
+researcher    0.75x   Low               Methodical scanning
+reviewer      0.875x  Low-mid           Authoritative
+documenter    0.9x    Below center      Quiet, background
+worker        1.0x    Center            Building
+auditor       1.125x  High-mid          Analytical
+validator     1.25x   High              Scrutinizing
+scout         1.5x    Highest           Quick observation
+```
+
+## Error Dissonance
+
+Events with errors (`PostToolUseFailure`, `StopFailure`, `PermissionDenied`,
+or any event carrying a non-empty `error` field) get dissonance layered on
+top of their normal sound:
+
+- **Tritone** (6 semitones up): 25% volume — the *diabolus in musica*,
+  most unstable interval in Western harmony
+- **Minor 2nd** (1 semitone up): 10% volume — tightest possible clash
+- **Pitch drop**: 15% volume — frequency descends 30% over the note's
+  duration, creating descending anxiety
+
+All three layers use exponential decay so dissonance fades quickly.
 
 ## Worktree-as-Voice
 

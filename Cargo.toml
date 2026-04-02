@@ -4,7 +4,7 @@
 
 [package]
 name = "branch-tone"
-version = "0.11.0"
+version = "0.13.1"
 edition = "2024"
 authors = ["Ramzi Abdoch"]
 description = "Generate unique musical tones from git branch names"
@@ -68,6 +68,13 @@ dirs = "5.0"
 # -----------------------------------------------------------------------------
 crossterm = "0.28"
 
+# -----------------------------------------------------------------------------
+# Ratatui - Terminal User Interface framework (immediate-mode, buffer-diffing)
+# Used by `branch-tone tui` to render a live dashboard of daemon state.
+# Uses crossterm (already a dependency) as its backend.
+# -----------------------------------------------------------------------------
+ratatui = { version = "0.29", optional = true, default-features = false, features = ["crossterm"] }
+
 # =============================================================================
 # Features - optional functionality behind feature flags
 # =============================================================================
@@ -75,6 +82,7 @@ crossterm = "0.28"
 [features]
 default = []
 tray = ["dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
+tui = ["dep:ratatui"]
 
 # =============================================================================
 # Platform-specific dependencies

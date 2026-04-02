@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.12.0] - 2026-04-01
+
+### Added
+- **Terminal dashboard** (`--features tui`): Live ratatui-powered system monitor for the daemon. Connects as a read-only client over the existing Unix socket — no audio code, no thread sync, open/close freely without affecting playback.
+- **Unified Stream panel**: Events and voices merged into a single feed. Each repo gets a stable lane color from an 8-color palette, shown as block-density prefixes (`█▓▒░`) that pulse on activity and decay over ~20 seconds.
+- **Stacked activity histogram**: 60-minute bar chart with per-category colored segments (tool=green, prompt=yellow, session=cyan, agent=blue). Direct buffer writes for cell-level color control — ratatui's Sparkline widget only supports single-color bars.
+- **Seed palette overlay**: Centered popup ([p] to open, Esc to close) showing all 16 curated seeds with groove params. Renders via `ratatui::widgets::Clear` + `List` with `ListState`.
+- **Event view reset**: Press [r] to clear displayed events and start counting fresh.
+- **Recency gradient**: Newest events flash white+bold for 2 seconds, then fade through full type color → DarkGray based on positional recency (`line_index / visible_count`).
+- **Event type parsing**: 16 hook event types mapped to 5 categories with per-type colors and compact labels (TOOL, PROMPT, START, FAIL, AGENT+, etc.).
+- **Voice activity tracking**: Per-repo Instant timestamps for real-time lane pulse effects.
+- **`docs/tui-design.md`**: Full design document with architecture, rendering techniques, and development diary.
+- 14 new TUI-specific tests (155 total with tui feature, 141 default, 142 tray)
+
+### Development Diary
+The TUI was built in a single session across three iterations:
+1. **v1 — Basic dashboard**: Split layout (voices left, seeds right, events bottom). Socket client ported from tray module. 7 tests.
+2. **v2 — Color and activity**: Event log parsing with per-type colors. 60-minute sparkline. Voice pulse indicators with block-density decay. Border flash on new events.
+3. **v3 — Unified stream**: Merged voices+events with colored lane prefixes. Stacked per-category activity bars via direct buffer writes. Seeds moved to popup overlay. Reset view. Inspired by user feedback: "Make this thing light up."
+
 ## [0.9.1] - 2026-03-14
 
 ### Added

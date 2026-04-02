@@ -9,6 +9,23 @@
     "SubagentStart": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
     "SubagentStop": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
     "PreCompact": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
-    "TeammateIdle": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }]
+    "TeammateIdle": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "PreToolUse": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "PostToolUse": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "InstructionsLoaded": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "ConfigChange": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "TaskCompleted": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "WorktreeCreate": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "WorktreeRemove": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "StopFailure": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "PermissionDenied": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "PostCompact": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "Setup": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "TaskCreated": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "CwdChanged": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "FileChanged": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "Elicitation": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }],
+    "ElicitationResult": [{ "hooks": [{ "type": "command", "command": "branch-tone hook", "async": true }] }]
   }
 }
