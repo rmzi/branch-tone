@@ -7365,6 +7365,7 @@ mod tui_app {
         rect_stream: Rect,
         rect_status: Rect,
         activity_cols: usize,  // last-known inner width for activity panel
+        activity_height: u16,  // user-adjustable height for activity panel (default 7)
         last_poll: Instant,
     }
 
@@ -7393,6 +7394,7 @@ mod tui_app {
                 rect_stream: Rect::default(),
                 rect_status: Rect::default(),
                 activity_cols: 80, // reasonable default until first render
+                activity_height: 7, // default activity panel height
                 last_poll: Instant::now() - Duration::from_secs(10),
             }
         }
@@ -7575,6 +7577,16 @@ mod tui_app {
                 Action::Continue
             }
 
+            // Panel resize: [ shrinks activity, ] grows it
+            KeyCode::Char('[') => {
+                state.activity_height = state.activity_height.saturating_sub(1).max(5);
+                Action::Continue
+            }
+            KeyCode::Char(']') => {
+                state.activity_height = (state.activity_height + 1).min(10);
+                Action::Continue
+            }
+
             // Stream scrolling
             KeyCode::Char('j') | KeyCode::Down => {
                 state.stream_scroll = state.stream_scroll.saturating_sub(1);
@@ -7739,10 +7751,10 @@ mod tui_app {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),   // status bar
-                Constraint::Length(5),   // activity bars (per-category)
-                Constraint::Min(8),     // merged voice+events stream
-                Constraint::Length(1),   // keybind footer
+                Constraint::Length(3),                       // status bar
+                Constraint::Length(state.activity_height),   // activity (resizable)
+                Constraint::Min(8),                         // stream (fills remaining)
+                Constraint::Length(1),                       // keybind footer
             ])
             .split(area);
 
@@ -7871,23 +7883,22 @@ mod tui_app {
         let offset_secs = state.time_offset as u64 * bucket_secs;
         let y_label = inner.y + inner.height - 1;
 
-        // Place ~4-5 evenly spaced time labels
+        // Place evenly spaced absolute time labels (HH:MM format)
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let label_count = (num_cols / 12).max(2).min(6);
         for li in 0..label_count {
             let col = if label_count <= 1 { num_cols - 1 }
                 else { li * (num_cols - 1) / (label_count - 1) };
-            // Time for this column: rightmost col = now - offset, leftmost = now - offset - window
             let cols_from_right = (num_cols - 1).saturating_sub(col) as u64;
             let secs_ago = offset_secs + cols_from_right * bucket_secs;
-            let label = if secs_ago == 0 {
-                "now".to_string()
-            } else if secs_ago < 60 {
-                format!("-{}s", secs_ago)
-            } else if secs_ago < 3600 {
-                format!("-{}m", secs_ago / 60)
-            } else {
-                format!("-{}h", secs_ago / 3600)
-            };
+            let epoch_at_col = now_epoch.saturating_sub(secs_ago);
+            // Convert epoch to HH:MM (local-ish: UTC for simplicity, matches log timestamps)
+            let h = (epoch_at_col / 3600) % 24;
+            let m = (epoch_at_col / 60) % 60;
+            let label = format!("{:02}:{:02}", h, m);
             let start_x = inner.x + col as u16;
             for (ci, ch) in label.chars().enumerate() {
                 let x = start_x + ci as u16;
@@ -8023,6 +8034,8 @@ mod tui_app {
             Span::styled(" [p]alette ", Style::default().fg(Color::Yellow)),
             Span::styled("│", Style::default().fg(Color::DarkGray)),
             Span::styled(" [+/-]zoom ", Style::default().fg(Color::White)),
+            Span::styled("│", Style::default().fg(Color::DarkGray)),
+            Span::styled(" [/]resize ", Style::default().fg(Color::White)),
             Span::styled("│", Style::default().fg(Color::DarkGray)),
             Span::styled(" [q]uit ", Style::default().fg(Color::White)),
         ]);
