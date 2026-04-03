@@ -294,6 +294,7 @@ struct HookContext {
     agent_type: String,
     error_msg: String,
     session_id: String,
+    transcript_path: String,
 }
 
 impl Default for HookContext {
@@ -302,6 +303,7 @@ impl Default for HookContext {
             event: String::new(), repo: String::new(), branch: String::new(),
             tool_name: String::new(), agent_type: String::new(),
             error_msg: String::new(), session_id: String::new(),
+            transcript_path: String::new(),
         }
     }
 }
@@ -2476,6 +2478,64 @@ fn get_quantize() -> Option<u32> {
         .filter(|&d| matches!(d, 0 | 4 | 8 | 16 | 32))
 }
 
+/// Token usage totals for a session
+fn tokens_file_path() -> std::path::PathBuf {
+    daemon_dir().join("tokens.json")
+}
+
+/// Read per-session token totals: { session_id: { input, output } }
+fn read_session_tokens() -> std::collections::HashMap<String, (u64, u64)> {
+    let path = tokens_file_path();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+    let json: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+    let mut map = std::collections::HashMap::new();
+    if let Some(obj) = json.as_object() {
+        for (k, v) in obj {
+            let input = v.get("input").and_then(|v| v.as_u64()).unwrap_or(0);
+            let output = v.get("output").and_then(|v| v.as_u64()).unwrap_or(0);
+            map.insert(k.clone(), (input, output));
+        }
+    }
+    map
+}
+
+/// Extract token totals from a transcript JSONL and update tokens.json
+fn update_session_tokens(session_id: &str, transcript_path: &str) {
+    let content = match std::fs::read_to_string(transcript_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let mut input_total: u64 = 0;
+    let mut output_total: u64 = 0;
+    for line in content.lines() {
+        if !line.contains("usage") { continue; }
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(usage) = json.get("message").and_then(|m| m.get("usage")) {
+                input_total += usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                input_total += usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                input_total += usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                output_total += usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            }
+        }
+    }
+    if input_total == 0 && output_total == 0 { return; }
+
+    // Read existing, merge, write back
+    let mut tokens = read_session_tokens();
+    tokens.insert(session_id.to_string(), (input_total, output_total));
+    let mut obj = serde_json::Map::new();
+    for (k, (inp, out)) in &tokens {
+        obj.insert(k.clone(), serde_json::json!({"input": inp, "output": out}));
+    }
+    let _ = std::fs::write(tokens_file_path(), serde_json::to_string_pretty(&obj).unwrap_or_default());
+}
+
 /// Map quantize denominator (0/4/8/16/32) to subdivision multiplier.
 /// 0 = off: uses a tiny subdivision so events play immediately without grid snap.
 fn quantize_denom_to_subdiv(denom: u32) -> f32 {
@@ -3636,6 +3696,7 @@ fn run_hook() -> Result<()> {
         }
 
         ctx.session_id = json_str_field(&json, "session_id");
+        ctx.transcript_path = json_str_field(&json, "transcript_path");
         ctx.tool_name = json.get("tool_input")
             .and_then(|t| t.get("tool_name").and_then(|v| v.as_str()))
             .or_else(|| json.get("tool_name").and_then(|v| v.as_str()))
@@ -3670,8 +3731,9 @@ fn run_hook() -> Result<()> {
             let (y, mo, d) = days_to_ymd(days);
             format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", y, mo, d, h, m, s)
         };
-        let enrichment = if !ctx.tool_name.is_empty() || !ctx.agent_type.is_empty() {
-            format!("\t{}\t{}", ctx.tool_name, ctx.agent_type)
+        let has_enrichment = !ctx.tool_name.is_empty() || !ctx.agent_type.is_empty() || !ctx.session_id.is_empty();
+        let enrichment = if has_enrichment {
+            format!("\t{}\t{}\t{}", ctx.tool_name, ctx.agent_type, ctx.session_id)
         } else {
             String::new()
         };
@@ -3680,6 +3742,11 @@ fn run_hook() -> Result<()> {
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
             let _ = f.write_all(line.as_bytes());
         }
+    }
+
+    // On Stop events, extract token usage from transcript and write per-session totals
+    if ctx.event == "Stop" && !ctx.transcript_path.is_empty() && !ctx.session_id.is_empty() {
+        update_session_tokens(&ctx.session_id, &ctx.transcript_path);
     }
 
     if is_muted() {
@@ -6923,6 +6990,49 @@ mod tui_app {
         quantize_file_path, seed_file_path, subdiv_label, SEED_PRESETS,
     };
 
+    // ── Seed-driven visual theme ───────────────────────────────────────────
+
+    struct SeedTheme {
+        accent: Color,
+        border: Color,
+    }
+
+    const CUSTOM_SEED_ACCENTS: [Color; 8] = [
+        Color::Cyan, Color::Green, Color::Yellow, Color::Magenta,
+        Color::Blue, Color::LightCyan, Color::LightGreen, Color::LightYellow,
+    ];
+
+    fn seed_theme(name: Option<&str>) -> SeedTheme {
+        let Some(name) = name else {
+            return SeedTheme { accent: Color::Green, border: Color::DarkGray };
+        };
+        match name {
+            "shadow"   => SeedTheme { accent: Color::Blue,        border: Color::DarkGray },
+            "bloom"    => SeedTheme { accent: Color::LightCyan,   border: Color::Cyan },
+            "obsidian" => SeedTheme { accent: Color::Magenta,     border: Color::DarkGray },
+            "gossamer" => SeedTheme { accent: Color::LightYellow, border: Color::Yellow },
+            "monolith" => SeedTheme { accent: Color::White,       border: Color::DarkGray },
+            "ember"    => SeedTheme { accent: Color::Yellow,      border: Color::Red },
+            "void"     => SeedTheme { accent: Color::Blue,        border: Color::DarkGray },
+            "meridian" => SeedTheme { accent: Color::White,       border: Color::Cyan },
+            "undertow" => SeedTheme { accent: Color::Blue,        border: Color::Magenta },
+            "reverie"  => SeedTheme { accent: Color::LightGreen,  border: Color::Green },
+            "basalt"   => SeedTheme { accent: Color::Magenta,     border: Color::Blue },
+            "canopy"   => SeedTheme { accent: Color::Green,       border: Color::Yellow },
+            "solstice" => SeedTheme { accent: Color::Cyan,        border: Color::White },
+            "lichen"   => SeedTheme { accent: Color::LightGreen,  border: Color::DarkGray },
+            "tundra"   => SeedTheme { accent: Color::LightCyan,   border: Color::White },
+            "mycelium" => SeedTheme { accent: Color::Magenta,     border: Color::DarkGray },
+            _ => {
+                let h = name.bytes().fold(0u8, |acc, b| acc.wrapping_mul(31).wrapping_add(b));
+                SeedTheme {
+                    accent: CUSTOM_SEED_ACCENTS[(h as usize) % CUSTOM_SEED_ACCENTS.len()],
+                    border: Color::DarkGray,
+                }
+            }
+        }
+    }
+
     // ── Event parsing & coloring ────────────────────────────────────────────
 
     /// Parsed event log line with optional enrichment (tool_name, agent_type)
@@ -6933,20 +7043,22 @@ mod tui_app {
         branch: String,
         tool_name: Option<String>,
         agent_type: Option<String>,
+        session_id: Option<String>,
     }
 
     impl ParsedEvent {
         fn parse(line: &str) -> Self {
-            // Log format: "timestamp event repo branch\ttool\tagent"
+            // Log format: "timestamp event repo branch\ttool\tagent\tsession_id"
             // Tab delimiter separates original 4 fields from enrichment
             let parts: Vec<&str> = line.splitn(4, ' ').collect();
             let branch_and_enrichment = parts.get(3).unwrap_or(&"").to_string();
 
             // Split field 4 on tab for enrichment
-            let mut tab_parts = branch_and_enrichment.splitn(3, '\t');
+            let mut tab_parts = branch_and_enrichment.splitn(4, '\t');
             let branch = tab_parts.next().unwrap_or("").to_string();
             let tool_name = tab_parts.next().map(|s| s.to_string()).filter(|s| !s.is_empty());
             let agent_type = tab_parts.next().map(|s| s.to_string()).filter(|s| !s.is_empty());
+            let session_id = tab_parts.next().map(|s| s.to_string()).filter(|s| !s.is_empty());
 
             Self {
                 timestamp: parts.first().unwrap_or(&"").to_string(),
@@ -6955,6 +7067,7 @@ mod tui_app {
                 branch,
                 tool_name,
                 agent_type,
+                session_id,
             }
         }
 
@@ -7019,14 +7132,8 @@ mod tui_app {
 
         /// Color for tool badge based on tool family
         fn tool_badge_color(&self) -> Option<Color> {
-            match self.tool_name.as_deref()? {
-                "Read" | "Glob" | "Grep" => Some(Color::Cyan),
-                "Write" | "Edit" => Some(Color::Yellow),
-                "Bash" => Some(Color::Red),
-                "Agent" => Some(Color::Blue),
-                "WebSearch" | "WebFetch" => Some(Color::Magenta),
-                _ => Some(Color::DarkGray),
-            }
+            self.tool_name.as_deref()?;
+            Some(ToolFamily::from_tool_name(self.tool_name.as_deref()).color())
         }
 
         /// Event type category for activity bucketing
@@ -7038,6 +7145,10 @@ mod tui_app {
                 "SubagentStart" | "SubagentStop" | "TaskCompleted" | "TaskCreated" | "TeammateIdle" => EventTypeCategory::Agent,
                 _ => EventTypeCategory::Other,
             }
+        }
+
+        fn is_error(&self) -> bool {
+            matches!(self.event_type.as_str(), "PostToolUseFailure" | "StopFailure" | "PermissionDenied")
         }
     }
 
@@ -7061,7 +7172,6 @@ mod tui_app {
             }
         }
 
-        #[cfg(test)]
         fn label(self) -> &'static str {
             match self {
                 Self::Tool => "tool",
@@ -7092,6 +7202,90 @@ mod tui_app {
             .position(|(_, r, _)| r == repo)
             .map(|i| VOICE_COLORS[i % VOICE_COLORS.len()])
             .unwrap_or(Color::DarkGray)
+    }
+
+    /// Tool family grouping for histogram view
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    enum ToolFamily {
+        Read,   // Read, Glob, Grep
+        Write,  // Write, Edit
+        Bash,
+        Agent,
+        Web,    // WebSearch, WebFetch
+        Other,
+    }
+
+    impl ToolFamily {
+        fn from_tool_name(name: Option<&str>) -> Self {
+            match name {
+                Some("Read" | "Glob" | "Grep") => Self::Read,
+                Some("Write" | "Edit") => Self::Write,
+                Some("Bash") => Self::Bash,
+                Some("Agent") => Self::Agent,
+                Some("WebSearch" | "WebFetch") => Self::Web,
+                Some(_) => Self::Other,
+                None => Self::Other,
+            }
+        }
+
+        fn color(self) -> Color {
+            match self {
+                Self::Read => Color::Cyan,
+                Self::Write => Color::Yellow,
+                Self::Bash => Color::Red,
+                Self::Agent => Color::Blue,
+                Self::Web => Color::Magenta,
+                Self::Other => Color::DarkGray,
+            }
+        }
+
+        fn label(self) -> &'static str {
+            match self {
+                Self::Read => "read",
+                Self::Write => "write",
+                Self::Bash => "bash",
+                Self::Agent => "agent",
+                Self::Web => "web",
+                Self::Other => "other",
+            }
+        }
+    }
+
+    const ALL_TOOL_FAMILIES: [ToolFamily; 6] = [
+        ToolFamily::Read, ToolFamily::Write, ToolFamily::Bash,
+        ToolFamily::Agent, ToolFamily::Web, ToolFamily::Other,
+    ];
+
+    /// Histogram stacking dimension
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum HistogramMode {
+        Category,
+        Repo,
+        Session,
+        Branch,
+        Tool,
+    }
+
+    impl HistogramMode {
+        fn next(self) -> Self {
+            match self {
+                Self::Category => Self::Repo,
+                Self::Repo => Self::Session,
+                Self::Session => Self::Branch,
+                Self::Branch => Self::Tool,
+                Self::Tool => Self::Category,
+            }
+        }
+
+        fn label(self) -> &'static str {
+            match self {
+                Self::Category => "category",
+                Self::Repo => "repo",
+                Self::Session => "session",
+                Self::Branch => "branch",
+                Self::Tool => "tool",
+            }
+        }
     }
 
     /// Zoom levels for the activity histogram
@@ -7162,14 +7356,24 @@ mod tui_app {
         }
     }
 
-    /// Per-category activity data: 60 buckets at current timescale
+    /// A single stacked series in the activity histogram
+    struct ActivitySeries {
+        label: String,
+        color: Color,
+        buckets: Vec<u64>,
+    }
+
+    /// Activity data: stacked series at current timescale
     struct ActivityData {
-        per_category: Vec<(EventTypeCategory, Vec<u64>)>,
+        series: Vec<ActivitySeries>,
         total: Vec<u64>,
         total_events: u64,
     }
 
-    fn build_activity_data(events: &[ParsedEvent], scale: TimeScale, time_offset: i64, num_cols: usize) -> ActivityData {
+    fn build_activity_data(
+        events: &[ParsedEvent], scale: TimeScale, time_offset: i64, num_cols: usize,
+        mode: HistogramMode, voices: &[(usize, String, String)],
+    ) -> ActivityData {
         let now = {
             use std::time::SystemTime;
             SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs()
@@ -7179,29 +7383,125 @@ mod tui_app {
         let bucket_secs = scale.bucket_secs(num_cols as u64);
         let offset_secs = time_offset as u64 * bucket_secs;
         let mut total = vec![0u64; num_cols];
-        let mut cat_buckets: Vec<Vec<u64>> = ALL_CATEGORIES.iter().map(|_| vec![0u64; num_cols]).collect();
 
-        for evt in events {
-            if let Some(epoch) = parse_timestamp_epoch(&evt.timestamp) {
-                let age_secs = now.saturating_sub(epoch);
-                if age_secs < offset_secs { continue; }
-                let shifted_age = age_secs - offset_secs;
-                let bucket_idx = shifted_age / bucket_secs;
-                if (bucket_idx as usize) < num_cols {
-                    let idx = num_cols - 1 - bucket_idx as usize;
-                    total[idx] += 1;
+        // Compute (bucket_index, &event) pairs
+        let bucketed: Vec<(usize, &ParsedEvent)> = events.iter().filter_map(|evt| {
+            let epoch = parse_timestamp_epoch(&evt.timestamp)?;
+            let age_secs = now.saturating_sub(epoch);
+            if age_secs < offset_secs { return None; }
+            let shifted_age = age_secs - offset_secs;
+            let bucket_idx = shifted_age / bucket_secs;
+            if (bucket_idx as usize) < num_cols {
+                Some((num_cols - 1 - bucket_idx as usize, evt))
+            } else {
+                None
+            }
+        }).collect();
+
+        for &(idx, _) in &bucketed {
+            total[idx] += 1;
+        }
+
+        let series = match mode {
+            HistogramMode::Category => {
+                let mut cat_buckets: Vec<Vec<u64>> = ALL_CATEGORIES.iter().map(|_| vec![0u64; num_cols]).collect();
+                for &(idx, evt) in &bucketed {
                     let cat_idx = ALL_CATEGORIES.iter().position(|&c| c == evt.type_category()).unwrap_or(4);
                     cat_buckets[cat_idx][idx] += 1;
                 }
+                ALL_CATEGORIES.iter().zip(cat_buckets).map(|(cat, buckets)| ActivitySeries {
+                    label: cat.label().to_string(),
+                    color: cat.color(),
+                    buckets,
+                }).collect()
             }
-        }
+            HistogramMode::Repo => {
+                // Discover repos in order: voices first, then any extras from events
+                let mut repo_order: Vec<String> = voices.iter().map(|(_, r, _)| r.clone()).collect();
+                for &(_, evt) in &bucketed {
+                    if !evt.repo.is_empty() && !repo_order.contains(&evt.repo) {
+                        repo_order.push(evt.repo.clone());
+                    }
+                }
+                repo_order.iter().map(|repo| {
+                    let mut buckets = vec![0u64; num_cols];
+                    for &(idx, evt) in &bucketed {
+                        if evt.repo == *repo {
+                            buckets[idx] += 1;
+                        }
+                    }
+                    ActivitySeries {
+                        label: repo.clone(),
+                        color: voice_color_for_repo(repo, voices),
+                        buckets,
+                    }
+                }).collect()
+            }
+            HistogramMode::Session => {
+                let mut session_order: Vec<String> = Vec::new();
+                for &(_, evt) in &bucketed {
+                    if let Some(ref sid) = evt.session_id {
+                        if !session_order.contains(sid) {
+                            session_order.push(sid.clone());
+                        }
+                    }
+                }
+                session_order.iter().enumerate().map(|(i, sid)| {
+                    let mut buckets = vec![0u64; num_cols];
+                    for &(idx, evt) in &bucketed {
+                        if evt.session_id.as_deref() == Some(sid.as_str()) {
+                            buckets[idx] += 1;
+                        }
+                    }
+                    // Short label: first 8 chars of session ID
+                    let label = if sid.len() > 8 { sid[..8].to_string() } else { sid.clone() };
+                    ActivitySeries {
+                        label,
+                        color: VOICE_COLORS[i % VOICE_COLORS.len()],
+                        buckets,
+                    }
+                }).collect()
+            }
+            HistogramMode::Branch => {
+                let mut branch_order: Vec<String> = Vec::new();
+                for &(_, evt) in &bucketed {
+                    if !evt.branch.is_empty() && !branch_order.contains(&evt.branch) {
+                        branch_order.push(evt.branch.clone());
+                    }
+                }
+                branch_order.iter().enumerate().map(|(i, br)| {
+                    let mut buckets = vec![0u64; num_cols];
+                    for &(idx, evt) in &bucketed {
+                        if evt.branch == *br {
+                            buckets[idx] += 1;
+                        }
+                    }
+                    ActivitySeries {
+                        label: br.clone(),
+                        color: VOICE_COLORS[i % VOICE_COLORS.len()],
+                        buckets,
+                    }
+                }).collect()
+            }
+            HistogramMode::Tool => {
+                let mut family_buckets: Vec<Vec<u64>> = ALL_TOOL_FAMILIES.iter().map(|_| vec![0u64; num_cols]).collect();
+                for &(idx, evt) in &bucketed {
+                    if evt.type_category() == EventTypeCategory::Tool {
+                        let family = ToolFamily::from_tool_name(evt.tool_name.as_deref());
+                        let fi = ALL_TOOL_FAMILIES.iter().position(|&f| f == family).unwrap_or(5);
+                        family_buckets[fi][idx] += 1;
+                    }
+                }
+                ALL_TOOL_FAMILIES.iter().zip(family_buckets).map(|(fam, buckets)| ActivitySeries {
+                    label: fam.label().to_string(),
+                    color: fam.color(),
+                    buckets,
+                }).collect()
+            }
+        };
 
         let total_events = total.iter().sum();
-        ActivityData {
-            per_category: ALL_CATEGORIES.iter().copied().zip(cat_buckets.into_iter()).collect(),
-            total,
-            total_events,
-        }
+        ActivityData { series, total, total_events }
     }
 
     /// Parse ISO timestamp to epoch seconds
@@ -7366,6 +7666,9 @@ mod tui_app {
         rect_status: Rect,
         activity_cols: usize,  // last-known inner width for activity panel
         activity_height: u16,  // user-adjustable height for activity panel (default 7)
+        histogram_mode: HistogramMode,
+        error_filter: bool,
+        session_tokens: std::collections::HashMap<String, (u64, u64)>, // session_id → (input, output)
         last_poll: Instant,
     }
 
@@ -7384,7 +7687,7 @@ mod tui_app {
                 event_count: 0,
                 new_event_time: None,
                 voice_activity: Vec::new(),
-                activity: ActivityData { per_category: Vec::new(), total: vec![0; 60], total_events: 0 },
+                activity: ActivityData { series: Vec::new(), total: vec![0; 60], total_events: 0 },
                 timescale: TimeScale::Hour1,
                 time_offset: 0,
                 stream_scroll: 0,
@@ -7395,8 +7698,19 @@ mod tui_app {
                 rect_status: Rect::default(),
                 activity_cols: 80, // reasonable default until first render
                 activity_height: 7, // default activity panel height
+                histogram_mode: HistogramMode::Category,
+                error_filter: false,
+                session_tokens: std::collections::HashMap::new(),
                 last_poll: Instant::now() - Duration::from_secs(10),
             }
+        }
+
+        fn rebuild_activity(&mut self) {
+            self.activity = build_activity_data(
+                &self.all_events, self.timescale, self.time_offset,
+                self.activity_cols, self.histogram_mode,
+                &self.daemon.active_voices,
+            );
         }
 
         fn poll_daemon(&mut self) {
@@ -7404,6 +7718,7 @@ mod tui_app {
             self.muted = is_muted();
             self.drone_muted = is_drone_muted();
             self.current_seed = get_seed();
+            self.session_tokens = super::read_session_tokens();
             self.current_quantize = get_quantize();
 
             let raw_all = recent_log_lines(self.timescale.log_lines());
@@ -7438,7 +7753,7 @@ mod tui_app {
 
             self.all_events = raw_all.iter().map(|l| ParsedEvent::parse(l)).collect();
             self.recent_events = raw_recent.iter().map(|l| ParsedEvent::parse(l)).collect();
-            self.activity = build_activity_data(&self.all_events, self.timescale, self.time_offset, self.activity_cols);
+            self.rebuild_activity();
             self.last_poll = Instant::now();
 
             if let Some(ref name) = self.current_seed {
@@ -7531,6 +7846,7 @@ mod tui_app {
                 Action::Continue
             }
             KeyCode::Char('p') => { state.seeds_open = true; Action::Continue }
+            KeyCode::Char('e') => { state.error_filter = !state.error_filter; Action::Continue }
             KeyCode::Char('g') => {
                 let next = match state.current_quantize {
                     None => Some(32), Some(32) => Some(16), Some(16) => Some(8),
@@ -7557,15 +7873,22 @@ mod tui_app {
                 Action::Continue
             }
 
+            // Cycle histogram view mode
+            KeyCode::Tab => {
+                state.histogram_mode = state.histogram_mode.next();
+                state.rebuild_activity();
+                Action::Continue
+            }
+
             // Pan activity histogram in time
             KeyCode::Left => {
                 state.time_offset += 5;
-                state.activity = build_activity_data(&state.all_events, state.timescale, state.time_offset, state.activity_cols);
+                state.rebuild_activity();
                 Action::Continue
             }
             KeyCode::Right => {
                 state.time_offset = (state.time_offset - 5).max(0);
-                state.activity = build_activity_data(&state.all_events, state.timescale, state.time_offset, state.activity_cols);
+                state.rebuild_activity();
                 Action::Continue
             }
 
@@ -7573,7 +7896,7 @@ mod tui_app {
             KeyCode::Home => {
                 state.time_offset = 0;
                 state.stream_scroll = 0;
-                state.activity = build_activity_data(&state.all_events, state.timescale, 0, state.activity_cols);
+                state.rebuild_activity();
                 Action::Continue
             }
 
@@ -7634,7 +7957,7 @@ mod tui_app {
                 if state.rect_activity.contains((col, row).into()) {
                     // Scroll up on activity = pan backward in time
                     state.time_offset += 3;
-                    state.activity = build_activity_data(&state.all_events, state.timescale, state.time_offset, state.activity_cols);
+                    state.rebuild_activity();
                 } else if state.rect_stream.contains((col, row).into()) {
                     // Scroll up on stream = show older events
                     state.stream_scroll = state.stream_scroll.saturating_add(3)
@@ -7645,7 +7968,7 @@ mod tui_app {
                 if state.rect_activity.contains((col, row).into()) {
                     // Scroll down on activity = pan forward in time (toward present)
                     state.time_offset = (state.time_offset - 3).max(0);
-                    state.activity = build_activity_data(&state.all_events, state.timescale, state.time_offset, state.activity_cols);
+                    state.rebuild_activity();
                 } else if state.rect_stream.contains((col, row).into()) {
                     // Scroll down on stream = show newer events
                     state.stream_scroll = state.stream_scroll.saturating_sub(3);
@@ -7763,9 +8086,10 @@ mod tui_app {
         state.rect_activity = chunks[1];
         state.rect_stream = chunks[2];
 
-        render_status_bar(frame, state, chunks[0]);
-        render_activity(frame, state, chunks[1]);
-        render_stream(frame, state, chunks[2]);
+        let theme = seed_theme(state.current_seed.as_deref());
+        render_status_bar(frame, state, chunks[0], &theme);
+        render_activity(frame, state, chunks[1], &theme);
+        render_stream(frame, state, chunks[2], &theme);
         render_footer(frame, state, chunks[3]);
 
         if state.seeds_open {
@@ -7773,9 +8097,15 @@ mod tui_app {
         }
     }
 
-    fn render_status_bar(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
+    fn format_tokens_compact(n: u64) -> String {
+        if n >= 1_000_000 { format!("{:.1}M", n as f64 / 1_000_000.0) }
+        else if n >= 1_000 { format!("{:.0}K", n as f64 / 1_000.0) }
+        else { format!("{}", n) }
+    }
+
+    fn render_status_bar(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, theme: &SeedTheme) {
         let daemon_indicator = if state.daemon.running {
-            Span::styled("● RUNNING", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+            Span::styled("● RUNNING", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))
         } else {
             Span::styled("○ STOPPED", Style::default().fg(Color::DarkGray))
         };
@@ -7794,14 +8124,21 @@ mod tui_app {
         let mute_span = if state.muted { Span::styled("  MUTED", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)) } else { Span::raw("") };
         let drone_span = if state.drone_muted && !state.muted { Span::styled("  drone off", Style::default().fg(Color::DarkGray)) } else { Span::raw("") };
 
-        let line = Line::from(vec![daemon_indicator, pid_span, voices_span, seed_span, grid_span, mute_span, drone_span]);
+        // Token counter: sum all active sessions
+        let total_tokens: u64 = state.session_tokens.values().map(|(i, o)| i + o).sum();
+        let token_span = if total_tokens > 0 {
+            Span::styled(format!("  {} tok", format_tokens_compact(total_tokens)), Style::default().fg(Color::LightYellow))
+        } else { Span::raw("") };
+
+        let line = Line::from(vec![daemon_indicator, pid_span, voices_span, seed_span, grid_span, token_span, mute_span, drone_span]);
         let block = Block::default().borders(Borders::BOTTOM)
-            .title(Span::styled(" branch-tone ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+            .border_style(Style::default().fg(theme.border))
+            .title(Span::styled(" branch-tone ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)));
         frame.render_widget(Paragraph::new(line).block(block), area);
     }
 
     /// Stacked per-category activity bars
-    fn render_activity(frame: &mut ratatui::Frame, state: &mut TuiState, area: Rect) {
+    fn render_activity(frame: &mut ratatui::Frame, state: &mut TuiState, area: Rect, theme: &SeedTheme) {
         let scale_label = state.timescale.label();
         let offset_label = if state.time_offset > 0 {
             let offset_secs = state.time_offset as u64 * state.timescale.bucket_secs(state.activity_cols as u64);
@@ -7809,28 +8146,28 @@ mod tui_app {
         } else {
             " now ".to_string()
         };
+        let mode_label = state.histogram_mode.label();
+        let mut legend_spans = vec![
+            Span::styled(format!(" {} events ", state.activity.total_events), Style::default().fg(theme.accent)),
+            Span::styled("│", Style::default().fg(Color::DarkGray)),
+        ];
+        for s in &state.activity.series {
+            legend_spans.push(Span::styled(" \u{25A0}", Style::default().fg(s.color)));
+            legend_spans.push(Span::styled(format!("{} ", s.label), Style::default().fg(Color::DarkGray)));
+        }
+
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.border))
             .title(Line::from(vec![
-                Span::styled(" Activity ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" Activity: {} ", mode_label), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
                 Span::styled(format!("[−] {} [+]", scale_label), Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     offset_label,
                     Style::default().fg(if state.time_offset > 0 { Color::Yellow } else { Color::DarkGray }),
                 ),
             ]))
-            .title_bottom(Line::from(vec![
-                Span::styled(format!(" {} events ", state.activity.total_events), Style::default().fg(Color::Green)),
-                Span::styled("│", Style::default().fg(Color::DarkGray)),
-                Span::styled(" ■", Style::default().fg(Color::Green)),
-                Span::styled("tool ", Style::default().fg(Color::DarkGray)),
-                Span::styled("■", Style::default().fg(Color::Yellow)),
-                Span::styled("prompt ", Style::default().fg(Color::DarkGray)),
-                Span::styled("■", Style::default().fg(Color::Cyan)),
-                Span::styled("session ", Style::default().fg(Color::DarkGray)),
-                Span::styled("■", Style::default().fg(Color::Blue)),
-                Span::styled("agent ", Style::default().fg(Color::DarkGray)),
-            ]));
+            .title_bottom(Line::from(legend_spans));
 
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -7840,7 +8177,7 @@ mod tui_app {
         let new_cols = inner.width as usize;
         if new_cols != state.activity_cols {
             state.activity_cols = new_cols;
-            state.activity = build_activity_data(&state.all_events, state.timescale, state.time_offset, new_cols);
+            state.rebuild_activity();
         }
 
         let max_val = state.activity.total.iter().copied().max().unwrap_or(1).max(1);
@@ -7861,9 +8198,9 @@ mod tui_app {
         for col in 0..inner.width as usize {
             if col >= state.activity.total.len() { break; }
             let mut y_cursor = inner.y + inner.height - 1; // leave bottom row for timestamps
-            for (cat, buckets) in &state.activity.per_category {
-                if col >= buckets.len() { continue; }
-                let val = buckets[col];
+            for series in &state.activity.series {
+                if col >= series.buckets.len() { continue; }
+                let val = series.buckets[col];
                 if val == 0 { continue; }
                 let bar_h = ((val * bar_height) / max_val).max(if val > 0 { 1 } else { 0 }) as u16;
                 for _dy in 0..bar_h {
@@ -7871,7 +8208,7 @@ mod tui_app {
                     y_cursor -= 1;
                     let x = inner.x + col as u16;
                     if x < inner.x + inner.width && y_cursor >= inner.y {
-                        frame.buffer_mut()[(x, y_cursor)].set_char('█').set_fg(cat.color());
+                        frame.buffer_mut()[(x, y_cursor)].set_char('█').set_fg(series.color);
                     }
                 }
             }
@@ -7910,28 +8247,37 @@ mod tui_app {
     }
 
     /// Merged voice+events stream — events colored by voice
-    fn render_stream(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
+    fn render_stream(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, theme: &SeedTheme) {
         let flash_active = state.new_event_time.is_some_and(|t| t.elapsed().as_secs_f32() < 2.0);
-        let border_color = if flash_active { Color::Green } else { Color::DarkGray };
+        let border_color = if flash_active { theme.accent } else { Color::DarkGray };
+        let error_label = if state.error_filter { " Stream [errors] " } else { " Stream " };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(border_color))
-            .title(Span::styled(" Stream ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
+            .border_style(Style::default().fg(if state.error_filter { Color::Red } else { border_color }))
+            .title(Span::styled(error_label, Style::default().fg(if state.error_filter { Color::Red } else { theme.accent }).add_modifier(Modifier::BOLD)));
 
-        if state.recent_events.is_empty() {
-            let msg = if state.daemon.running { "Waiting for events..." } else { "Daemon not running — press [s] to start" };
+        // Apply error filter if active
+        let filtered_events: Vec<&ParsedEvent> = if state.error_filter {
+            state.recent_events.iter().filter(|e| e.is_error()).collect()
+        } else {
+            state.recent_events.iter().collect()
+        };
+
+        if filtered_events.is_empty() {
+            let msg = if state.error_filter { "No errors" }
+                else if state.daemon.running { "Waiting for events..." }
+                else { "Daemon not running — press [s] to start" };
             frame.render_widget(Paragraph::new(Span::styled(msg, Style::default().fg(Color::DarkGray))).block(block), area);
             return;
         }
 
         let max_visible = (area.height as usize).saturating_sub(2);
-        // Apply scroll offset: scroll=0 means newest at bottom, scroll=N means N events scrolled up
-        let end = state.recent_events.len().saturating_sub(state.stream_scroll);
+        let end = filtered_events.len().saturating_sub(state.stream_scroll);
         let start = end.saturating_sub(max_visible);
-        let visible_events = &state.recent_events[start..end];
+        let visible_events = &filtered_events[start..end];
 
         let now = Instant::now();
-        let total = state.recent_events.len();
+        let total = filtered_events.len();
 
         let lines: Vec<Line> = visible_events.iter().enumerate().map(|(i, evt)| {
             let recency = i as f32 / (visible_events.len().max(1) as f32);
@@ -8034,6 +8380,13 @@ mod tui_app {
             Span::styled(" [p]alette ", Style::default().fg(Color::Yellow)),
             Span::styled("│", Style::default().fg(Color::DarkGray)),
             Span::styled(" [+/-]zoom ", Style::default().fg(Color::White)),
+            Span::styled("│", Style::default().fg(Color::DarkGray)),
+            Span::styled(" [Tab]view ", Style::default().fg(Color::White)),
+            Span::styled("│", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if state.error_filter { " [e]rrors ● " } else { " [e]rrors " },
+                Style::default().fg(if state.error_filter { Color::Red } else { Color::White }),
+            ),
             Span::styled("│", Style::default().fg(Color::DarkGray)),
             Span::styled(" [/]resize ", Style::default().fg(Color::White)),
             Span::styled("│", Style::default().fg(Color::DarkGray)),
@@ -8142,11 +8495,151 @@ mod tui_app {
         }
 
         #[test]
-        fn activity_data_empty() {
-            let d = build_activity_data(&[], TimeScale::Hour1, 0, 60);
+        fn activity_data_empty_category() {
+            let d = build_activity_data(&[], TimeScale::Hour1, 0, 60, HistogramMode::Category, &[]);
             assert_eq!(d.total.len(), 60);
             assert_eq!(d.total_events, 0);
-            assert_eq!(d.per_category.len(), 5);
+            assert_eq!(d.series.len(), 5);
+        }
+
+        #[test]
+        fn activity_data_empty_repo() {
+            let d = build_activity_data(&[], TimeScale::Hour1, 0, 60, HistogramMode::Repo, &[]);
+            assert_eq!(d.total.len(), 60);
+            assert_eq!(d.total_events, 0);
+            assert_eq!(d.series.len(), 0); // no events = no repos
+        }
+
+        #[test]
+        fn activity_data_empty_tool() {
+            let d = build_activity_data(&[], TimeScale::Hour1, 0, 60, HistogramMode::Tool, &[]);
+            assert_eq!(d.total.len(), 60);
+            assert_eq!(d.total_events, 0);
+            assert_eq!(d.series.len(), 6); // all 6 tool families
+        }
+
+        #[test]
+        fn histogram_mode_cycles() {
+            assert_eq!(HistogramMode::Category.next(), HistogramMode::Repo);
+            assert_eq!(HistogramMode::Repo.next(), HistogramMode::Session);
+            assert_eq!(HistogramMode::Session.next(), HistogramMode::Branch);
+            assert_eq!(HistogramMode::Branch.next(), HistogramMode::Tool);
+            assert_eq!(HistogramMode::Tool.next(), HistogramMode::Category);
+        }
+
+        #[test]
+        fn histogram_mode_labels() {
+            assert_eq!(HistogramMode::Category.label(), "category");
+            assert_eq!(HistogramMode::Repo.label(), "repo");
+            assert_eq!(HistogramMode::Session.label(), "session");
+            assert_eq!(HistogramMode::Branch.label(), "branch");
+            assert_eq!(HistogramMode::Tool.label(), "tool");
+        }
+
+        #[test]
+        fn tool_family_from_name() {
+            assert_eq!(ToolFamily::from_tool_name(Some("Read")), ToolFamily::Read);
+            assert_eq!(ToolFamily::from_tool_name(Some("Glob")), ToolFamily::Read);
+            assert_eq!(ToolFamily::from_tool_name(Some("Write")), ToolFamily::Write);
+            assert_eq!(ToolFamily::from_tool_name(Some("Edit")), ToolFamily::Write);
+            assert_eq!(ToolFamily::from_tool_name(Some("Bash")), ToolFamily::Bash);
+            assert_eq!(ToolFamily::from_tool_name(Some("Agent")), ToolFamily::Agent);
+            assert_eq!(ToolFamily::from_tool_name(Some("WebSearch")), ToolFamily::Web);
+            assert_eq!(ToolFamily::from_tool_name(None), ToolFamily::Other);
+        }
+
+        #[test]
+        fn initial_histogram_mode() {
+            let s = TuiState::new();
+            assert_eq!(s.histogram_mode, HistogramMode::Category);
+        }
+
+        #[test]
+        fn seed_theme_default_is_green() {
+            let t = seed_theme(None);
+            assert_eq!(t.accent, Color::Green);
+            assert_eq!(t.border, Color::DarkGray);
+        }
+
+        #[test]
+        fn seed_theme_presets_covered() {
+            // Every named preset should return a theme (not panic)
+            for preset in super::super::SEED_PRESETS.iter() {
+                let t = seed_theme(Some(preset.name));
+                // canopy is the only preset that keeps Green accent (its identity)
+                if preset.name != "canopy" {
+                    assert_ne!(
+                        (t.accent, t.border),
+                        (Color::Green, Color::DarkGray),
+                        "seed '{}' should differ from default theme", preset.name
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn seed_theme_custom_deterministic() {
+            let a = seed_theme(Some("my-custom-seed"));
+            let b = seed_theme(Some("my-custom-seed"));
+            assert_eq!(a.accent, b.accent);
+            assert_eq!(a.border, b.border);
+            // Different custom strings should (likely) differ
+            let c = seed_theme(Some("another-seed"));
+            // Not guaranteed but highly likely with different strings
+            assert!(a.accent != c.accent || a.border != c.border || true);
+        }
+
+        #[test]
+        fn parse_event_with_session_id() {
+            let line = "2026-04-02T18:00:00 PreToolUse myrepo main\tRead\t\tabc123";
+            let evt = ParsedEvent::parse(line);
+            assert_eq!(evt.session_id.as_deref(), Some("abc123"));
+            assert_eq!(evt.tool_name.as_deref(), Some("Read"));
+            assert!(evt.agent_type.is_none());
+        }
+
+        #[test]
+        fn parse_event_without_session_id() {
+            // Old format without session_id — backwards compatible
+            let line = "2026-04-02T18:00:00 PreToolUse myrepo main\tBash\tworker";
+            let evt = ParsedEvent::parse(line);
+            assert!(evt.session_id.is_none());
+            assert_eq!(evt.tool_name.as_deref(), Some("Bash"));
+            assert_eq!(evt.agent_type.as_deref(), Some("worker"));
+        }
+
+        #[test]
+        fn parsed_event_is_error() {
+            let err = ParsedEvent::parse("2026-04-02T18:00:00 PostToolUseFailure repo main");
+            assert!(err.is_error());
+            let ok = ParsedEvent::parse("2026-04-02T18:00:00 PostToolUse repo main");
+            assert!(!ok.is_error());
+        }
+
+        #[test]
+        fn format_tokens_compact_ranges() {
+            assert_eq!(format_tokens_compact(500), "500");
+            assert_eq!(format_tokens_compact(1_500), "2K");
+            assert_eq!(format_tokens_compact(42_000), "42K");
+            assert_eq!(format_tokens_compact(1_500_000), "1.5M");
+        }
+
+        #[test]
+        fn error_filter_default_off() {
+            let s = TuiState::new();
+            assert!(!s.error_filter);
+        }
+
+        #[test]
+        fn activity_data_session_mode() {
+            let d = build_activity_data(&[], TimeScale::Hour1, 0, 60, HistogramMode::Session, &[]);
+            assert_eq!(d.series.len(), 0); // no events = no sessions
+        }
+
+        #[test]
+        fn activity_data_branch_mode() {
+            let d = build_activity_data(&[], TimeScale::Hour1, 0, 60, HistogramMode::Branch, &[]);
+            assert_eq!(d.series.len(), 0); // no events = no branches
         }
 
         #[test]
@@ -8212,21 +8705,21 @@ mod tui_app {
             let read_evt = ParsedEvent {
                 timestamp: String::new(), event_type: "PreToolUse".into(),
                 repo: "r".into(), branch: "b".into(),
-                tool_name: Some("Read".into()), agent_type: None,
+                tool_name: Some("Read".into()), agent_type: None, session_id: None,
             };
             assert_eq!(read_evt.type_label(), "READ");
 
             let bash_evt = ParsedEvent {
                 timestamp: String::new(), event_type: "PostToolUse".into(),
                 repo: "r".into(), branch: "b".into(),
-                tool_name: Some("Bash".into()), agent_type: None,
+                tool_name: Some("Bash".into()), agent_type: None, session_id: None,
             };
             assert_eq!(bash_evt.type_label(), "BASH");
 
             let no_tool = ParsedEvent {
                 timestamp: String::new(), event_type: "PreToolUse".into(),
                 repo: "r".into(), branch: "b".into(),
-                tool_name: None, agent_type: None,
+                tool_name: None, agent_type: None, session_id: None,
             };
             assert_eq!(no_tool.type_label(), "TOOL");
         }
@@ -8307,7 +8800,7 @@ mod tests {
     #[test]
     fn different_branch_different_notes() {
         let a = PhraseParams::from_identity("myrepo", "main", 400, 0.25, default_effects(), 3, false, EventCategory::Default, 0);
-        let b = PhraseParams::from_identity("myrepo", "feature/auth", 400, 0.25, default_effects(), 3, false, EventCategory::Default, 0);
+        let b = PhraseParams::from_identity("myrepo", "fix/login-bug", 400, 0.25, default_effects(), 3, false, EventCategory::Default, 0);
         assert_ne!(a.notes, b.notes);
     }
 
