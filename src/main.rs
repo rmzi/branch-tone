@@ -7351,12 +7351,39 @@ mod tui_app {
         palette[h % palette.len()]
     }
 
-    /// Per-branch color: each branch picks a distinct slot from the palette.
-    /// The repo hash offsets the starting position, the branch hash rotates from there.
-    /// Tree indentation in the sidebar provides the repo grouping — colors maximize contrast.
-    fn branch_color_for(_repo: &str, branch: &str, _voices: &[(usize, String, String)], palette: &[Color; 8]) -> Color {
-        let bh = branch.bytes().fold(0usize, |acc, b| acc.wrapping_mul(37).wrapping_add(b as usize));
-        palette[bh % palette.len()]
+    /// Per-branch color: maximally contrasting hues via golden-angle rotation.
+    /// Each unique repo+branch combo gets a hue far from its neighbors,
+    /// independent of the seed palette. Saturation and brightness stay high for readability.
+    fn branch_color_for(repo: &str, branch: &str, _voices: &[(usize, String, String)], _palette: &[Color; 8]) -> Color {
+        // Hash repo+branch together for a unique index
+        let mut h = 0u32;
+        for b in repo.bytes().chain(b"/".iter().copied()).chain(branch.bytes()) {
+            h = h.wrapping_mul(31).wrapping_add(b as u32);
+        }
+        // Golden angle (~137.5°) gives maximally spaced hues for any number of items
+        let hue = (h as f32 * 137.508) % 360.0;
+        let (r, g, b) = hsl_to_rgb(hue, 0.7, 0.65);
+        Color::Rgb(r, g, b)
+    }
+
+    /// Convert HSL to RGB. h in [0,360), s and l in [0,1].
+    fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
+        let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+        let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+        let m = l - c / 2.0;
+        let (r1, g1, b1) = match h as u32 {
+            0..=59 => (c, x, 0.0),
+            60..=119 => (x, c, 0.0),
+            120..=179 => (0.0, c, x),
+            180..=239 => (0.0, x, c),
+            240..=299 => (x, 0.0, c),
+            _ => (c, 0.0, x),
+        };
+        (
+            ((r1 + m) * 255.0).clamp(0.0, 255.0) as u8,
+            ((g1 + m) * 255.0).clamp(0.0, 255.0) as u8,
+            ((b1 + m) * 255.0).clamp(0.0, 255.0) as u8,
+        )
     }
 
     /// Pad short strings, truncate long ones with `…` suffix. Unicode-safe.
@@ -7965,25 +7992,36 @@ mod tui_app {
     /// Animation state — drives breathing, fade-in, and flash effects at ~20 FPS.
     struct AnimState {
         start: Instant,
+        last_frame: Instant,
+        dt: f32,
         frame: u64,
     }
 
     impl AnimState {
-        fn new() -> Self { Self { start: Instant::now(), frame: 0 } }
-        /// Seconds since TUI started (monotonic clock for all animation).
+        fn new() -> Self {
+            let now = Instant::now();
+            Self { start: now, last_frame: now, dt: 0.016, frame: 0 }
+        }
+        /// Seconds since TUI started (monotonic wall clock for all animation).
         fn elapsed_secs(&self) -> f32 { self.start.elapsed().as_secs_f32() }
-        /// Breathing pulse: sine wave mapped to [lo, hi] brightness factor.
+        /// Real time delta since last frame.
+        fn dt(&self) -> f32 { self.dt }
+        /// Breathing pulse: sine wave mapped to brightness factor.
         fn breath(&self, rate: f32) -> f32 {
             let t = self.elapsed_secs() * rate * std::f32::consts::TAU;
-            0.7 + 0.3 * t.sin() // oscillates between 0.4 and 1.0
+            0.7 + 0.3 * t.sin()
         }
-        fn tick(&mut self) { self.frame += 1; }
+        fn tick(&mut self) {
+            let now = Instant::now();
+            self.dt = now.duration_since(self.last_frame).as_secs_f32().min(0.1); // cap at 100ms
+            self.last_frame = now;
+            self.frame += 1;
+        }
     }
 
     /// Sphere position in a normalized cube [-1,1]³ with orbital + wander physics.
     struct SphereState {
         x: f32, y: f32, z: f32,
-        vx: f32, vy: f32, vz: f32,
         orbit_phase: f32,
         orbit_tilt: f32,
         precession: f32,
@@ -7992,52 +8030,46 @@ mod tui_app {
     impl SphereState {
         fn new() -> Self {
             Self {
-                x: 0.0, y: 0.0, z: 0.0,
-                vx: 0.12, vy: 0.08, vz: 0.06,
+                x: 2.5, y: -1.8, z: -1.0, // start off-screen, drifts in
                 orbit_phase: 0.0,
                 orbit_tilt: 0.4,
                 precession: 0.0,
             }
         }
 
-        /// Advance physics by dt seconds. Elliptical orbit with precession + wall bounce.
+        /// Advance physics by dt seconds. Smooth orbital drift with soft wall bounce.
         fn update(&mut self, dt: f32) {
-            let orbit_speed = 0.5; // rad/s
-            let precess_speed = 0.07; // rad/s
+            let orbit_speed = 0.3; // rad/s — slower for smoother motion
+            let precess_speed = 0.05; // rad/s
 
             self.orbit_phase += orbit_speed * dt;
             self.precession += precess_speed * dt;
 
             // Orbital target: ellipse in xz plane, tilted by orbit_tilt, precessing
-            let r = 0.55;
+            let r = 0.5;
             let cos_p = self.precession.cos();
             let sin_p = self.precession.sin();
             let ox = r * self.orbit_phase.cos();
-            let oy = r * 0.4 * (self.orbit_phase * 1.3).sin() * self.orbit_tilt.sin();
-            let oz = r * 0.7 * self.orbit_phase.sin();
+            let oy = r * 0.35 * (self.orbit_phase * 0.7).sin() * self.orbit_tilt.sin();
+            let oz = r * 0.6 * self.orbit_phase.sin();
             // Rotate orbital plane by precession
             let tx = ox * cos_p - oz * sin_p;
             let tz = ox * sin_p + oz * cos_p;
 
-            // Attract toward orbital target with spring force
-            let spring = 1.8;
-            let damp: f32 = 0.92;
-            self.vx += (tx - self.x) * spring * dt;
-            self.vy += (oy - self.y) * spring * dt;
-            self.vz += (tz - self.z) * spring * dt;
-            self.vx *= damp.powf(dt * 60.0);
-            self.vy *= damp.powf(dt * 60.0);
-            self.vz *= damp.powf(dt * 60.0);
+            // Smooth follow: critically damped spring (no oscillation, no overshoot)
+            // tau = smoothing time constant — larger = smoother/slower
+            let tau: f32 = 0.6;
+            let blend = 1.0 - (-dt / tau).exp(); // exponential smoothing
+            self.x += (tx - self.x) * blend;
+            self.y += (oy - self.y) * blend;
+            self.z += (tz - self.z) * blend;
 
-            self.x += self.vx * dt;
-            self.y += self.vy * dt;
-            self.z += self.vz * dt;
-
-            // Wall bounce at cube boundaries
-            let wall = 0.85;
-            for (pos, vel) in [(&mut self.x, &mut self.vx), (&mut self.y, &mut self.vy), (&mut self.z, &mut self.vz)] {
-                if *pos > wall { *pos = wall; *vel = -vel.abs() * 0.7; }
-                if *pos < -wall { *pos = -wall; *vel = vel.abs() * 0.7; }
+            // Soft wall push — gradual repulsion instead of hard bounce
+            let wall = 0.8;
+            let push_strength = 0.3;
+            for pos in [&mut self.x, &mut self.y, &mut self.z] {
+                if *pos > wall { *pos -= (*pos - wall) * push_strength; }
+                if *pos < -wall { *pos -= (*pos + wall) * push_strength; }
             }
         }
 
@@ -8655,7 +8687,7 @@ mod tui_app {
             .direction(Direction::Horizontal)
             .constraints([
                 Constraint::Min(30),              // stream
-                Constraint::Length(22),            // sphere PiP
+                Constraint::Length(28),            // sphere PiP
             ])
             .split(chunks[bottom_idx]);
         state.rect_stream = bottom_chunks[0];
@@ -9160,11 +9192,11 @@ mod tui_app {
 
         let total = filtered_events.len();
 
-        // Tight column layout: TYPE(7) + context(flex) + repo/branch(right-aligned)
+        // Tight layout: ● TYPE(7) context(flex) HH:MM:SS
+        // ● = branch color dot, TYPE = colored stub, context = max space, timestamp right
         let inner_w = area.width.saturating_sub(2) as usize;
-        let type_w = 7;
-        let repo_branch_w = 20.min(inner_w / 3); // repo/branch gets up to 1/3 width
-        let context_w = inner_w.saturating_sub(type_w + repo_branch_w + 2); // +2 for spaces
+        let fixed = 2 + 7 + 1 + 9; // dot+space + type + space + timestamp
+        let context_w = inner_w.saturating_sub(fixed);
 
         let lines: Vec<Line> = visible_events.iter().enumerate().map(|(i, evt)| {
             let recency = i as f32 / (visible_events.len().max(1) as f32);
@@ -9172,7 +9204,7 @@ mod tui_app {
 
             let type_color = if is_newest { theme.bright_text } else if recency > 0.3 { evt.type_color() } else { theme.dim_text };
             let br_col = branch_color_for(&evt.repo, &evt.branch, &state.daemon.active_voices, &theme.voice_colors);
-            let repo_branch_color = if is_newest { theme.bright_text } else if recency > 0.3 { br_col } else { scale_rgb(br_col, 0.5) };
+            let dot_color = if is_newest { theme.bright_text } else if recency > 0.3 { br_col } else { scale_rgb(br_col, 0.5) };
 
             // Context: tool-specific info, or tool badge, or event type
             let context = if let Some(ref ctx) = evt.context {
@@ -9185,21 +9217,25 @@ mod tui_app {
                 String::new()
             };
             let context_display = truncate_pad(&context, context_w);
-            let repo_branch = format!("{}/{}", evt.repo, evt.branch);
-            let repo_branch_display = truncate_pad(&repo_branch, repo_branch_w);
+
+            // Timestamp right-aligned
+            let time_str = parse_timestamp_epoch(&evt.timestamp)
+                .map(|epoch| { let (h, m, s) = epoch_to_local_hms(epoch); format!("{:02}:{:02}:{:02}", h, m, s) })
+                .unwrap_or_default();
 
             Line::from(vec![
+                Span::styled("● ", Style::default().fg(dot_color)),
                 Span::styled(
                     format!("{:<7}", evt.type_label()),
                     Style::default().fg(type_color).add_modifier(if is_newest { Modifier::BOLD } else { Modifier::empty() }),
                 ),
                 Span::styled(
-                    format!(" {}", context_display),
+                    format!("{}", context_display),
                     Style::default().fg(if is_newest { theme.bright_text } else { theme.normal_text }),
                 ),
                 Span::styled(
-                    format!(" {}", repo_branch_display),
-                    Style::default().fg(repo_branch_color),
+                    format!(" {}", time_str),
+                    Style::default().fg(if is_newest { theme.bright_text } else { theme.dim_text }),
                 ),
             ])
         }).collect();
@@ -9307,9 +9343,9 @@ mod tui_app {
                     state.poll_daemon();
                 }
                 state.anim.tick();
-                state.sphere.update(0.05); // 50ms timestep
+                state.sphere.update(state.anim.dt());
                 terminal.draw(|frame| ui(frame, &mut state))?;
-                if crossterm::event::poll(Duration::from_millis(50))? {
+                if crossterm::event::poll(Duration::from_millis(16))? {
                     match crossterm::event::read()? {
                         crossterm::event::Event::Key(key) => {
                             if key.kind != crossterm::event::KeyEventKind::Press { continue; }
