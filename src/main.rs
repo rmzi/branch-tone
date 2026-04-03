@@ -295,6 +295,7 @@ struct HookContext {
     error_msg: String,
     session_id: String,
     transcript_path: String,
+    context: String,
 }
 
 impl Default for HookContext {
@@ -303,7 +304,7 @@ impl Default for HookContext {
             event: String::new(), repo: String::new(), branch: String::new(),
             tool_name: String::new(), agent_type: String::new(),
             error_msg: String::new(), session_id: String::new(),
-            transcript_path: String::new(),
+            transcript_path: String::new(), context: String::new(),
         }
     }
 }
@@ -3709,6 +3710,42 @@ fn run_hook() -> Result<()> {
             .and_then(|v| v.as_str())
             .or_else(|| json.get("error_message").and_then(|v| v.as_str()))
             .unwrap_or("").to_string();
+
+        // Extract contextual snippet from tool_input or top-level fields
+        let tool_input = json.get("tool_input");
+        ctx.context = match ctx.tool_name.as_str() {
+            "Read" | "Edit" | "Write" => tool_input
+                .and_then(|t| t.get("file_path").and_then(|v| v.as_str()))
+                .unwrap_or("").to_string(),
+            "Grep" | "Glob" => tool_input
+                .and_then(|t| t.get("pattern").and_then(|v| v.as_str()))
+                .unwrap_or("").to_string(),
+            "Bash" => {
+                let cmd = tool_input
+                    .and_then(|t| t.get("command").and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                // Truncate long commands, strip newlines
+                let clean: String = cmd.chars().take(80).map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
+                clean
+            }
+            "Agent" => tool_input
+                .and_then(|t| t.get("description").and_then(|v| v.as_str()))
+                .unwrap_or("").to_string(),
+            "WebSearch" => tool_input
+                .and_then(|t| t.get("query").and_then(|v| v.as_str()))
+                .unwrap_or("").to_string(),
+            "WebFetch" => tool_input
+                .and_then(|t| t.get("url").and_then(|v| v.as_str()))
+                .unwrap_or("").to_string(),
+            _ => {
+                // UserPromptSubmit: extract prompt from top-level
+                json.get("prompt").and_then(|v| v.as_str())
+                    .map(|s| s.chars().take(80).collect::<String>())
+                    .unwrap_or_default()
+            }
+        };
+        // Strip tabs from context (they'd break the log format)
+        ctx.context = ctx.context.replace('\t', " ");
     }
 
     let branch = get_current_branch().unwrap_or_else(|_| "claude".to_string());
@@ -3731,9 +3768,9 @@ fn run_hook() -> Result<()> {
             let (y, mo, d) = days_to_ymd(days);
             format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", y, mo, d, h, m, s)
         };
-        let has_enrichment = !ctx.tool_name.is_empty() || !ctx.agent_type.is_empty() || !ctx.session_id.is_empty();
+        let has_enrichment = !ctx.tool_name.is_empty() || !ctx.agent_type.is_empty() || !ctx.session_id.is_empty() || !ctx.context.is_empty();
         let enrichment = if has_enrichment {
-            format!("\t{}\t{}\t{}", ctx.tool_name, ctx.agent_type, ctx.session_id)
+            format!("\t{}\t{}\t{}\t{}", ctx.tool_name, ctx.agent_type, ctx.session_id, ctx.context)
         } else {
             String::new()
         };
@@ -7146,21 +7183,23 @@ mod tui_app {
         tool_name: Option<String>,
         agent_type: Option<String>,
         session_id: Option<String>,
+        context: Option<String>,
     }
 
     impl ParsedEvent {
         fn parse(line: &str) -> Self {
-            // Log format: "timestamp event repo branch\ttool\tagent\tsession_id"
+            // Log format: "timestamp event repo branch\ttool\tagent\tsession_id\tcontext"
             // Tab delimiter separates original 4 fields from enrichment
             let parts: Vec<&str> = line.splitn(4, ' ').collect();
             let branch_and_enrichment = parts.get(3).unwrap_or(&"").to_string();
 
-            // Split field 4 on tab for enrichment
-            let mut tab_parts = branch_and_enrichment.splitn(4, '\t');
+            // Split field 4 on tab for enrichment (now 5 tab fields)
+            let mut tab_parts = branch_and_enrichment.splitn(5, '\t');
             let branch = tab_parts.next().unwrap_or("").to_string();
             let tool_name = tab_parts.next().map(|s| s.to_string()).filter(|s| !s.is_empty());
             let agent_type = tab_parts.next().map(|s| s.to_string()).filter(|s| !s.is_empty());
             let session_id = tab_parts.next().map(|s| s.to_string()).filter(|s| !s.is_empty());
+            let context = tab_parts.next().map(|s| s.to_string()).filter(|s| !s.is_empty());
 
             Self {
                 timestamp: parts.first().unwrap_or(&"").to_string(),
@@ -7170,6 +7209,7 @@ mod tui_app {
                 tool_name,
                 agent_type,
                 session_id,
+                context,
             }
         }
 
@@ -7233,6 +7273,7 @@ mod tui_app {
         }
 
         /// Color for tool badge based on tool family
+        #[allow(dead_code)]
         fn tool_badge_color(&self) -> Option<Color> {
             self.tool_name.as_deref()?;
             Some(ToolFamily::from_tool_name(self.tool_name.as_deref()).color())
@@ -7308,6 +7349,14 @@ mod tui_app {
         // No active slot → hash repo name for a stable palette color
         let h = repo.bytes().fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(b as usize));
         palette[h % palette.len()]
+    }
+
+    /// Per-branch color: each branch picks a distinct slot from the palette.
+    /// The repo hash offsets the starting position, the branch hash rotates from there.
+    /// Tree indentation in the sidebar provides the repo grouping — colors maximize contrast.
+    fn branch_color_for(_repo: &str, branch: &str, _voices: &[(usize, String, String)], palette: &[Color; 8]) -> Color {
+        let bh = branch.bytes().fold(0usize, |acc, b| acc.wrapping_mul(37).wrapping_add(b as usize));
+        palette[bh % palette.len()]
     }
 
     /// Pad short strings, truncate long ones with `…` suffix. Unicode-safe.
@@ -7931,6 +7980,73 @@ mod tui_app {
         fn tick(&mut self) { self.frame += 1; }
     }
 
+    /// Sphere position in a normalized cube [-1,1]³ with orbital + wander physics.
+    struct SphereState {
+        x: f32, y: f32, z: f32,
+        vx: f32, vy: f32, vz: f32,
+        orbit_phase: f32,
+        orbit_tilt: f32,
+        precession: f32,
+    }
+
+    impl SphereState {
+        fn new() -> Self {
+            Self {
+                x: 0.0, y: 0.0, z: 0.0,
+                vx: 0.12, vy: 0.08, vz: 0.06,
+                orbit_phase: 0.0,
+                orbit_tilt: 0.4,
+                precession: 0.0,
+            }
+        }
+
+        /// Advance physics by dt seconds. Elliptical orbit with precession + wall bounce.
+        fn update(&mut self, dt: f32) {
+            let orbit_speed = 0.5; // rad/s
+            let precess_speed = 0.07; // rad/s
+
+            self.orbit_phase += orbit_speed * dt;
+            self.precession += precess_speed * dt;
+
+            // Orbital target: ellipse in xz plane, tilted by orbit_tilt, precessing
+            let r = 0.55;
+            let cos_p = self.precession.cos();
+            let sin_p = self.precession.sin();
+            let ox = r * self.orbit_phase.cos();
+            let oy = r * 0.4 * (self.orbit_phase * 1.3).sin() * self.orbit_tilt.sin();
+            let oz = r * 0.7 * self.orbit_phase.sin();
+            // Rotate orbital plane by precession
+            let tx = ox * cos_p - oz * sin_p;
+            let tz = ox * sin_p + oz * cos_p;
+
+            // Attract toward orbital target with spring force
+            let spring = 1.8;
+            let damp: f32 = 0.92;
+            self.vx += (tx - self.x) * spring * dt;
+            self.vy += (oy - self.y) * spring * dt;
+            self.vz += (tz - self.z) * spring * dt;
+            self.vx *= damp.powf(dt * 60.0);
+            self.vy *= damp.powf(dt * 60.0);
+            self.vz *= damp.powf(dt * 60.0);
+
+            self.x += self.vx * dt;
+            self.y += self.vy * dt;
+            self.z += self.vz * dt;
+
+            // Wall bounce at cube boundaries
+            let wall = 0.85;
+            for (pos, vel) in [(&mut self.x, &mut self.vx), (&mut self.y, &mut self.vy), (&mut self.z, &mut self.vz)] {
+                if *pos > wall { *pos = wall; *vel = -vel.abs() * 0.7; }
+                if *pos < -wall { *pos = -wall; *vel = vel.abs() * 0.7; }
+            }
+        }
+
+        /// Sphere scale factor from z-depth: closer (z>0) = bigger, farther (z<0) = smaller.
+        fn scale(&self) -> f32 { 0.7 + 0.3 * (self.z * 0.5 + 0.5).clamp(0.0, 1.0) }
+        /// Brightness from z-depth: closer = brighter.
+        fn brightness(&self) -> f32 { 0.6 + 0.4 * (self.z * 0.5 + 0.5).clamp(0.0, 1.0) }
+    }
+
     /// Blend two colors: t=0 → `a`, t=1 → `b`. Works on RGB colors.
     fn blend_color(a: Color, b: Color, t: f32) -> Color {
         match (a, b) {
@@ -7987,6 +8103,7 @@ mod tui_app {
         rect_sidebar: Rect,
         human_session_secs: u64, // continuous session duration (no gap > 30min)
         anim: AnimState,
+        sphere: SphereState,
     }
 
     impl TuiState {
@@ -8024,6 +8141,7 @@ mod tui_app {
                 rect_sidebar: Rect::default(),
                 human_session_secs: 0,
                 anim: AnimState::new(),
+                sphere: SphereState::new(),
             }
         }
 
@@ -8491,12 +8609,16 @@ mod tui_app {
 
     fn ui(frame: &mut ratatui::Frame, state: &mut TuiState) {
         let area = frame.area();
+        let show_repos = state.sidebar_visible;
+        let repo_height = if show_repos { 5u16 } else { 0 };
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),                       // status bar
                 Constraint::Length(state.activity_height),   // activity (resizable)
-                Constraint::Min(8),                         // stream (fills remaining)
+                Constraint::Length(repo_height),             // repos (full width)
+                Constraint::Min(6),                         // stream + sphere PiP
                 Constraint::Length(1),                       // keybind footer
             ])
             .split(area);
@@ -8519,27 +8641,29 @@ mod tui_app {
         render_status_bar(frame, state, chunks[0], &theme);
         render_activity(frame, state, chunks[1], &theme);
 
-        // Horizontal split: sidebar + stream
-        let show_sidebar = state.sidebar_visible && area.width >= 64;
-        if show_sidebar {
-            let stream_chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Length(24),
-                    Constraint::Min(40),
-                ])
-                .split(chunks[2]);
-            state.rect_sidebar = stream_chunks[0];
-            state.rect_stream = stream_chunks[1];
-            render_sidebar(frame, state, stream_chunks[0], &theme);
-            render_stream(frame, state, stream_chunks[1], &theme);
+        // Repos panel: full width
+        if show_repos {
+            state.rect_sidebar = chunks[2];
+            render_repos(frame, state, chunks[2], &theme);
         } else {
             state.rect_sidebar = Rect::default();
-            state.rect_stream = chunks[2];
-            render_stream(frame, state, chunks[2], &theme);
         }
 
-        render_footer(frame, state, chunks[3], &theme);
+        // Bottom: stream + sphere PiP side by side
+        let bottom_idx = if show_repos { 3 } else { 2 };
+        let bottom_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(30),              // stream
+                Constraint::Length(22),            // sphere PiP
+            ])
+            .split(chunks[bottom_idx]);
+        state.rect_stream = bottom_chunks[0];
+        render_stream(frame, state, bottom_chunks[0], &theme);
+        render_sphere_panel(frame, state, bottom_chunks[1], &theme);
+
+        let footer_idx = if show_repos { 4 } else { 3 };
+        render_footer(frame, state, chunks[footer_idx], &theme);
 
         if state.seeds_open {
             render_seed_overlay(frame, state, area, &theme);
@@ -8743,7 +8867,7 @@ mod tui_app {
     }
 
     /// Repo/branch sidebar — shows active repos and their branches with glow effects.
-    fn render_sidebar(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, theme: &ResolvedTheme) {
+    fn render_repos(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, theme: &ResolvedTheme) {
         let now = Instant::now();
         let inner_w = area.width.saturating_sub(2) as usize; // inside borders
         let active_repos: Vec<&str> = state.daemon.active_voices.iter()
@@ -8789,16 +8913,17 @@ mod tui_app {
                 Span::styled(repo_display, name_style),
             ]));
 
-            // Branch lines (dimmer shade of voice color)
+            // Branch lines — each branch gets its own color variant
             for (branch, last_seen, last_action) in branches {
                 if lines.len() >= max_lines { break; }
                 let branch_age = last_seen.map(|t| now.duration_since(t).as_secs_f32());
+                let br_col = branch_color_for(repo, branch, &state.daemon.active_voices, &theme.voice_colors);
                 let branch_color = if branch_age.is_some_and(|a| a < 5.0) {
                     theme.bright_text  // just fired — white flash
                 } else if branch_age.is_some_and(|a| a < 120.0) {
-                    voice_col          // active — voice color
+                    br_col             // active — branch-specific color
                 } else {
-                    theme.dim_text     // stale
+                    scale_rgb(br_col, 0.5) // stale — dimmed branch color
                 };
                 let branch_display = truncate_pad(branch, inner_w.saturating_sub(4));
                 lines.push(Line::from(vec![
@@ -8831,6 +8956,178 @@ mod tui_app {
         frame.render_widget(Paragraph::new(lines).block(block), area);
     }
 
+    /// Sphere panel — dedicated area for the rotating Braille-raycast sphere.
+    fn render_sphere_panel(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, theme: &ResolvedTheme) {
+        let inner_w = area.width.saturating_sub(2) as usize;
+        let inner_h = area.height.saturating_sub(2) as usize;
+        if inner_w < 4 || inner_h < 3 { return; }
+
+        let scale = state.sphere.scale();
+        let bright = state.sphere.brightness();
+        let sphere = render_sphere(state, theme, inner_w, scale, bright);
+
+        // Map sphere x,y position to offset within the PiP frame
+        let max_pad_x = inner_w.saturating_sub(sphere.first().map(|l| l.spans.len()).unwrap_or(0));
+        let max_pad_y = inner_h.saturating_sub(sphere.len());
+        let pad_x = ((state.sphere.x * 0.5 + 0.5) * max_pad_x as f32).clamp(0.0, max_pad_x as f32) as usize;
+        let pad_y = ((-state.sphere.y * 0.5 + 0.5) * max_pad_y as f32).clamp(0.0, max_pad_y as f32) as usize;
+
+        let mut lines: Vec<Line> = Vec::with_capacity(inner_h);
+        for _ in 0..pad_y { lines.push(Line::raw("")); }
+        for line in sphere {
+            let mut spans = vec![Span::raw(" ".repeat(pad_x))];
+            spans.extend(line.spans);
+            lines.push(Line::from(spans));
+        }
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.border));
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
+    /// Render a raycast sphere using Braille characters for sub-cell resolution.
+    /// Each Braille character encodes a 2×4 dot grid, giving 2x horizontal and
+    /// 4x vertical resolution per terminal cell. The sphere rotates around Y
+    /// using the animation timer, with Lambertian shading from a directional light.
+    fn render_sphere<'a>(state: &TuiState, theme: &ResolvedTheme, avail_w: usize, size_scale: f32, depth_bright: f32) -> Vec<Line<'a>> {
+        let elapsed = state.anim.elapsed_secs();
+        let angle = elapsed * 0.8; // rotation speed (rad/s)
+
+        // Sphere dimensions scaled by z-depth position
+        let base_w = avail_w.min(18);
+        let cell_w = ((base_w as f32 * size_scale).round() as usize).max(4).min(avail_w);
+        let cell_h = (cell_w + 1) / 2; // account for ~2:1 cell aspect ratio
+        let radius = cell_h as f32 * 1.8; // radius in sub-cell units (Braille: 4 rows per cell)
+
+        // Braille sub-cell resolution: 2 dots wide × 4 dots tall per character
+        let dot_w = cell_w * 2;
+        let dot_h = cell_h * 4;
+        let cx = dot_w as f32 / 2.0;
+        let cy = dot_h as f32 / 2.0;
+
+        // Light direction (rotates slowly opposite to sphere)
+        let light_angle = -angle * 0.3;
+        let lx = light_angle.cos() * 0.5;
+        let ly = -0.4_f32;
+        let lz = light_angle.sin() * 0.5 + 0.6;
+        let ll = (lx * lx + ly * ly + lz * lz).sqrt();
+        let (lx, ly, lz) = (lx / ll, ly / ll, lz / ll);
+
+        // Latitude lines on sphere for visual detail (every 30°)
+        let stripe_count = 6.0_f32;
+
+        // Accent color components for shading
+        let (ar, ag, ab) = match theme.accent {
+            Color::Rgb(r, g, b) => (r as f32, g as f32, b as f32),
+            _ => (180.0, 180.0, 180.0),
+        };
+
+        // Rasterize sphere into dot grid + per-cell brightness
+        let mut dots = vec![false; dot_w * dot_h];
+        let mut brightness = vec![0.0f32; cell_w * cell_h]; // per-cell average brightness
+
+        for dy in 0..dot_h {
+            for dx in 0..dot_w {
+                // Map dot to normalized coordinates (aspect-corrected)
+                let nx = (dx as f32 - cx) / radius * 2.0; // *2 because Braille dots are half-width
+                let ny = (dy as f32 - cy) / radius;
+
+                let r2 = nx * nx + ny * ny;
+                if r2 > 1.0 { continue; }
+
+                let nz = (1.0 - r2).sqrt();
+
+                // Rotate normal around Y axis
+                let cos_a = angle.cos();
+                let sin_a = angle.sin();
+                let rnx = nx * cos_a + nz * sin_a;
+                let rnz = -nx * sin_a + nz * cos_a;
+
+                // Lambertian diffuse
+                let diffuse = (rnx * lx + ny * ly + rnz * lz).max(0.0);
+                // Ambient
+                let shade = 0.15 + 0.85 * diffuse;
+
+                // Latitude stripes for surface detail
+                let lat = ny.asin();
+                let lon = rnx.atan2(rnz);
+                let stripe = ((lat * stripe_count).sin() * 0.3 + (lon * stripe_count * 0.5).sin() * 0.15).abs();
+
+                let final_shade = shade * (0.85 + stripe * 0.15);
+
+                // Only light enough areas get a dot (threshold for Braille visibility)
+                if final_shade > 0.12 {
+                    dots[dy * dot_w + dx] = true;
+                }
+
+                // Accumulate brightness for color
+                let ci = (dx / 2) + (dy / 4) * cell_w;
+                if ci < brightness.len() {
+                    brightness[ci] = brightness[ci].max(final_shade);
+                }
+            }
+        }
+
+        // Convert dot grid to Braille characters with per-cell color
+        let mut result = Vec::with_capacity(cell_h);
+        for row in 0..cell_h {
+            let mut spans: Vec<Span> = Vec::with_capacity(cell_w + 1);
+            // Center the sphere
+            let pad = (avail_w.saturating_sub(cell_w)) / 2;
+            if pad > 0 {
+                spans.push(Span::raw(" ".repeat(pad)));
+            }
+            for col in 0..cell_w {
+                // Braille dot mapping: each char is 2 wide × 4 tall
+                // Dot positions map to Unicode offset bits:
+                //   (0,0)=0x01 (1,0)=0x08
+                //   (0,1)=0x02 (1,1)=0x10
+                //   (0,2)=0x04 (1,2)=0x20
+                //   (0,3)=0x40 (1,3)=0x80
+                let mut braille: u32 = 0x2800; // Braille base
+                let bx = col * 2;
+                let by = row * 4;
+                for sub_y in 0..4u32 {
+                    for sub_x in 0..2u32 {
+                        let dx = bx + sub_x as usize;
+                        let dy = by + sub_y as usize;
+                        if dx < dot_w && dy < dot_h && dots[dy * dot_w + dx] {
+                            let bit = match (sub_x, sub_y) {
+                                (0, 0) => 0x01,
+                                (0, 1) => 0x02,
+                                (0, 2) => 0x04,
+                                (1, 0) => 0x08,
+                                (1, 1) => 0x10,
+                                (1, 2) => 0x20,
+                                (0, 3) => 0x40,
+                                (1, 3) => 0x80,
+                                _ => 0,
+                            };
+                            braille |= bit;
+                        }
+                    }
+                }
+                let ch = char::from_u32(braille).unwrap_or(' ');
+                let b = brightness[row * cell_w + col];
+                let db = b * depth_bright; // modulate by z-depth brightness
+                let cr = (ar * db).clamp(0.0, 255.0) as u8;
+                let cg = (ag * db).clamp(0.0, 255.0) as u8;
+                let cb = (ab * db).clamp(0.0, 255.0) as u8;
+                if braille == 0x2800 {
+                    spans.push(Span::raw(" "));
+                } else {
+                    spans.push(Span::styled(
+                        ch.to_string(),
+                        Style::default().fg(Color::Rgb(cr, cg, cb)),
+                    ));
+                }
+            }
+            result.push(Line::from(spans));
+        }
+        result
+    }
+
     /// Merged voice+events stream — events colored by voice
     fn render_stream(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, theme: &ResolvedTheme) {
         let flash_active = state.new_event_time.is_some_and(|t| t.elapsed().as_secs_f32() < 2.0);
@@ -8861,80 +9158,50 @@ mod tui_app {
         let start = end.saturating_sub(max_visible);
         let visible_events = &filtered_events[start..end];
 
-        let now = Instant::now();
         let total = filtered_events.len();
 
-        // Column widths: lane(1) + time(9) + type(8) = 18 fixed; repo+branch share the rest
-        let inner_w = area.width.saturating_sub(2) as usize; // inside borders
-        let fixed_cols = 18; // lane(1) + space+time(9) + space+type(8)
-        let badge_reserve = 10; // space for [Tool] badge
-        let flex = inner_w.saturating_sub(fixed_cols + badge_reserve);
-        let repo_w = (flex * 2 / 5).max(8);
-        let branch_w = flex.saturating_sub(repo_w).max(8);
-
-        // Fade-in blend: interpolate new event colors from accent toward target over 500ms
-        let fade_progress = state.new_event_time
-            .map(|t| (t.elapsed().as_secs_f32() / 0.5).clamp(0.0, 1.0))
-            .unwrap_or(1.0);
+        // Tight column layout: TYPE(7) + context(flex) + repo/branch(right-aligned)
+        let inner_w = area.width.saturating_sub(2) as usize;
+        let type_w = 7;
+        let repo_branch_w = 20.min(inner_w / 3); // repo/branch gets up to 1/3 width
+        let context_w = inner_w.saturating_sub(type_w + repo_branch_w + 2); // +2 for spaces
 
         let lines: Vec<Line> = visible_events.iter().enumerate().map(|(i, evt)| {
             let recency = i as f32 / (visible_events.len().max(1) as f32);
             let is_newest = i == visible_events.len() - 1 && flash_active;
-            // Apply fade-in: only the newest event gets the blend
-            let fade = if is_newest && fade_progress < 1.0 { fade_progress } else { 1.0 };
 
-            let voice_col = voice_color_for_repo(&evt.repo, &state.daemon.active_voices, &theme.voice_colors);
-            let voice_age = state.voice_activity.iter()
-                .find(|(r, _)| *r == evt.repo)
-                .map(|(_, t)| now.duration_since(*t).as_secs_f32());
-
-            // Intensity gauge: count nearby events from same repo for density heat
-            let density = {
-                let window = 4usize; // look ±4 events around current position
-                let abs_i = start + i;
-                let lo = abs_i.saturating_sub(window);
-                let hi = (abs_i + window + 1).min(filtered_events.len());
-                let count = filtered_events[lo..hi].iter().filter(|e| e.repo == evt.repo).count();
-                (count as f32 / (window as f32 * 2.0 + 1.0)).clamp(0.0, 1.0)
-            };
-            let lane_char = if is_newest { "█" } else if voice_age.is_some_and(|a| a < 2.0) { "▓" } else if density > 0.5 { "▓" } else if recency > 0.7 { "▒" } else { "░" };
-            let lane_brightness = 0.5 + density * 0.5; // density modulates brightness
-            let lane_color = if is_newest { theme.bright_text } else { scale_rgb(voice_col, lane_brightness) };
-            let time_str_owned = parse_timestamp_epoch(&evt.timestamp)
-                .map(|epoch| { let (h, m, s) = epoch_to_local_hms(epoch); format!("{:02}:{:02}:{:02}", h, m, s) })
-                .unwrap_or_else(|| if evt.timestamp.len() > 11 { evt.timestamp[11..].to_string() } else { evt.timestamp.clone() });
-            let time_str = time_str_owned.as_str();
             let type_color = if is_newest { theme.bright_text } else if recency > 0.3 { evt.type_color() } else { theme.dim_text };
-            let repo_color = if is_newest { blend_color(theme.accent, voice_col, fade) } else { voice_col };
-            let time_color = if is_newest { theme.bright_text } else { theme.time_color };
-            let branch_color = if is_newest { theme.bright_text } else if recency > 0.5 { theme.normal_text } else { theme.dim_text };
+            let br_col = branch_color_for(&evt.repo, &evt.branch, &state.daemon.active_voices, &theme.voice_colors);
+            let repo_branch_color = if is_newest { theme.bright_text } else if recency > 0.3 { br_col } else { scale_rgb(br_col, 0.5) };
 
-            let repo_col = truncate_pad(&evt.repo, repo_w);
-            let branch_col = truncate_pad(&evt.branch, branch_w);
+            // Context: tool-specific info, or tool badge, or event type
+            let context = if let Some(ref ctx) = evt.context {
+                ctx.clone()
+            } else if let Some(ref tool) = evt.tool_name {
+                format!("[{}]", tool)
+            } else if let Some(ref agent) = evt.agent_type {
+                format!("<{}>", agent)
+            } else {
+                String::new()
+            };
+            let context_display = truncate_pad(&context, context_w);
+            let repo_branch = format!("{}/{}", evt.repo, evt.branch);
+            let repo_branch_display = truncate_pad(&repo_branch, repo_branch_w);
 
-            let mut spans = vec![
-                Span::styled(lane_char, Style::default().fg(lane_color)),
-                Span::styled(format!(" {:>8}", time_str), Style::default().fg(time_color)),
-                Span::styled(format!(" {:<7}", evt.type_label()), Style::default().fg(type_color).add_modifier(if is_newest { Modifier::BOLD } else { Modifier::empty() })),
-                Span::styled(format!(" {}", repo_col), Style::default().fg(repo_color)),
-                Span::styled(format!("/{}", branch_col), Style::default().fg(branch_color)),
-            ];
-            // Tool badge: [Read], [Bash], etc.
-            if let Some(tool) = &evt.tool_name {
-                let badge_color = evt.tool_badge_color().unwrap_or(theme.dim_text);
-                spans.push(Span::styled(
-                    format!(" [{}]", tool),
-                    Style::default().fg(if is_newest { theme.bright_text } else { badge_color }),
-                ));
-            }
-            // Agent badge: <worker>, <researcher>, etc.
-            if let Some(agent) = &evt.agent_type {
-                spans.push(Span::styled(
-                    format!(" <{}>", agent),
-                    Style::default().fg(if is_newest { theme.bright_text } else { Color::Blue }),
-                ));
-            }
-            Line::from(spans)
+            Line::from(vec![
+                Span::styled(
+                    format!("{:<7}", evt.type_label()),
+                    Style::default().fg(type_color).add_modifier(if is_newest { Modifier::BOLD } else { Modifier::empty() }),
+                ),
+                Span::styled(
+                    format!(" {}", context_display),
+                    Style::default().fg(if is_newest { theme.bright_text } else { theme.normal_text }),
+                ),
+                Span::styled(
+                    format!(" {}", repo_branch_display),
+                    Style::default().fg(repo_branch_color),
+                ),
+            ])
         }).collect();
 
         let scroll_hint = if state.stream_scroll > 0 {
@@ -9040,6 +9307,7 @@ mod tui_app {
                     state.poll_daemon();
                 }
                 state.anim.tick();
+                state.sphere.update(0.05); // 50ms timestep
                 terminal.draw(|frame| ui(frame, &mut state))?;
                 if crossterm::event::poll(Duration::from_millis(50))? {
                     match crossterm::event::read()? {
@@ -9339,21 +9607,21 @@ mod tui_app {
             let read_evt = ParsedEvent {
                 timestamp: String::new(), event_type: "PreToolUse".into(),
                 repo: "r".into(), branch: "b".into(),
-                tool_name: Some("Read".into()), agent_type: None, session_id: None,
+                tool_name: Some("Read".into()), agent_type: None, session_id: None, context: None,
             };
             assert_eq!(read_evt.type_label(), "READ");
 
             let bash_evt = ParsedEvent {
                 timestamp: String::new(), event_type: "PostToolUse".into(),
                 repo: "r".into(), branch: "b".into(),
-                tool_name: Some("Bash".into()), agent_type: None, session_id: None,
+                tool_name: Some("Bash".into()), agent_type: None, session_id: None, context: None,
             };
             assert_eq!(bash_evt.type_label(), "BASH");
 
             let no_tool = ParsedEvent {
                 timestamp: String::new(), event_type: "PreToolUse".into(),
                 repo: "r".into(), branch: "b".into(),
-                tool_name: None, agent_type: None, session_id: None,
+                tool_name: None, agent_type: None, session_id: None, context: None,
             };
             assert_eq!(no_tool.type_label(), "TOOL");
         }
@@ -9539,8 +9807,9 @@ mod tests {
 
     #[test]
     fn different_branch_different_notes() {
-        let a = PhraseParams::from_identity("myrepo", "main", 400, 0.25, default_effects(), 3, false, EventCategory::Default, 0);
-        let b = PhraseParams::from_identity("myrepo", "develop", 400, 0.25, default_effects(), 3, false, EventCategory::Default, 0);
+        // Use 5 steps to avoid rounding collisions in the 3-note interval_spread mapping
+        let a = PhraseParams::from_identity("myrepo", "main", 400, 0.25, default_effects(), 5, false, EventCategory::Default, 0);
+        let b = PhraseParams::from_identity("myrepo", "feature/auth", 400, 0.25, default_effects(), 5, false, EventCategory::Default, 0);
         assert_ne!(a.notes, b.notes);
     }
 

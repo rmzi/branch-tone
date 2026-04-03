@@ -1,60 +1,155 @@
-# TUI Polish Pass Round 2: Menu Jump Fix + Activity Theming
+# TUI Layout Restructure: Repos Top, Stream+Sphere PiP Bottom
 
 ## Context
 
-Round 1 (S1–S4, B1–B3) is implemented and passing. Two follow-up issues:
-1. **Bug**: "on rerender the menu jumps" — seed overlay list offset resets every frame because `render_seed_overlay` clones `seed_list` state
-2. **Feature question**: Should the activity histogram adopt seed-themed colors?
+The current layout gives too much prominence to the stream and doesn't match the user's vision. The sphere needs to be a permanent, animated PiP element — not crammed into a sidebar. The stream should show commands contextually but be secondary to repos and the sphere.
 
-## F1. Fix seed overlay list jump
+## Layout
 
-**Root cause**: `render_seed_overlay` takes `&TuiState` (immutable) and calls `frame.render_stateful_widget(list, overlay, &mut state.seed_list.clone())`. The `clone()` discards the scroll offset that ratatui computes each frame. On short terminals (< 20 rows), not all 16 seeds fit — ratatui recalculates the offset every frame, and since it starts from scratch each time, the list can visually oscillate.
+```
+┌─ Status ──────────────────────────────┐
+├─ Activity ────────────────────────────┤
+├─ Repos (full width, 4-5 lines) ──────┤
+│ ■ branch-tone/main  GREP "fn res.."  │
+│ ■ branch-tone/dev   EDIT main.rs     │
+│ □ other-repo/feat   BASH cargo test  │
+├─ Stream ──────────────────────┬──────┤
+│ GREP  "fn resolve" src/       │      │
+│ EDIT  main.rs:7759            │  ◯   │
+│ BASH  cargo test              │ PiP  │
+│ PROMPT "fix contrast"         │      │
+├───────────────────────────────┴──────┤
+└─ footer ─────────────────────────────┘
+```
 
-**Fix**:
-- Change `fn render_seed_overlay(frame, state: &TuiState, ...)` → `state: &mut TuiState`
-- Replace `&mut state.seed_list.clone()` → `&mut state.seed_list`
-- No borrow conflicts: `theme` is an owned `ResolvedTheme`, not borrowing from `state`
-- Location: `render_seed_overlay` (~line 8929), call site in `ui()` (~line 8523)
+Vertical stack:
+1. Status bar (3 lines)
+2. Activity histogram (resizable, default 11)
+3. Repos panel (full width, `Length(5)`)
+4. Stream + Sphere PiP side-by-side (`Min(6)`, stream gets `Min(30)`, sphere gets `Length(22)`)
+5. Footer (1 line)
 
-## F2. Activity histogram theming
+## L1. Layout restructure in `ui()`
 
-**Current state**: 5 histogram modes with different color sources:
-| Mode | Color source | Seed-aware? |
-|------|-------------|-------------|
-| Category | `EventTypeCategory::color()` — fixed ANSI: Green/Yellow/Cyan/Blue/DarkGray | No |
-| Repo | `voice_color_for_repo()` from seed palette | **Yes** |
-| Session | `voice_colors[i % 8]` from seed palette | **Yes** |
-| Branch | `voice_colors[i % 8]` from seed palette | **Yes** |
-| Tool | `ToolFamily::color()` — fixed ANSI: Cyan/Yellow/Red/Blue/Magenta/DarkGray | No |
+Change the vertical constraints:
+```rust
+Constraint::Length(3),                     // status
+Constraint::Length(state.activity_height), // activity  
+Constraint::Length(5),                     // repos (full width)
+Constraint::Min(6),                       // stream + sphere PiP
+Constraint::Length(1),                     // footer
+```
 
-**Approach**: Tint Category and Tool fixed colors toward the seed accent — 25% blend. This preserves inter-category/tool hue distinctness while adding seed cohesion. The `Other`/`DarkGray` entries get the seed's `dim_text` RGB instead.
+Then split chunk[3] horizontally:
+```rust
+let bottom = Layout::horizontal([
+    Constraint::Min(30),      // stream
+    Constraint::Length(22),   // sphere PiP
+]).split(chunks[3]);
+```
 
-**Implementation**:
-- Add a `tint_toward(base: Color, accent: Color) -> Color` that blends 25% toward accent (using existing `blend_color`)
-- In `build_activity_data`, pass `accent: Color` and apply `tint_toward` for Category and Tool modes
-- The accent comes from `seed_theme().accent` which is already available at the call site in `rebuild_activity()`
-- The `Other` / `DarkGray` category gets `Rgb(90,90,90)` minimum (matching S3 fix)
+- `render_sidebar` → `render_repos` (renamed, full-width, no sphere code)
+- `render_sphere_panel` renders in the PiP rect
+- `render_stream` renders in the stream rect
+- Remove old sidebar toggle / `show_sidebar` horizontal split logic
 
-**Risk**: Monochromatic seeds (monolith, tundra) could reduce distinctness. At 25% blend, category hues stay recognizable — Green tinted 25% toward gray is still identifiably green. Safe for at-a-glance reading.
+## L2. Sphere 3D physics — orbit + wander with wall bouncing
 
-**Files**: `src/main.rs`
-- `build_activity_data` signature: add `accent: Color` param (~line 7513)
-- `EventTypeCategory::color` / `ToolFamily::color`: apply tint in series construction
-- `rebuild_activity` call site: pass accent (~line 7966)
-- Tests: `activity_data_*` tests pass the accent
+Add `SphereState` to `TuiState`:
+```rust
+struct SphereState {
+    // Position in normalized cube space [-1, 1]³
+    x: f32, y: f32, z: f32,
+    // Velocity
+    vx: f32, vy: f32, vz: f32,
+    // Orbital parameters (slowly drifting ellipse)
+    orbit_phase: f32,
+    orbit_radius: f32,
+    orbit_tilt: f32,
+}
+```
+
+**Physics model**: The cube is 2.5× the sphere diameter. The sphere follows an elliptical orbit that slowly precesses, with gentle random perturbations. When it approaches a wall (|coord| > 1.0), it bounces elastically — reflected velocity with slight damping. The orbit_phase advances each tick, creating continuous smooth motion.
+
+**Projection**: The sphere's (x,y,z) position determines:
+- Lateral offset in the PiP frame (x maps to horizontal centering)
+- Vertical offset (y maps to vertical centering)
+- Scale/brightness (z maps to apparent size — closer = bigger/brighter, farther = smaller/dimmer)
+
+The raycast sphere renderer already exists — just pass the offset and scale derived from SphereState.
+
+Update `render_sphere()` to accept position offsets + scale factor so the sphere appears to move within the PiP frame.
+
+## L3. Stream column tightening
+
+Current stream columns: `lane(1) + time(9) + type(8) + repo + branch + badge`
+
+New tighter layout — drop the lane char, make type the leading color stub:
+```
+TYPE   context                    repo/branch
+GREP   "fn resolve_theme" src/   branch-tone/main
+EDIT   main.rs:7759              branch-tone/main  
+BASH   cargo test --features tui branch-tone/dev
+PROMPT "fix the contrast"        branch-tone/main
+```
+
+- Type label is the colored stub (5-7 chars, left-aligned, colored by semantic type)
+- Context is the most valuable info (file path, command, pattern) — gets the most space
+- Repo/branch right-aligned, colored by branch_color_for()
+- Timestamp only shown if scrolled (not in live tail mode)
+- Drop the `▓░▒` lane chars — type color stub replaces them
+
+**Note**: Context data requires hook enrichment (L4) to populate. Until then, show tool badge as fallback.
+
+## L4. Hook enrichment (context extraction)
+
+In `run_hook()`, extract a context snippet from `tool_input` and append to the log line as a 5th tab-delimited field:
+
+```rust
+let context = match ctx.tool_name.as_str() {
+    "Read" | "Edit" | "Write" => json_str_field(&tool_input, "file_path"),
+    "Grep" | "Glob" => json_str_field(&tool_input, "pattern"),
+    "Bash" => json_str_field(&tool_input, "command"),  // truncate to 80 chars
+    "Agent" => json_str_field(&tool_input, "description"),
+    "WebSearch" => json_str_field(&tool_input, "query"),
+    "WebFetch" => json_str_field(&tool_input, "url"),
+    _ => String::new(),
+};
+// For UserPromptSubmit: extract "prompt" from top-level JSON
+```
+
+Log format becomes:
+```
+timestamp event repo branch\ttool\tagent\tsession_id\tcontext
+```
+
+Update `ParsedEvent::parse()` to extract the context field.
+Update `type_label()` / stream rendering to show context.
 
 ## Implementation Order
 
-1. **F1** (overlay fix) — 2 min
-2. **F2** (activity tint) — 5 min
-3. Tests + build + install
+1. **L1** — Layout restructure (vertical stack, PiP split)
+2. **L2** — SphereState physics (orbit + wander + bounce in cube)
+3. **L3** — Stream column tightening (type stub + context + repo/branch)
+4. **L4** — Hook enrichment (context extraction into log)
+
+## Files
+
+All in `src/main.rs`:
+- `ui()` — layout constraints (~line 8500)
+- `render_sidebar()` → rename to `render_repos()`, remove sphere
+- `render_sphere_panel()` + `render_sphere()` — accept position/scale
+- `render_stream()` — new column layout
+- `run_hook()` — context extraction (~line 3682)
+- `ParsedEvent::parse()` — context field (~line 7152)
+- `TuiState` — add `SphereState` field
 
 ## Verification
 
 ```bash
-cargo test --features tui     # all 203+ tests pass
-cargo build --features tui    # zero warnings
+cargo test --features tui   # all tests pass
+cargo build --features tui  # zero warnings  
 cargo install --path . --features tui
 ```
 
-Visual: Open `branch-tone tui`, press `p` — seed overlay doesn't jump on short terminals. Switch seeds — activity histogram bars pick up seed tint. Category mode still clearly distinguishable (Green/Yellow/Cyan/Blue remain identifiable).
+Visual: `branch-tone tui` — repos full-width under activity, stream compact with type stubs, sphere orbiting smoothly in PiP bottom-right, bouncing off frame walls with z-depth scaling.
