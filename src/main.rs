@@ -6996,6 +6996,7 @@ mod tui_app {
     struct SeedTheme {
         accent: Color,
         border: Color,
+        voice_colors: [Color; 8],
     }
 
     const CUSTOM_SEED_ACCENTS: [Color; 8] = [
@@ -7003,33 +7004,133 @@ mod tui_app {
         Color::Blue, Color::LightCyan, Color::LightGreen, Color::LightYellow,
     ];
 
+    /// Derive an 8-color voice palette by rotating a base ring to lead with the accent.
+    fn voice_palette_from_accent(accent: Color) -> [Color; 8] {
+        const BASE: [Color; 8] = [
+            Color::Cyan, Color::Green, Color::Yellow, Color::Magenta,
+            Color::Blue, Color::Red, Color::LightCyan, Color::LightGreen,
+        ];
+        let offset = match accent {
+            Color::Cyan | Color::LightCyan => 0,
+            Color::Green | Color::LightGreen => 1,
+            Color::Yellow | Color::LightYellow => 2,
+            Color::Magenta => 3,
+            Color::Blue => 4,
+            Color::Red => 5,
+            Color::White => 6,
+            _ => 0,
+        };
+        let mut p = [Color::White; 8];
+        for i in 0..8 {
+            p[i] = BASE[(i + offset) % 8];
+        }
+        p
+    }
+
+    /// Build a curated RGB palette for a named seed. Each seed gets a unique look
+    /// reflecting its name's character rather than just rotating a shared ring.
     fn seed_theme(name: Option<&str>) -> SeedTheme {
+        // Helper: construct theme from RGB accent, border, and 8-color palette
+        macro_rules! rgb_theme {
+            ($acc:expr, $bdr:expr, [$($c:expr),+ $(,)?]) => {
+                SeedTheme { accent: c($acc), border: c($bdr), voice_colors: [$(c($c)),+] }
+            };
+        }
+        fn c((r, g, b): (u8, u8, u8)) -> Color { Color::Rgb(r, g, b) }
+
         let Some(name) = name else {
-            return SeedTheme { accent: Color::Green, border: Color::DarkGray };
+            // Default: clean green terminal aesthetic
+            return rgb_theme!((80,220,100), (60,60,60), [
+                (80,220,100), (100,200,220), (220,220,80), (200,100,220),
+                (100,140,240), (220,100,100), (120,240,200), (160,240,120),
+            ]);
         };
         match name {
-            "shadow"   => SeedTheme { accent: Color::Blue,        border: Color::DarkGray },
-            "bloom"    => SeedTheme { accent: Color::LightCyan,   border: Color::Cyan },
-            "obsidian" => SeedTheme { accent: Color::Magenta,     border: Color::DarkGray },
-            "gossamer" => SeedTheme { accent: Color::LightYellow, border: Color::Yellow },
-            "monolith" => SeedTheme { accent: Color::White,       border: Color::DarkGray },
-            "ember"    => SeedTheme { accent: Color::Yellow,      border: Color::Red },
-            "void"     => SeedTheme { accent: Color::Blue,        border: Color::DarkGray },
-            "meridian" => SeedTheme { accent: Color::White,       border: Color::Cyan },
-            "undertow" => SeedTheme { accent: Color::Blue,        border: Color::Magenta },
-            "reverie"  => SeedTheme { accent: Color::LightGreen,  border: Color::Green },
-            "basalt"   => SeedTheme { accent: Color::Magenta,     border: Color::Blue },
-            "canopy"   => SeedTheme { accent: Color::Green,       border: Color::Yellow },
-            "solstice" => SeedTheme { accent: Color::Cyan,        border: Color::White },
-            "lichen"   => SeedTheme { accent: Color::LightGreen,  border: Color::DarkGray },
-            "tundra"   => SeedTheme { accent: Color::LightCyan,   border: Color::White },
-            "mycelium" => SeedTheme { accent: Color::Magenta,     border: Color::DarkGray },
+            // shadow: Dracula blues — cool purple-blue noir
+            "shadow" => rgb_theme!((139,233,253), (68,71,90), [
+                (139,233,253), (189,147,249), (80,250,123), (255,121,198),
+                (98,114,164), (241,250,140), (255,184,108), (248,248,242),
+            ]),
+            // bloom: Catppuccin Mocha pastels — soft muted rainbow
+            "bloom" => rgb_theme!((245,194,231), (88,91,112), [
+                (245,194,231), (203,166,247), (137,220,235), (166,227,161),
+                (249,226,175), (242,205,205), (148,226,213), (180,190,254),
+            ]),
+            // obsidian: Purple Rain — deep purple/magenta royalty
+            "obsidian" => rgb_theme!((180,70,220), (50,30,70), [
+                (180,70,220), (140,50,180), (220,100,240), (100,40,160),
+                (160,80,200), (200,60,180), (120,30,140), (190,110,230),
+            ]),
+            // gossamer: Gruvbox warm gold — amber earth tones
+            "gossamer" => rgb_theme!((250,189,47), (146,131,116), [
+                (250,189,47), (235,219,178), (214,93,14), (204,36,29),
+                (152,151,26), (69,133,136), (177,98,134), (251,241,199),
+            ]),
+            // monolith: Pencil grayscale — achromatic brutalism
+            "monolith" => rgb_theme!((224,224,224), (76,76,76), [
+                (224,224,224), (192,192,192), (160,160,160), (208,208,208),
+                (144,144,144), (200,200,200), (176,176,176), (216,216,216),
+            ]),
+            // ember: Firewatch warm — fire gradient red-orange-gold
+            "ember" => rgb_theme!((253,167,0), (150,50,30), [
+                (253,167,0), (239,97,32), (208,50,50), (255,200,60),
+                (180,40,40), (253,140,0), (220,70,50), (255,220,100),
+            ]),
+            // void: Nord dark — deep indigo polar night
+            "void" => rgb_theme!((129,161,193), (46,52,64), [
+                (129,161,193), (94,129,172), (136,192,208), (143,188,187),
+                (76,86,106), (163,190,140), (180,142,173), (208,135,112),
+            ]),
+            // meridian: Nord bright — arctic frost palette
+            "meridian" => rgb_theme!((136,192,208), (76,86,106), [
+                (136,192,208), (143,188,187), (129,161,193), (163,190,140),
+                (94,129,172), (180,142,173), (208,135,112), (235,203,139),
+            ]),
+            // undertow: Synthwave neon — electric purple-pink-cyan
+            "undertow" => rgb_theme!((255,40,200), (58,20,80), [
+                (255,40,200), (115,75,255), (0,255,240), (255,110,255),
+                (180,50,255), (0,200,200), (255,80,160), (140,100,255),
+            ]),
+            // reverie: Rosé Pine pastels — dreamy rose-lavender
+            "reverie" => rgb_theme!((234,154,151), (64,61,82), [
+                (234,154,151), (196,167,231), (156,207,216), (246,193,119),
+                (235,111,146), (62,143,176), (144,140,170), (224,222,244),
+            ]),
+            // basalt: Earthsong — volcanic earth tones
+            "basalt" => rgb_theme!((219,168,121), (54,54,46), [
+                (219,168,121), (168,155,132), (132,109,90), (219,193,148),
+                (113,98,82), (185,140,100), (160,120,95), (200,185,165),
+            ]),
+            // canopy: Everforest — dense forest greens
+            "canopy" => rgb_theme!((167,192,128), (73,80,69), [
+                (167,192,128), (131,165,152), (219,188,127), (230,126,128),
+                (115,149,130), (214,153,133), (165,187,152), (211,198,170),
+            ]),
+            // solstice: Catppuccin Latte — bright winter pastels
+            "solstice" => rgb_theme!((30,102,245), (172,176,190), [
+                (30,102,245), (136,57,239), (23,146,153), (64,160,43),
+                (223,142,29), (210,15,57), (234,118,203), (76,79,105),
+            ]),
+            // lichen: muted Everforest — sage/olive understory
+            "lichen" => rgb_theme!((143,191,120), (65,72,60), [
+                (143,191,120), (122,170,100), (165,190,130), (108,168,112),
+                (135,175,95), (155,200,138), (118,165,105), (148,188,115),
+            ]),
+            // tundra: Nord Snow — ice-white frost
+            "tundra" => rgb_theme!((216,222,233), (129,161,193), [
+                (216,222,233), (229,233,240), (236,239,244), (200,215,228),
+                (190,208,224), (210,225,238), (222,230,240), (204,218,232),
+            ]),
+            // mycelium: Shades of Purple — electric violet network
+            "mycelium" => rgb_theme!((179,98,255), (43,36,58), [
+                (179,98,255), (255,157,0), (56,255,189), (255,106,193),
+                (130,80,223), (250,208,0), (103,220,255), (255,127,127),
+            ]),
+            // Custom seed: hash-derive an RGB palette
             _ => {
                 let h = name.bytes().fold(0u8, |acc, b| acc.wrapping_mul(31).wrapping_add(b));
-                SeedTheme {
-                    accent: CUSTOM_SEED_ACCENTS[(h as usize) % CUSTOM_SEED_ACCENTS.len()],
-                    border: Color::DarkGray,
-                }
+                let accent = CUSTOM_SEED_ACCENTS[(h as usize) % CUSTOM_SEED_ACCENTS.len()];
+                SeedTheme { accent, border: Color::DarkGray, voice_colors: voice_palette_from_accent(accent) }
             }
         }
     }
@@ -7083,10 +7184,10 @@ mod tui_app {
                 "Stop" => Color::Magenta,
                 "SubagentStart" | "SubagentStop" => Color::Blue,
                 "TaskCompleted" | "TaskCreated" => Color::Cyan,
-                "PreCompact" | "PostCompact" => Color::DarkGray,
-                "ConfigChange" | "InstructionsLoaded" | "CwdChanged" => Color::DarkGray,
+                "PreCompact" | "PostCompact" => Color::Rgb(90,90,90),
+                "ConfigChange" | "InstructionsLoaded" | "CwdChanged" => Color::Rgb(90,90,90),
                 "PermissionRequest" => Color::Yellow,
-                "TeammateIdle" => Color::DarkGray,
+                "TeammateIdle" => Color::Rgb(90,90,90),
                 _ => Color::White,
             }
         }
@@ -7192,17 +7293,35 @@ mod tui_app {
         EventTypeCategory::Other,
     ];
 
-    /// Stable color palette for voice slots (up to 8)
+    /// Default color palette for voice slots (used in tests)
+    #[cfg(test)]
     const VOICE_COLORS: [Color; 8] = [
         Color::Cyan, Color::Green, Color::Yellow, Color::Magenta,
         Color::Blue, Color::Red, Color::LightCyan, Color::LightGreen,
     ];
 
-    fn voice_color_for_repo(repo: &str, voices: &[(usize, String, String)]) -> Color {
-        voices.iter()
-            .position(|(_, r, _)| r == repo)
-            .map(|i| VOICE_COLORS[i % VOICE_COLORS.len()])
-            .unwrap_or(Color::DarkGray)
+    fn voice_color_for_repo(repo: &str, voices: &[(usize, String, String)], palette: &[Color; 8]) -> Color {
+        // Active voice slot → deterministic position in palette
+        if let Some(i) = voices.iter().position(|(_, r, _)| r == repo) {
+            return palette[i % palette.len()];
+        }
+        // No active slot → hash repo name for a stable palette color
+        let h = repo.bytes().fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(b as usize));
+        palette[h % palette.len()]
+    }
+
+    /// Pad short strings, truncate long ones with `…` suffix. Unicode-safe.
+    fn truncate_pad(s: &str, width: usize) -> String {
+        let len = s.chars().count();
+        if len <= width {
+            format!("{:<width$}", s, width = width)
+        } else if width <= 1 {
+            s.chars().take(width).collect()
+        } else {
+            let mut out: String = s.chars().take(width - 1).collect();
+            out.push('…');
+            out
+        }
     }
 
     /// Tool family grouping for histogram view
@@ -7292,20 +7411,28 @@ mod tui_app {
     /// Zoom levels for the activity histogram
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum TimeScale {
-        Min5,    // 5 min, 5s buckets
-        Min15,   // 15 min, 15s buckets
-        Hour1,   // 1 hour, 1 min buckets
-        Hour4,   // 4 hours, 4 min buckets
-        Hour24,  // 24 hours, 24 min buckets
+        Min1,    // 1 min
+        Min5,    // 5 min
+        Min15,   // 15 min
+        Min30,   // 30 min
+        Hour1,   // 1 hour
+        Hour2,   // 2 hours
+        Hour4,   // 4 hours
+        Hour8,   // 8 hours
+        Hour24,  // 24 hours
     }
 
     impl TimeScale {
         fn label(self) -> &'static str {
             match self {
+                Self::Min1 => "1 min",
                 Self::Min5 => "5 min",
                 Self::Min15 => "15 min",
+                Self::Min30 => "30 min",
                 Self::Hour1 => "1 hour",
+                Self::Hour2 => "2 hours",
                 Self::Hour4 => "4 hours",
+                Self::Hour8 => "8 hours",
                 Self::Hour24 => "24 hours",
             }
         }
@@ -7313,10 +7440,14 @@ mod tui_app {
         /// Total window in seconds
         fn window_secs(self) -> u64 {
             match self {
+                Self::Min1 => 60,
                 Self::Min5 => 5 * 60,
                 Self::Min15 => 15 * 60,
+                Self::Min30 => 30 * 60,
                 Self::Hour1 => 60 * 60,
+                Self::Hour2 => 2 * 60 * 60,
                 Self::Hour4 => 4 * 60 * 60,
+                Self::Hour8 => 8 * 60 * 60,
                 Self::Hour24 => 24 * 60 * 60,
             }
         }
@@ -7329,29 +7460,37 @@ mod tui_app {
         /// How many log lines to read (wider windows need more history)
         fn log_lines(self) -> usize {
             match self {
-                Self::Min5 | Self::Min15 => 500,
-                Self::Hour1 => 2000,
-                Self::Hour4 => 5000,
+                Self::Min1 | Self::Min5 | Self::Min15 | Self::Min30 => 500,
+                Self::Hour1 | Self::Hour2 => 2000,
+                Self::Hour4 | Self::Hour8 => 5000,
                 Self::Hour24 => 10000,
             }
         }
 
         fn zoom_in(self) -> Self {
             match self {
-                Self::Min5 => Self::Min5,
+                Self::Min1 => Self::Min1,
+                Self::Min5 => Self::Min1,
                 Self::Min15 => Self::Min5,
-                Self::Hour1 => Self::Min15,
-                Self::Hour4 => Self::Hour1,
-                Self::Hour24 => Self::Hour4,
+                Self::Min30 => Self::Min15,
+                Self::Hour1 => Self::Min30,
+                Self::Hour2 => Self::Hour1,
+                Self::Hour4 => Self::Hour2,
+                Self::Hour8 => Self::Hour4,
+                Self::Hour24 => Self::Hour8,
             }
         }
 
         fn zoom_out(self) -> Self {
             match self {
+                Self::Min1 => Self::Min5,
                 Self::Min5 => Self::Min15,
-                Self::Min15 => Self::Hour1,
-                Self::Hour1 => Self::Hour4,
-                Self::Hour4 => Self::Hour24,
+                Self::Min15 => Self::Min30,
+                Self::Min30 => Self::Hour1,
+                Self::Hour1 => Self::Hour2,
+                Self::Hour2 => Self::Hour4,
+                Self::Hour4 => Self::Hour8,
+                Self::Hour8 => Self::Hour24,
                 Self::Hour24 => Self::Hour24,
             }
         }
@@ -7371,9 +7510,31 @@ mod tui_app {
         total_events: u64,
     }
 
+    /// Tint a base color 25% toward an accent. Converts ANSI colors to RGB first.
+    fn tint_toward(base: Color, accent: Color) -> Color {
+        let base_rgb = match base {
+            Color::Rgb(r, g, b) => (r, g, b),
+            Color::Green => (0, 200, 0),
+            Color::Yellow => (220, 220, 0),
+            Color::Cyan => (0, 200, 200),
+            Color::Blue => (60, 60, 220),
+            Color::Red => (220, 60, 60),
+            Color::Magenta => (200, 60, 200),
+            Color::DarkGray => (90, 90, 90),
+            _ => return base,
+        };
+        let accent_rgb = match accent {
+            Color::Rgb(r, g, b) => (r, g, b),
+            _ => return base,
+        };
+        let (r, g, b) = lerp_rgb(base_rgb, accent_rgb, 0.25);
+        Color::Rgb(r, g, b)
+    }
+
     fn build_activity_data(
         events: &[ParsedEvent], scale: TimeScale, time_offset: i64, num_cols: usize,
         mode: HistogramMode, voices: &[(usize, String, String)],
+        voice_colors: &[Color; 8], accent: Color,
     ) -> ActivityData {
         let now = {
             use std::time::SystemTime;
@@ -7412,7 +7573,7 @@ mod tui_app {
                 }
                 ALL_CATEGORIES.iter().zip(cat_buckets).map(|(cat, buckets)| ActivitySeries {
                     label: cat.label().to_string(),
-                    color: cat.color(),
+                    color: tint_toward(cat.color(), accent),
                     buckets,
                 }).collect()
             }
@@ -7433,7 +7594,7 @@ mod tui_app {
                     }
                     ActivitySeries {
                         label: repo.clone(),
-                        color: voice_color_for_repo(repo, voices),
+                        color: voice_color_for_repo(repo, voices, voice_colors),
                         buckets,
                     }
                 }).collect()
@@ -7458,7 +7619,7 @@ mod tui_app {
                     let label = if sid.len() > 8 { sid[..8].to_string() } else { sid.clone() };
                     ActivitySeries {
                         label,
-                        color: VOICE_COLORS[i % VOICE_COLORS.len()],
+                        color: voice_colors[i % voice_colors.len()],
                         buckets,
                     }
                 }).collect()
@@ -7479,7 +7640,7 @@ mod tui_app {
                     }
                     ActivitySeries {
                         label: br.clone(),
-                        color: VOICE_COLORS[i % VOICE_COLORS.len()],
+                        color: voice_colors[i % voice_colors.len()],
                         buckets,
                     }
                 }).collect()
@@ -7495,7 +7656,7 @@ mod tui_app {
                 }
                 ALL_TOOL_FAMILIES.iter().zip(family_buckets).map(|(fam, buckets)| ActivitySeries {
                     label: fam.label().to_string(),
-                    color: fam.color(),
+                    color: tint_toward(fam.color(), accent),
                     buckets,
                 }).collect()
             }
@@ -7525,6 +7686,114 @@ mod tui_app {
         let doy = (153 * m + 2) / 5 + d - 1;
         let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
         era * 146097 + doe - 719468
+    }
+
+    /// Convert UTC epoch seconds to local-time (hour, minute, second) via POSIX localtime_r.
+    fn epoch_to_local_hms(epoch_secs: u64) -> (u64, u64, u64) {
+        #[repr(C)]
+        struct Tm {
+            tm_sec: i32, tm_min: i32, tm_hour: i32, tm_mday: i32,
+            tm_mon: i32, tm_year: i32, tm_wday: i32, tm_yday: i32,
+            tm_isdst: i32, _tm_gmtoff: i64, _tm_zone: *const std::ffi::c_char,
+        }
+        unsafe extern "C" {
+            fn localtime_r(timep: *const i64, result: *mut Tm) -> *mut Tm;
+        }
+        let time = epoch_secs as i64;
+        let mut tm = unsafe { std::mem::MaybeUninit::<Tm>::zeroed().assume_init() };
+        unsafe { localtime_r(&time, &mut tm); }
+        (tm.tm_hour as u64, tm.tm_min as u64, tm.tm_sec as u64)
+    }
+
+    /// Get current local (hour, minute).
+    fn current_local_hm() -> (u64, u64) {
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let (h, m, _) = epoch_to_local_hms(epoch);
+        (h, m)
+    }
+
+    // ── Day/night theming ───────────────────────────────────────────────────
+
+    /// Linearly interpolate between two RGB triples.
+    fn lerp_rgb(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
+        let t = t.clamp(0.0, 1.0);
+        (
+            (a.0 as f32 + (b.0 as f32 - a.0 as f32) * t) as u8,
+            (a.1 as f32 + (b.1 as f32 - a.1 as f32) * t) as u8,
+            (a.2 as f32 + (b.2 as f32 - a.2 as f32) * t) as u8,
+        )
+    }
+
+    /// Map current local hour+minute to an ambient sky-like RGB color.
+    fn time_of_day_color(hour: u64, minute: u64) -> Color {
+        let t = hour as f32 + minute as f32 / 60.0;
+        let night   = (40u8, 50u8, 120u8);
+        let dawn    = (160, 100, 180);
+        let sunrise = (220, 160, 80);
+        let day     = (200, 200, 160);
+        let golden  = (220, 160, 80);
+        let dusk    = (160, 100, 180);
+
+        let (r, g, b) = match hour {
+            0..=4   => night,
+            5       => lerp_rgb(night, dawn, t - 5.0),
+            6       => lerp_rgb(dawn, sunrise, t - 6.0),
+            7..=8   => lerp_rgb(sunrise, day, (t - 7.0) / 2.0),
+            9..=15  => day,
+            16..=17 => lerp_rgb(day, golden, (t - 16.0) / 2.0),
+            18      => lerp_rgb(golden, dusk, t - 18.0),
+            19      => lerp_rgb(dusk, night, t - 19.0),
+            _       => night, // 20-23
+        };
+        Color::Rgb(r, g, b)
+    }
+
+    /// Coarse phase of day for theme adjustments.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum DayPhase { Night, Dawn, Day, Dusk }
+
+    impl DayPhase {
+        fn from_hour(h: u64) -> Self {
+            match h {
+                6..=7   => Self::Dawn,
+                8..=17  => Self::Day,
+                18..=21 => Self::Dusk,
+                _       => Self::Night,
+            }
+        }
+    }
+
+    /// Fully resolved theme: seed palette + day/night adjustments + time color.
+    /// Computed once per render frame, passed to all render functions.
+    struct ResolvedTheme {
+        accent: Color,
+        accent_secondary: Color,
+        border: Color,
+        voice_colors: [Color; 8],
+        dim_text: Color,
+        normal_text: Color,
+        bright_text: Color,
+        time_color: Color,
+    }
+
+    fn resolve_theme(base: &SeedTheme, h: u64, m: u64) -> ResolvedTheme {
+        let phase = DayPhase::from_hour(h);
+        let (dim_text, normal_text, border) = match phase {
+            DayPhase::Night => (Color::Rgb(100,100,100), Color::Rgb(160,160,160), Color::DarkGray),
+            DayPhase::Dawn | DayPhase::Dusk => (Color::Rgb(120,120,120), Color::Rgb(200,200,200), base.border),
+            DayPhase::Day => (Color::Rgb(140,140,140), Color::Rgb(240,240,240), base.border),
+        };
+        ResolvedTheme {
+            accent: base.accent,
+            accent_secondary: base.voice_colors[1],
+            border,
+            voice_colors: base.voice_colors,
+            dim_text,
+            normal_text,
+            bright_text: Color::White,
+            time_color: time_of_day_color(h, m),
+        }
     }
 
     // ── Daemon socket client (ported from tray module) ──────────────────────
@@ -7644,6 +7913,47 @@ mod tui_app {
 
     // ── TUI state ───────────────────────────────────────────────────────────
 
+    /// Animation state — drives breathing, fade-in, and flash effects at ~20 FPS.
+    struct AnimState {
+        start: Instant,
+        frame: u64,
+    }
+
+    impl AnimState {
+        fn new() -> Self { Self { start: Instant::now(), frame: 0 } }
+        /// Seconds since TUI started (monotonic clock for all animation).
+        fn elapsed_secs(&self) -> f32 { self.start.elapsed().as_secs_f32() }
+        /// Breathing pulse: sine wave mapped to [lo, hi] brightness factor.
+        fn breath(&self, rate: f32) -> f32 {
+            let t = self.elapsed_secs() * rate * std::f32::consts::TAU;
+            0.7 + 0.3 * t.sin() // oscillates between 0.4 and 1.0
+        }
+        fn tick(&mut self) { self.frame += 1; }
+    }
+
+    /// Blend two colors: t=0 → `a`, t=1 → `b`. Works on RGB colors.
+    fn blend_color(a: Color, b: Color, t: f32) -> Color {
+        match (a, b) {
+            (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) => {
+                let (r, g, bl) = lerp_rgb((ar, ag, ab), (br, bg, bb), t);
+                Color::Rgb(r, g, bl)
+            }
+            _ => if t < 0.5 { a } else { b },
+        }
+    }
+
+    /// Scale an RGB color's brightness by a factor (0.0–1.0+).
+    fn scale_rgb(color: Color, factor: f32) -> Color {
+        match color {
+            Color::Rgb(r, g, b) => Color::Rgb(
+                (r as f32 * factor).clamp(0.0, 255.0) as u8,
+                (g as f32 * factor).clamp(0.0, 255.0) as u8,
+                (b as f32 * factor).clamp(0.0, 255.0) as u8,
+            ),
+            other => other,
+        }
+    }
+
     struct TuiState {
         daemon: DaemonStatus,
         muted: bool,
@@ -7671,6 +7981,12 @@ mod tui_app {
         error_filter: bool,
         session_tokens: std::collections::HashMap<String, (u64, u64)>, // session_id → (input, output)
         last_poll: Instant,
+        // Repo/branch sidebar
+        repo_tree: Vec<(String, Vec<(String, Option<Instant>, Option<String>)>)>, // (repo, [(branch, last_seen, last_action)])
+        sidebar_visible: bool,
+        rect_sidebar: Rect,
+        human_session_secs: u64, // continuous session duration (no gap > 30min)
+        anim: AnimState,
     }
 
     impl TuiState {
@@ -7698,20 +8014,84 @@ mod tui_app {
                 rect_stream: Rect::default(),
                 rect_status: Rect::default(),
                 activity_cols: 80, // reasonable default until first render
-                activity_height: 7, // default activity panel height
+                activity_height: 11, // default activity panel height
                 histogram_mode: HistogramMode::Category,
                 error_filter: false,
                 session_tokens: std::collections::HashMap::new(),
                 last_poll: Instant::now() - Duration::from_secs(10),
+                repo_tree: Vec::new(),
+                sidebar_visible: true,
+                rect_sidebar: Rect::default(),
+                human_session_secs: 0,
+                anim: AnimState::new(),
             }
         }
 
         fn rebuild_activity(&mut self) {
+            let st = seed_theme(self.current_seed.as_deref());
             self.activity = build_activity_data(
                 &self.all_events, self.timescale, self.time_offset,
                 self.activity_cols, self.histogram_mode,
-                &self.daemon.active_voices,
+                &self.daemon.active_voices, &st.voice_colors, st.accent,
             );
+        }
+
+        /// Build repo→branches tree from recent events + daemon voices.
+        /// Build repo→branches tree from recent events + daemon voices.
+        fn rebuild_repo_tree(&mut self) {
+            let now = Instant::now();
+            // (branch, last_seen, last_action)
+            let mut map: std::collections::HashMap<String, Vec<(String, Option<Instant>, Option<String>)>> =
+                std::collections::HashMap::new();
+
+            // Build a per-(repo, branch) last-action lookup from recent events
+            let mut last_actions: std::collections::HashMap<(String, String), String> =
+                std::collections::HashMap::new();
+            for evt in self.recent_events.iter().rev() {
+                let key = (evt.repo.clone(), evt.branch.clone());
+                last_actions.entry(key).or_insert_with(|| evt.type_label().to_string());
+            }
+
+            // Seed from daemon active voices (these are "currently playing")
+            for (_, repo, branch) in &self.daemon.active_voices {
+                let branches = map.entry(repo.clone()).or_default();
+                if !branches.iter().any(|(b, _, _)| b == branch) {
+                    let last = self.voice_activity.iter()
+                        .find(|(r, _)| r == repo).map(|(_, t)| *t);
+                    let action = last_actions.get(&(repo.clone(), branch.clone())).cloned();
+                    branches.push((branch.clone(), last, action));
+                }
+            }
+
+            // Add branches seen in recent events
+            for evt in self.recent_events.iter().rev().take(200) {
+                if evt.repo.is_empty() { continue; }
+                let branches = map.entry(evt.repo.clone()).or_default();
+                if !branches.iter().any(|(b, _, _)| b == &evt.branch) {
+                    let last = self.voice_activity.iter()
+                        .find(|(r, _)| r == &evt.repo).map(|(_, t)| *t);
+                    let action = last_actions.get(&(evt.repo.clone(), evt.branch.clone())).cloned();
+                    branches.push((evt.branch.clone(), last, action));
+                }
+            }
+
+            // Sort: repos with active voices first, then by recency
+            let active_repos: Vec<String> = self.daemon.active_voices.iter()
+                .map(|(_, r, _)| r.clone()).collect();
+            let mut tree: Vec<(String, Vec<(String, Option<Instant>, Option<String>)>)> = map.into_iter().collect();
+            tree.sort_by(|(a, _), (b, _)| {
+                let a_active = active_repos.contains(a);
+                let b_active = active_repos.contains(b);
+                b_active.cmp(&a_active).then_with(|| {
+                    let a_age = self.voice_activity.iter()
+                        .find(|(r, _)| r == a).map(|(_, t)| now.duration_since(*t));
+                    let b_age = self.voice_activity.iter()
+                        .find(|(r, _)| r == b).map(|(_, t)| now.duration_since(*t));
+                    a_age.cmp(&b_age)
+                })
+            });
+
+            self.repo_tree = tree;
         }
 
         fn poll_daemon(&mut self) {
@@ -7755,6 +8135,29 @@ mod tui_app {
             self.all_events = raw_all.iter().map(|l| ParsedEvent::parse(l)).collect();
             self.recent_events = raw_recent.iter().map(|l| ParsedEvent::parse(l)).collect();
             self.rebuild_activity();
+            self.rebuild_repo_tree();
+
+            // Calculate human session duration: walk events backward,
+            // find continuous activity with no gap > 30 minutes
+            self.human_session_secs = {
+                let gap_threshold = 30 * 60; // 30 minutes
+                let mut epochs: Vec<u64> = self.recent_events.iter()
+                    .filter_map(|e| parse_timestamp_epoch(&e.timestamp))
+                    .collect();
+                epochs.sort_unstable();
+                if let (Some(_), Some(&last)) = (epochs.first(), epochs.last()) {
+                    // Walk backward from newest, find where a gap > threshold breaks the session
+                    let mut session_start = last;
+                    for pair in epochs.windows(2).rev() {
+                        if pair[1] - pair[0] > gap_threshold {
+                            session_start = pair[1];
+                            break;
+                        }
+                        session_start = pair[0];
+                    }
+                    last.saturating_sub(session_start)
+                } else { 0 }
+            };
             self.last_poll = Instant::now();
 
             if let Some(ref name) = self.current_seed {
@@ -7848,6 +8251,7 @@ mod tui_app {
             }
             KeyCode::Char('p') => { state.seeds_open = true; Action::Continue }
             KeyCode::Char('e') => { state.error_filter = !state.error_filter; Action::Continue }
+            KeyCode::Char('b') => { state.sidebar_visible = !state.sidebar_visible; Action::Continue }
             KeyCode::Char('g') => {
                 let next = match state.current_quantize {
                     None => Some(32), Some(32) => Some(16), Some(16) => Some(8),
@@ -7907,7 +8311,7 @@ mod tui_app {
                 Action::Continue
             }
             KeyCode::Char(']') => {
-                state.activity_height = (state.activity_height + 1).min(10);
+                state.activity_height = (state.activity_height + 1).min(16);
                 Action::Continue
             }
 
@@ -7936,10 +8340,25 @@ mod tui_app {
             }
 
             KeyCode::Char('r') => {
+                // Quick refresh — re-poll daemon state
+                state.poll_daemon();
+                Action::Continue
+            }
+            KeyCode::Char('R') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Full reset — back up events.log before clearing
+                let log_path = daemon_dir().join("events.log");
+                if log_path.exists() {
+                    let epoch = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                    let backup = daemon_dir().join(format!("events.{}.log", epoch));
+                    let _ = std::fs::copy(&log_path, &backup);
+                }
                 state.recent_events.clear();
+                state.all_events.clear();
                 state.event_count = 0;
                 state.new_event_time = None;
                 state.voice_activity.clear();
+                state.repo_tree.clear();
                 state.stream_scroll = 0;
                 Action::Continue
             }
@@ -8085,16 +8504,45 @@ mod tui_app {
         // Store rects for mouse hit-testing
         state.rect_status = chunks[0];
         state.rect_activity = chunks[1];
-        state.rect_stream = chunks[2];
 
-        let theme = seed_theme(state.current_seed.as_deref());
+        // Resolve theme: seed palette + day/night
+        // Preview the selected seed when overlay is open
+        let effective_seed: Option<&str> = if state.seeds_open {
+            state.selected_seed_name().or(state.current_seed.as_deref())
+        } else {
+            state.current_seed.as_deref()
+        };
+        let base = seed_theme(effective_seed);
+        let (h, m) = current_local_hm();
+        let theme = resolve_theme(&base, h, m);
+
         render_status_bar(frame, state, chunks[0], &theme);
         render_activity(frame, state, chunks[1], &theme);
-        render_stream(frame, state, chunks[2], &theme);
-        render_footer(frame, state, chunks[3]);
+
+        // Horizontal split: sidebar + stream
+        let show_sidebar = state.sidebar_visible && area.width >= 64;
+        if show_sidebar {
+            let stream_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length(24),
+                    Constraint::Min(40),
+                ])
+                .split(chunks[2]);
+            state.rect_sidebar = stream_chunks[0];
+            state.rect_stream = stream_chunks[1];
+            render_sidebar(frame, state, stream_chunks[0], &theme);
+            render_stream(frame, state, stream_chunks[1], &theme);
+        } else {
+            state.rect_sidebar = Rect::default();
+            state.rect_stream = chunks[2];
+            render_stream(frame, state, chunks[2], &theme);
+        }
+
+        render_footer(frame, state, chunks[3], &theme);
 
         if state.seeds_open {
-            render_seed_overlay(frame, state, area);
+            render_seed_overlay(frame, state, area, &theme);
         }
     }
 
@@ -8104,34 +8552,66 @@ mod tui_app {
         else { format!("{}", n) }
     }
 
-    fn render_status_bar(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, theme: &SeedTheme) {
+    /// Uptime color: white→yellow (0-1h), yellow→red (1-3h), red→purple (3-5h), flashing 5h+.
+    fn uptime_color(secs: u64) -> (Color, bool) {
+        let hours = secs as f32 / 3600.0;
+        let flash = hours >= 5.0;
+        let (r, g, b) = if hours < 1.0 {
+            // White (255,255,255) → Yellow (255,255,0)
+            lerp_rgb((255, 255, 255), (255, 255, 0), hours)
+        } else if hours < 3.0 {
+            // Yellow (255,255,0) → Red (255,50,50)
+            lerp_rgb((255, 255, 0), (255, 50, 50), (hours - 1.0) / 2.0)
+        } else if hours < 5.0 {
+            // Red (255,50,50) → Purple (180,50,255)
+            lerp_rgb((255, 50, 50), (180, 50, 255), (hours - 3.0) / 2.0)
+        } else {
+            (180, 50, 255) // stays purple, flashes
+        };
+        (Color::Rgb(r, g, b), flash)
+    }
+
+    fn render_status_bar(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, theme: &ResolvedTheme) {
         let daemon_indicator = if state.daemon.running {
             Span::styled("● RUNNING", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))
         } else {
-            Span::styled("○ STOPPED", Style::default().fg(Color::DarkGray))
+            Span::styled("○ STOPPED", Style::default().fg(theme.dim_text))
         };
         let pid_span = if state.daemon.running {
-            Span::styled(format!("  PID {}  up {}", state.daemon.pid, format_uptime(state.daemon.uptime_secs)), Style::default().fg(Color::DarkGray))
+            Span::styled(format!("  PID {}", state.daemon.pid), Style::default().fg(Color::Rgb(0xBA, 0xDA, 0x55)))
+        } else { Span::raw("") };
+        // Session duration: how long the human has been continuously driving
+        let session_span = if state.human_session_secs > 0 {
+            let (up_color, up_flash) = uptime_color(state.human_session_secs);
+            let up_visible = !up_flash || (state.human_session_secs / 900) % 2 == 0;
+            let up_style = if up_visible {
+                Style::default().fg(up_color).add_modifier(if state.human_session_secs >= 3600 { Modifier::BOLD } else { Modifier::empty() })
+            } else {
+                Style::default().fg(theme.dim_text)
+            };
+            Span::styled(format!("  session {}", format_uptime(state.human_session_secs)), up_style)
+        } else if state.daemon.running {
+            Span::styled(format!("  up {}", format_uptime(state.daemon.uptime_secs)), Style::default().fg(theme.dim_text))
         } else { Span::raw("") };
         let voice_count = state.daemon.active_voices.len();
         let voices_span = if voice_count > 0 {
-            Span::styled(format!("  {} voice{}", voice_count, if voice_count == 1 { "" } else { "s" }), Style::default().fg(Color::Cyan))
-        } else { Span::styled("  no voices", Style::default().fg(Color::DarkGray)) };
+            Span::styled(format!("  {} voice{}", voice_count, if voice_count == 1 { "" } else { "s" }), Style::default().fg(theme.accent_secondary))
+        } else { Span::styled("  no voices", Style::default().fg(theme.dim_text)) };
         let seed_span = match &state.current_seed {
-            Some(name) => Span::styled(format!("  seed: {}", name), Style::default().fg(Color::Yellow)),
-            None => Span::styled("  seed: default", Style::default().fg(Color::DarkGray)),
+            Some(name) => Span::styled(format!("  seed: {}", name), Style::default().fg(theme.accent)),
+            None => Span::styled("  seed: default", Style::default().fg(theme.dim_text)),
         };
-        let grid_span = Span::styled(format!("  grid: {}", state.grid_label()), Style::default().fg(Color::Magenta));
+        let grid_span = Span::styled(format!("  grid: {}", state.grid_label()), Style::default().fg(theme.accent_secondary));
         let mute_span = if state.muted { Span::styled("  MUTED", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)) } else { Span::raw("") };
-        let drone_span = if state.drone_muted && !state.muted { Span::styled("  drone off", Style::default().fg(Color::DarkGray)) } else { Span::raw("") };
+        let drone_span = if state.drone_muted && !state.muted { Span::styled("  drone off", Style::default().fg(theme.dim_text)) } else { Span::raw("") };
 
         // Token counter: sum all active sessions
         let total_tokens: u64 = state.session_tokens.values().map(|(i, o)| i + o).sum();
         let token_span = if total_tokens > 0 {
-            Span::styled(format!("  {} tok", format_tokens_compact(total_tokens)), Style::default().fg(Color::LightYellow))
+            Span::styled(format!("  {} tok", format_tokens_compact(total_tokens)), Style::default().fg(theme.accent))
         } else { Span::raw("") };
 
-        let line = Line::from(vec![daemon_indicator, pid_span, voices_span, seed_span, grid_span, token_span, mute_span, drone_span]);
+        let line = Line::from(vec![daemon_indicator, pid_span, session_span, voices_span, seed_span, grid_span, token_span, mute_span, drone_span]);
         let block = Block::default().borders(Borders::BOTTOM)
             .border_style(Style::default().fg(theme.border))
             .title(Span::styled(" branch-tone ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)));
@@ -8139,7 +8619,7 @@ mod tui_app {
     }
 
     /// Stacked per-category activity bars
-    fn render_activity(frame: &mut ratatui::Frame, state: &mut TuiState, area: Rect, theme: &SeedTheme) {
+    fn render_activity(frame: &mut ratatui::Frame, state: &mut TuiState, area: Rect, theme: &ResolvedTheme) {
         let scale_label = state.timescale.label();
         let offset_label = if state.time_offset > 0 {
             let offset_secs = state.time_offset as u64 * state.timescale.bucket_secs(state.activity_cols as u64);
@@ -8150,11 +8630,11 @@ mod tui_app {
         let mode_label = state.histogram_mode.label();
         let mut legend_spans = vec![
             Span::styled(format!(" {} events ", state.activity.total_events), Style::default().fg(theme.accent)),
-            Span::styled("│", Style::default().fg(Color::DarkGray)),
+            Span::styled("│", Style::default().fg(theme.dim_text)),
         ];
         for s in &state.activity.series {
             legend_spans.push(Span::styled(" \u{25A0}", Style::default().fg(s.color)));
-            legend_spans.push(Span::styled(format!("{} ", s.label), Style::default().fg(Color::DarkGray)));
+            legend_spans.push(Span::styled(format!("{} ", s.label), Style::default().fg(theme.dim_text)));
         }
 
         let block = Block::default()
@@ -8162,10 +8642,10 @@ mod tui_app {
             .border_style(Style::default().fg(theme.border))
             .title(Line::from(vec![
                 Span::styled(format!(" Activity: {} ", mode_label), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("[−] {} [+]", scale_label), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("[−] {} [+]", scale_label), Style::default().fg(theme.dim_text)),
                 Span::styled(
                     offset_label,
-                    Style::default().fg(if state.time_offset > 0 { Color::Yellow } else { Color::DarkGray }),
+                    Style::default().fg(if state.time_offset > 0 { theme.accent_secondary } else { theme.dim_text }),
                 ),
             ]))
             .title_bottom(Line::from(legend_spans));
@@ -8191,25 +8671,36 @@ mod tui_app {
         for (ci, ch) in scale_str.chars().enumerate() {
             let x = inner.x + ci as u16;
             if x < inner.x + inner.width {
-                frame.buffer_mut()[(x, inner.y)].set_char(ch).set_fg(Color::DarkGray);
+                frame.buffer_mut()[(x, inner.y)].set_char(ch).set_fg(theme.dim_text);
             }
         }
 
-        // ── Bars ──
-        for col in 0..inner.width as usize {
+        // ── Bars ── (with flash highlight on newest columns when new event arrives)
+        let flash_fade = state.new_event_time
+            .map(|t| 1.0 - (t.elapsed().as_secs_f32() / 0.8).clamp(0.0, 1.0))
+            .unwrap_or(0.0);
+        let total_cols = inner.width as usize;
+        for col in 0..total_cols {
             if col >= state.activity.total.len() { break; }
+            // Flash the rightmost 3 columns (newest time bucket) on new events
+            let is_flash_col = flash_fade > 0.0 && col >= total_cols.saturating_sub(3);
             let mut y_cursor = inner.y + inner.height - 1; // leave bottom row for timestamps
             for series in &state.activity.series {
                 if col >= series.buckets.len() { continue; }
                 let val = series.buckets[col];
                 if val == 0 { continue; }
                 let bar_h = ((val * bar_height) / max_val).max(if val > 0 { 1 } else { 0 }) as u16;
+                let bar_color = if is_flash_col {
+                    blend_color(theme.accent, series.color, 1.0 - flash_fade)
+                } else {
+                    series.color
+                };
                 for _dy in 0..bar_h {
                     if y_cursor == inner.y { break; }
                     y_cursor -= 1;
                     let x = inner.x + col as u16;
                     if x < inner.x + inner.width && y_cursor >= inner.y {
-                        frame.buffer_mut()[(x, y_cursor)].set_char('█').set_fg(series.color);
+                        frame.buffer_mut()[(x, y_cursor)].set_char('█').set_fg(bar_color);
                     }
                 }
             }
@@ -8221,36 +8712,129 @@ mod tui_app {
         let offset_secs = state.time_offset as u64 * bucket_secs;
         let y_label = inner.y + inner.height - 1;
 
-        // Place evenly spaced absolute time labels (HH:MM format)
+        // Place evenly spaced absolute time labels — HH:MM:SS for fine scales, HH:MM for coarser
+        let show_seconds = matches!(state.timescale, TimeScale::Min1 | TimeScale::Min5);
+        let label_width: usize = if show_seconds { 8 } else { 5 }; // "HH:MM:SS" vs "HH:MM"
         let now_epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let label_count = (num_cols / 12).max(2).min(6);
+        let label_count = (num_cols / (label_width + 4)).max(2).min(6);
         for li in 0..label_count {
             let col = if label_count <= 1 { num_cols - 1 }
                 else { li * (num_cols - 1) / (label_count - 1) };
             let cols_from_right = (num_cols - 1).saturating_sub(col) as u64;
             let secs_ago = offset_secs + cols_from_right * bucket_secs;
             let epoch_at_col = now_epoch.saturating_sub(secs_ago);
-            // Convert epoch to HH:MM (local-ish: UTC for simplicity, matches log timestamps)
-            let h = (epoch_at_col / 3600) % 24;
-            let m = (epoch_at_col / 60) % 60;
-            let label = format!("{:02}:{:02}", h, m);
+            let (h, m, s) = epoch_to_local_hms(epoch_at_col);
+            let label = if show_seconds {
+                format!("{:02}:{:02}:{:02}", h, m, s)
+            } else {
+                format!("{:02}:{:02}", h, m)
+            };
             let start_x = inner.x + col as u16;
             for (ci, ch) in label.chars().enumerate() {
                 let x = start_x + ci as u16;
                 if x < inner.x + inner.width {
-                    frame.buffer_mut()[(x, y_label)].set_char(ch).set_fg(Color::DarkGray);
+                    frame.buffer_mut()[(x, y_label)].set_char(ch).set_fg(theme.time_color);
                 }
             }
         }
     }
 
+    /// Repo/branch sidebar — shows active repos and their branches with glow effects.
+    fn render_sidebar(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, theme: &ResolvedTheme) {
+        let now = Instant::now();
+        let inner_w = area.width.saturating_sub(2) as usize; // inside borders
+        let active_repos: Vec<&str> = state.daemon.active_voices.iter()
+            .map(|(_, r, _)| r.as_str()).collect();
+
+        let max_lines = area.height.saturating_sub(2) as usize;
+        let mut lines: Vec<Line> = Vec::with_capacity(max_lines);
+
+        for (repo, branches) in &state.repo_tree {
+            if lines.len() >= max_lines { break; }
+
+            let is_active = active_repos.contains(&repo.as_str());
+            let repo_age = state.voice_activity.iter()
+                .find(|(r, _)| r == repo)
+                .map(|(_, t)| now.duration_since(*t).as_secs_f32());
+
+            // Repo header: ■/□ + name (colored by voice)
+            let marker = if is_active { "■" } else { "□" };
+            let voice_col = voice_color_for_repo(repo, &state.daemon.active_voices, &theme.voice_colors);
+            let (marker_style, name_style) = if repo_age.is_some_and(|a| a < 2.0) {
+                // Just fired — bright glow
+                (Style::default().fg(voice_col).add_modifier(Modifier::BOLD),
+                 Style::default().fg(theme.bright_text).add_modifier(Modifier::BOLD))
+            } else if is_active {
+                // Active voice — breathing pulse on marker
+                let pulse_col = scale_rgb(voice_col, state.anim.breath(0.8));
+                (Style::default().fg(pulse_col).add_modifier(Modifier::BOLD),
+                 Style::default().fg(voice_col))
+            } else if repo_age.is_some_and(|a| a < 120.0) {
+                // Seen within 2 minutes — steady voice color
+                (Style::default().fg(voice_col),
+                 Style::default().fg(voice_col))
+            } else {
+                // Older — still tinted, just dimmer
+                (Style::default().fg(voice_col),
+                 Style::default().fg(theme.dim_text))
+            };
+
+            let repo_display = truncate_pad(repo, inner_w.saturating_sub(2));
+            lines.push(Line::from(vec![
+                Span::styled(marker, marker_style),
+                Span::raw(" "),
+                Span::styled(repo_display, name_style),
+            ]));
+
+            // Branch lines (dimmer shade of voice color)
+            for (branch, last_seen, last_action) in branches {
+                if lines.len() >= max_lines { break; }
+                let branch_age = last_seen.map(|t| now.duration_since(t).as_secs_f32());
+                let branch_color = if branch_age.is_some_and(|a| a < 5.0) {
+                    theme.bright_text  // just fired — white flash
+                } else if branch_age.is_some_and(|a| a < 120.0) {
+                    voice_col          // active — voice color
+                } else {
+                    theme.dim_text     // stale
+                };
+                let branch_display = truncate_pad(branch, inner_w.saturating_sub(4));
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled("└ ", Style::default().fg(theme.dim_text)),
+                    Span::styled(branch_display, Style::default().fg(branch_color)),
+                ]));
+
+                // Last action line (smaller, dimmer, indented further)
+                if let Some(action) = last_action {
+                    if lines.len() < max_lines {
+                        let action_display = truncate_pad(action, inner_w.saturating_sub(6));
+                        lines.push(Line::from(vec![
+                            Span::raw("      "),
+                            Span::styled(action_display, Style::default().fg(theme.dim_text)),
+                        ]));
+                    }
+                }
+            }
+        }
+
+        if lines.is_empty() {
+            lines.push(Line::from(Span::styled("No repos", Style::default().fg(theme.dim_text))));
+        }
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.border))
+            .title(Span::styled(" Repos ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)));
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
     /// Merged voice+events stream — events colored by voice
-    fn render_stream(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, theme: &SeedTheme) {
+    fn render_stream(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, theme: &ResolvedTheme) {
         let flash_active = state.new_event_time.is_some_and(|t| t.elapsed().as_secs_f32() < 2.0);
-        let border_color = if flash_active { theme.accent } else { Color::DarkGray };
+        let border_color = if flash_active { theme.accent } else { theme.border };
         let error_label = if state.error_filter { " Stream [errors] " } else { " Stream " };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -8268,7 +8852,7 @@ mod tui_app {
             let msg = if state.error_filter { "No errors" }
                 else if state.daemon.running { "Waiting for events..." }
                 else { "Daemon not running — press [s] to start" };
-            frame.render_widget(Paragraph::new(Span::styled(msg, Style::default().fg(Color::DarkGray))).block(block), area);
+            frame.render_widget(Paragraph::new(Span::styled(msg, Style::default().fg(theme.dim_text))).block(block), area);
             return;
         }
 
@@ -8280,43 +8864,74 @@ mod tui_app {
         let now = Instant::now();
         let total = filtered_events.len();
 
+        // Column widths: lane(1) + time(9) + type(8) = 18 fixed; repo+branch share the rest
+        let inner_w = area.width.saturating_sub(2) as usize; // inside borders
+        let fixed_cols = 18; // lane(1) + space+time(9) + space+type(8)
+        let badge_reserve = 10; // space for [Tool] badge
+        let flex = inner_w.saturating_sub(fixed_cols + badge_reserve);
+        let repo_w = (flex * 2 / 5).max(8);
+        let branch_w = flex.saturating_sub(repo_w).max(8);
+
+        // Fade-in blend: interpolate new event colors from accent toward target over 500ms
+        let fade_progress = state.new_event_time
+            .map(|t| (t.elapsed().as_secs_f32() / 0.5).clamp(0.0, 1.0))
+            .unwrap_or(1.0);
+
         let lines: Vec<Line> = visible_events.iter().enumerate().map(|(i, evt)| {
             let recency = i as f32 / (visible_events.len().max(1) as f32);
             let is_newest = i == visible_events.len() - 1 && flash_active;
+            // Apply fade-in: only the newest event gets the blend
+            let fade = if is_newest && fade_progress < 1.0 { fade_progress } else { 1.0 };
 
-            let voice_col = voice_color_for_repo(&evt.repo, &state.daemon.active_voices);
+            let voice_col = voice_color_for_repo(&evt.repo, &state.daemon.active_voices, &theme.voice_colors);
             let voice_age = state.voice_activity.iter()
                 .find(|(r, _)| *r == evt.repo)
                 .map(|(_, t)| now.duration_since(*t).as_secs_f32());
 
-            let lane_char = if is_newest { "█" } else if voice_age.is_some_and(|a| a < 2.0) { "▓" } else if recency > 0.7 { "▒" } else { "░" };
-            let lane_color = if is_newest { Color::White } else { voice_col };
-            let time_str = if evt.timestamp.len() > 11 { &evt.timestamp[11..] } else { &evt.timestamp };
-            let type_color = if is_newest { Color::White } else if recency > 0.7 { evt.type_color() } else { Color::DarkGray };
-            let repo_color = if is_newest { Color::White } else if recency > 0.5 { voice_col } else { Color::DarkGray };
-            let time_color = if is_newest { Color::White } else { Color::DarkGray };
-            let branch_color = if is_newest { Color::White } else { Color::DarkGray };
+            // Intensity gauge: count nearby events from same repo for density heat
+            let density = {
+                let window = 4usize; // look ±4 events around current position
+                let abs_i = start + i;
+                let lo = abs_i.saturating_sub(window);
+                let hi = (abs_i + window + 1).min(filtered_events.len());
+                let count = filtered_events[lo..hi].iter().filter(|e| e.repo == evt.repo).count();
+                (count as f32 / (window as f32 * 2.0 + 1.0)).clamp(0.0, 1.0)
+            };
+            let lane_char = if is_newest { "█" } else if voice_age.is_some_and(|a| a < 2.0) { "▓" } else if density > 0.5 { "▓" } else if recency > 0.7 { "▒" } else { "░" };
+            let lane_brightness = 0.5 + density * 0.5; // density modulates brightness
+            let lane_color = if is_newest { theme.bright_text } else { scale_rgb(voice_col, lane_brightness) };
+            let time_str_owned = parse_timestamp_epoch(&evt.timestamp)
+                .map(|epoch| { let (h, m, s) = epoch_to_local_hms(epoch); format!("{:02}:{:02}:{:02}", h, m, s) })
+                .unwrap_or_else(|| if evt.timestamp.len() > 11 { evt.timestamp[11..].to_string() } else { evt.timestamp.clone() });
+            let time_str = time_str_owned.as_str();
+            let type_color = if is_newest { theme.bright_text } else if recency > 0.3 { evt.type_color() } else { theme.dim_text };
+            let repo_color = if is_newest { blend_color(theme.accent, voice_col, fade) } else { voice_col };
+            let time_color = if is_newest { theme.bright_text } else { theme.time_color };
+            let branch_color = if is_newest { theme.bright_text } else if recency > 0.5 { theme.normal_text } else { theme.dim_text };
+
+            let repo_col = truncate_pad(&evt.repo, repo_w);
+            let branch_col = truncate_pad(&evt.branch, branch_w);
 
             let mut spans = vec![
                 Span::styled(lane_char, Style::default().fg(lane_color)),
-                Span::styled(format!(" {} ", time_str), Style::default().fg(time_color)),
-                Span::styled(format!("{:<7}", evt.type_label()), Style::default().fg(type_color).add_modifier(if is_newest { Modifier::BOLD } else { Modifier::empty() })),
-                Span::styled(format!(" {}", evt.repo), Style::default().fg(repo_color)),
-                Span::styled(format!("/{}", evt.branch), Style::default().fg(branch_color)),
+                Span::styled(format!(" {:>8}", time_str), Style::default().fg(time_color)),
+                Span::styled(format!(" {:<7}", evt.type_label()), Style::default().fg(type_color).add_modifier(if is_newest { Modifier::BOLD } else { Modifier::empty() })),
+                Span::styled(format!(" {}", repo_col), Style::default().fg(repo_color)),
+                Span::styled(format!("/{}", branch_col), Style::default().fg(branch_color)),
             ];
             // Tool badge: [Read], [Bash], etc.
             if let Some(tool) = &evt.tool_name {
-                let badge_color = evt.tool_badge_color().unwrap_or(Color::DarkGray);
+                let badge_color = evt.tool_badge_color().unwrap_or(theme.dim_text);
                 spans.push(Span::styled(
                     format!(" [{}]", tool),
-                    Style::default().fg(if is_newest { Color::White } else { badge_color }),
+                    Style::default().fg(if is_newest { theme.bright_text } else { badge_color }),
                 ));
             }
             // Agent badge: <worker>, <researcher>, etc.
             if let Some(agent) = &evt.agent_type {
                 spans.push(Span::styled(
                     format!(" <{}>", agent),
-                    Style::default().fg(if is_newest { Color::White } else { Color::Blue }),
+                    Style::default().fg(if is_newest { theme.bright_text } else { Color::Blue }),
                 ));
             }
             Line::from(spans)
@@ -8327,12 +8942,12 @@ mod tui_app {
         } else { String::new() };
         let title_right = format!(" {}/{}{} [r]eset ", visible_events.len(), total, scroll_hint);
         let block = block.title_bottom(Line::from(Span::styled(title_right, Style::default().fg(
-            if state.stream_scroll > 0 { Color::Yellow } else { Color::DarkGray }
+            if state.stream_scroll > 0 { Color::Yellow } else { theme.dim_text }
         ))).alignment(ratatui::layout::Alignment::Right));
         frame.render_widget(Paragraph::new(lines).block(block), area);
     }
 
-    fn render_seed_overlay(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
+    fn render_seed_overlay(frame: &mut ratatui::Frame, state: &mut TuiState, area: Rect, theme: &ResolvedTheme) {
         let overlay_w = 50u16.min(area.width.saturating_sub(4));
         let overlay_h = 20u16.min(area.height.saturating_sub(4));
         let x = (area.width.saturating_sub(overlay_w)) / 2 + area.x;
@@ -8343,57 +8958,70 @@ mod tui_app {
 
         let items: Vec<ListItem> = SEED_PRESETS.iter().map(|preset| {
             let is_active = state.current_seed.as_deref() == Some(preset.name);
+            let preset_theme = seed_theme(Some(preset.name));
             let marker = if is_active { "▸ " } else { "  " };
             let name_style = if is_active {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-            } else { Style::default().fg(Color::White) };
+                Style::default().fg(preset_theme.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(preset_theme.accent)
+            };
             let groove = format!(" sw:{:.0}% hu:{:.0}% {}", preset.swing * 100.0, preset.humanize * 100.0, subdiv_label(preset.quantize_subdiv));
             ListItem::new(Line::from(vec![
                 Span::raw(marker),
                 Span::styled(format!("{:<10}", preset.name), name_style),
-                Span::styled(groove, Style::default().fg(Color::DarkGray)),
+                Span::styled(groove, Style::default().fg(theme.dim_text)),
             ]))
         }).collect();
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow))
-            .title(Span::styled(" Seeds ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
-            .title_bottom(Line::from(Span::styled(" [j/k] navigate  [Enter] apply  [x] clear  [Esc] close ", Style::default().fg(Color::DarkGray))));
+            .border_style(Style::default().fg(theme.accent))
+            .title(Span::styled(" Seeds ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)))
+            .title_bottom(Line::from(Span::styled(" [j/k] navigate  [Enter] apply  [x] clear  [Esc] close ", Style::default().fg(theme.dim_text))));
 
         let list = List::new(items).block(block).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-        frame.render_stateful_widget(list, overlay, &mut state.seed_list.clone());
+        frame.render_stateful_widget(list, overlay, &mut state.seed_list);
     }
 
-    fn render_footer(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
+    fn render_footer(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, theme: &ResolvedTheme) {
         let mute_key = if state.muted { "[m]unmute" } else { "[m]ute" };
         let drone_key = if state.drone_muted { "[d]rone on" } else { "[d]rone off" };
         let daemon_key = if state.daemon.running { "[S]top" } else { "[s]tart" };
-        let line = Line::from(vec![
-            Span::styled(format!(" {} ", mute_key), Style::default().fg(Color::White)),
-            Span::styled("│", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!(" {} ", drone_key), Style::default().fg(Color::White)),
-            Span::styled("│", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!(" {} daemon ", daemon_key), Style::default().fg(Color::White)),
-            Span::styled("│", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!(" [g]rid: {} ", state.grid_label()), Style::default().fg(Color::White)),
-            Span::styled("│", Style::default().fg(Color::DarkGray)),
-            Span::styled(" [p]alette ", Style::default().fg(Color::Yellow)),
-            Span::styled("│", Style::default().fg(Color::DarkGray)),
-            Span::styled(" [+/-]zoom ", Style::default().fg(Color::White)),
-            Span::styled("│", Style::default().fg(Color::DarkGray)),
-            Span::styled(" [Tab]view ", Style::default().fg(Color::White)),
-            Span::styled("│", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                if state.error_filter { " [e]rrors ● " } else { " [e]rrors " },
-                Style::default().fg(if state.error_filter { Color::Red } else { Color::White }),
-            ),
-            Span::styled("│", Style::default().fg(Color::DarkGray)),
-            Span::styled(" [/]resize ", Style::default().fg(Color::White)),
-            Span::styled("│", Style::default().fg(Color::DarkGray)),
-            Span::styled(" [q]uit ", Style::default().fg(Color::White)),
-        ]);
-        frame.render_widget(Paragraph::new(line), area);
+        let sep_s = "│";
+        let sep = Style::default().fg(theme.dim_text);
+        let key = Style::default().fg(theme.normal_text);
+        let w = area.width as usize;
+
+        // Build items as (text, style) pairs; join with separators up to available width
+        let items: Vec<(String, Style)> = vec![
+            (format!(" {} ", mute_key), key),
+            (format!(" {} ", drone_key), key),
+            (format!(" {} ", daemon_key), key),
+            (format!(" [g]:{} ", state.grid_label()), key),
+            (" [p]al ".to_string(), Style::default().fg(theme.accent)),
+            (" [+/-] ".to_string(), key),
+            (" [Tab] ".to_string(), key),
+            (if state.error_filter { " [e]● ".to_string() } else { " [e]rr ".to_string() },
+             Style::default().fg(if state.error_filter { Color::Red } else { theme.normal_text })),
+            (if state.sidebar_visible { " [b]● ".to_string() } else { " [b]rn ".to_string() },
+             Style::default().fg(if state.sidebar_visible { theme.accent_secondary } else { theme.normal_text })),
+            (" [/] ".to_string(), key),
+            (" [q] ".to_string(), key),
+        ];
+
+        let mut spans: Vec<Span> = Vec::new();
+        let mut used = 0usize;
+        for (i, (text, style)) in items.iter().enumerate() {
+            let need = text.len() + if i > 0 { 1 } else { 0 }; // +1 for separator
+            if used + need > w { break; }
+            if i > 0 {
+                spans.push(Span::styled(sep_s, sep));
+                used += 1;
+            }
+            spans.push(Span::styled(text.clone(), *style));
+            used += text.len();
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     // ── Entry point ─────────────────────────────────────────────────────────
@@ -8411,8 +9039,9 @@ mod tui_app {
                 if state.last_poll.elapsed() > Duration::from_secs(2) {
                     state.poll_daemon();
                 }
+                state.anim.tick();
                 terminal.draw(|frame| ui(frame, &mut state))?;
-                if crossterm::event::poll(Duration::from_millis(200))? {
+                if crossterm::event::poll(Duration::from_millis(50))? {
                     match crossterm::event::read()? {
                         crossterm::event::Event::Key(key) => {
                             if key.kind != crossterm::event::KeyEventKind::Press { continue; }
@@ -8497,7 +9126,7 @@ mod tui_app {
 
         #[test]
         fn activity_data_empty_category() {
-            let d = build_activity_data(&[], TimeScale::Hour1, 0, 60, HistogramMode::Category, &[]);
+            let d = build_activity_data(&[], TimeScale::Hour1, 0, 60, HistogramMode::Category, &[], &VOICE_COLORS, Color::Cyan);
             assert_eq!(d.total.len(), 60);
             assert_eq!(d.total_events, 0);
             assert_eq!(d.series.len(), 5);
@@ -8505,7 +9134,7 @@ mod tui_app {
 
         #[test]
         fn activity_data_empty_repo() {
-            let d = build_activity_data(&[], TimeScale::Hour1, 0, 60, HistogramMode::Repo, &[]);
+            let d = build_activity_data(&[], TimeScale::Hour1, 0, 60, HistogramMode::Repo, &[], &VOICE_COLORS, Color::Cyan);
             assert_eq!(d.total.len(), 60);
             assert_eq!(d.total_events, 0);
             assert_eq!(d.series.len(), 0); // no events = no repos
@@ -8513,7 +9142,7 @@ mod tui_app {
 
         #[test]
         fn activity_data_empty_tool() {
-            let d = build_activity_data(&[], TimeScale::Hour1, 0, 60, HistogramMode::Tool, &[]);
+            let d = build_activity_data(&[], TimeScale::Hour1, 0, 60, HistogramMode::Tool, &[], &VOICE_COLORS, Color::Cyan);
             assert_eq!(d.total.len(), 60);
             assert_eq!(d.total_events, 0);
             assert_eq!(d.series.len(), 6); // all 6 tool families
@@ -8558,8 +9187,8 @@ mod tui_app {
         #[test]
         fn seed_theme_default_is_green() {
             let t = seed_theme(None);
-            assert_eq!(t.accent, Color::Green);
-            assert_eq!(t.border, Color::DarkGray);
+            assert_eq!(t.accent, Color::Rgb(80, 220, 100));
+            assert_eq!(t.border, Color::Rgb(60, 60, 60));
         }
 
         #[test]
@@ -8633,21 +9262,21 @@ mod tui_app {
 
         #[test]
         fn activity_data_session_mode() {
-            let d = build_activity_data(&[], TimeScale::Hour1, 0, 60, HistogramMode::Session, &[]);
+            let d = build_activity_data(&[], TimeScale::Hour1, 0, 60, HistogramMode::Session, &[], &VOICE_COLORS, Color::Cyan);
             assert_eq!(d.series.len(), 0); // no events = no sessions
         }
 
         #[test]
         fn activity_data_branch_mode() {
-            let d = build_activity_data(&[], TimeScale::Hour1, 0, 60, HistogramMode::Branch, &[]);
+            let d = build_activity_data(&[], TimeScale::Hour1, 0, 60, HistogramMode::Branch, &[], &VOICE_COLORS, Color::Cyan);
             assert_eq!(d.series.len(), 0); // no events = no branches
         }
 
         #[test]
         fn timescale_zoom_in_out() {
-            assert_eq!(TimeScale::Hour1.zoom_in(), TimeScale::Min15);
-            assert_eq!(TimeScale::Hour1.zoom_out(), TimeScale::Hour4);
-            assert_eq!(TimeScale::Min5.zoom_in(), TimeScale::Min5); // can't zoom further
+            assert_eq!(TimeScale::Hour1.zoom_in(), TimeScale::Min30);
+            assert_eq!(TimeScale::Hour1.zoom_out(), TimeScale::Hour2);
+            assert_eq!(TimeScale::Min1.zoom_in(), TimeScale::Min1); // can't zoom further
             assert_eq!(TimeScale::Hour24.zoom_out(), TimeScale::Hour24); // can't zoom further
         }
 
@@ -8675,9 +9304,13 @@ mod tui_app {
         #[test]
         fn voice_color_assignment() {
             let voices = vec![(0, "repo-a".into(), "main".into()), (1, "repo-b".into(), "dev".into())];
-            assert_eq!(voice_color_for_repo("repo-a", &voices), VOICE_COLORS[0]);
-            assert_eq!(voice_color_for_repo("repo-b", &voices), VOICE_COLORS[1]);
-            assert_eq!(voice_color_for_repo("unknown", &voices), Color::DarkGray);
+            assert_eq!(voice_color_for_repo("repo-a", &voices, &VOICE_COLORS), VOICE_COLORS[0]);
+            assert_eq!(voice_color_for_repo("repo-b", &voices, &VOICE_COLORS), VOICE_COLORS[1]);
+            // Unknown repos get a hash-derived palette color, not DarkGray
+            let unknown_col = voice_color_for_repo("unknown", &voices, &VOICE_COLORS);
+            assert!(VOICE_COLORS.contains(&unknown_col));
+            // Same name → same color (deterministic)
+            assert_eq!(voice_color_for_repo("unknown", &voices, &VOICE_COLORS), unknown_col);
         }
 
         #[test]
@@ -8774,6 +9407,112 @@ mod tui_app {
             assert_ne!(scale.zoom_in(), scale);
             assert_ne!(scale.zoom_out(), scale);
         }
+
+        // ── lerp_rgb ──────────────────────────────────────────────────────
+        #[test]
+        fn lerp_rgb_endpoints() {
+            assert_eq!(lerp_rgb((0, 0, 0), (255, 128, 64), 0.0), (0, 0, 0));
+            assert_eq!(lerp_rgb((0, 0, 0), (255, 128, 64), 1.0), (255, 128, 64));
+        }
+        #[test]
+        fn lerp_rgb_midpoint() {
+            let mid = lerp_rgb((0, 0, 0), (200, 100, 50), 0.5);
+            assert_eq!(mid, (100, 50, 25));
+        }
+        #[test]
+        fn lerp_rgb_clamps() {
+            assert_eq!(lerp_rgb((10, 10, 10), (20, 20, 20), -1.0), (10, 10, 10));
+            assert_eq!(lerp_rgb((10, 10, 10), (20, 20, 20), 2.0), (20, 20, 20));
+        }
+
+        // ── time_of_day_color ─────────────────────────────────────────────
+        #[test]
+        fn time_of_day_color_returns_rgb() {
+            for h in 0..24 {
+                let c = time_of_day_color(h, 0);
+                assert!(matches!(c, Color::Rgb(_, _, _)), "hour {} should be Rgb", h);
+            }
+        }
+        #[test]
+        fn time_of_day_color_night_is_blue() {
+            if let Color::Rgb(r, _g, b) = time_of_day_color(2, 0) {
+                assert!(b > r, "night should be blue-dominant");
+            }
+        }
+        #[test]
+        fn time_of_day_color_day_is_warm() {
+            if let Color::Rgb(r, g, _b) = time_of_day_color(12, 0) {
+                assert!(r >= 180 && g >= 180, "day should be bright/warm");
+            }
+        }
+
+        // ── DayPhase ─────────────────────────────────────────────────────
+        #[test]
+        fn day_phase_from_hour() {
+            assert_eq!(DayPhase::from_hour(3), DayPhase::Night);
+            assert_eq!(DayPhase::from_hour(6), DayPhase::Dawn);
+            assert_eq!(DayPhase::from_hour(12), DayPhase::Day);
+            assert_eq!(DayPhase::from_hour(19), DayPhase::Dusk);
+            assert_eq!(DayPhase::from_hour(23), DayPhase::Night);
+        }
+
+        // ── truncate_pad ─────────────────────────────────────────────────
+        #[test]
+        fn truncate_pad_short_pads() {
+            assert_eq!(truncate_pad("hi", 6), "hi    ");
+        }
+        #[test]
+        fn truncate_pad_exact_passes() {
+            assert_eq!(truncate_pad("abcdef", 6), "abcdef");
+        }
+        #[test]
+        fn truncate_pad_long_truncates() {
+            let result = truncate_pad("abcdefghij", 6);
+            assert_eq!(result.chars().count(), 6);
+            assert!(result.ends_with('…'));
+        }
+        #[test]
+        fn truncate_pad_width_one() {
+            assert_eq!(truncate_pad("abc", 1), "a");
+        }
+
+        // ── ResolvedTheme ────────────────────────────────────────────────
+        #[test]
+        fn resolve_theme_night_dims() {
+            let base = seed_theme(Some("shadow"));
+            let night = resolve_theme(&base, 2, 0);
+            assert_eq!(night.dim_text, Color::Rgb(100, 100, 100));
+            assert_eq!(night.normal_text, Color::Rgb(160, 160, 160));
+        }
+        #[test]
+        fn resolve_theme_day_bright() {
+            let base = seed_theme(Some("shadow"));
+            let day = resolve_theme(&base, 12, 0);
+            assert_eq!(day.normal_text, Color::Rgb(240, 240, 240));
+            assert_eq!(day.dim_text, Color::Rgb(140, 140, 140));
+        }
+        #[test]
+        fn resolve_theme_preserves_accent() {
+            let base = seed_theme(Some("ember"));
+            let r = resolve_theme(&base, 12, 0);
+            assert_eq!(r.accent, base.accent);
+            assert_eq!(r.voice_colors, base.voice_colors);
+        }
+        #[test]
+        fn resolve_theme_has_rgb_time() {
+            let r = resolve_theme(&seed_theme(None), 14, 30);
+            assert!(matches!(r.time_color, Color::Rgb(_, _, _)));
+        }
+
+        // ── TuiState sidebar fields ──────────────────────────────────────
+        #[test]
+        fn sidebar_visible_default() {
+            assert!(TuiState::new().sidebar_visible);
+        }
+        #[test]
+        fn repo_tree_default_empty() {
+            assert!(TuiState::new().repo_tree.is_empty());
+        }
     }
 }
 
@@ -8801,7 +9540,7 @@ mod tests {
     #[test]
     fn different_branch_different_notes() {
         let a = PhraseParams::from_identity("myrepo", "main", 400, 0.25, default_effects(), 3, false, EventCategory::Default, 0);
-        let b = PhraseParams::from_identity("myrepo", "fix/login-bug", 400, 0.25, default_effects(), 3, false, EventCategory::Default, 0);
+        let b = PhraseParams::from_identity("myrepo", "develop", 400, 0.25, default_effects(), 3, false, EventCategory::Default, 0);
         assert_ne!(a.notes, b.notes);
     }
 
