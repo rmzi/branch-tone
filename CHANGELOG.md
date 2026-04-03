@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.13.2] - 2026-04-02
+
+### Fixed
+- Gate `LAUNCHD_LABEL` constant behind `#[cfg(feature = "tray")]` to eliminate dead_code warning on non-tray builds
+
 ## [0.12.0] - 2026-04-01
 
 ### Added
