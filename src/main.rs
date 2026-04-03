@@ -6677,6 +6677,7 @@ fn run_tray(foreground: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(all(target_os = "macos", feature = "tray"))]
 const LAUNCHD_LABEL: &str = "com.branch-tone.tray";
 
 #[cfg(all(target_os = "macos", feature = "tray"))]
