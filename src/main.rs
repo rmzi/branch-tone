@@ -8133,6 +8133,7 @@ mod tui_app {
         repo_tree: Vec<(String, Vec<(String, Option<Instant>, Option<String>)>)>, // (repo, [(branch, last_seen, last_action)])
         sidebar_visible: bool,
         rect_sidebar: Rect,
+        rect_sphere: Rect,
         human_session_secs: u64, // continuous session duration (no gap > 30min)
         anim: AnimState,
         sphere: SphereState,
@@ -8163,7 +8164,7 @@ mod tui_app {
                 rect_stream: Rect::default(),
                 rect_status: Rect::default(),
                 activity_cols: 80, // reasonable default until first render
-                activity_height: 11, // default activity panel height
+                activity_height: 18, // default activity panel height
                 histogram_mode: HistogramMode::Category,
                 error_filter: false,
                 session_tokens: std::collections::HashMap::new(),
@@ -8171,6 +8172,7 @@ mod tui_app {
                 repo_tree: Vec::new(),
                 sidebar_visible: true,
                 rect_sidebar: Rect::default(),
+                rect_sphere: Rect::default(),
                 human_session_secs: 0,
                 anim: AnimState::new(),
                 sphere: SphereState::new(),
@@ -8195,11 +8197,19 @@ mod tui_app {
                 std::collections::HashMap::new();
 
             // Build a per-(repo, branch) last-action lookup from recent events
+            // Includes context (file path, command, etc.) when available
             let mut last_actions: std::collections::HashMap<(String, String), String> =
                 std::collections::HashMap::new();
             for evt in self.recent_events.iter().rev() {
                 let key = (evt.repo.clone(), evt.branch.clone());
-                last_actions.entry(key).or_insert_with(|| evt.type_label().to_string());
+                last_actions.entry(key).or_insert_with(|| {
+                    let label = evt.type_label();
+                    match (&evt.context, &evt.tool_name) {
+                        (Some(ctx), _) => format!("{} {}", label, ctx),
+                        (None, Some(tool)) => format!("{} [{}]", label, tool),
+                        _ => label.to_string(),
+                    }
+                });
             }
 
             // Seed from daemon active voices (these are "currently playing")
@@ -8525,30 +8535,38 @@ mod tui_app {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 if state.rect_activity.contains((col, row).into()) {
-                    // Scroll up on activity = pan backward in time
                     state.time_offset += 3;
                     state.rebuild_activity();
                 } else if state.rect_stream.contains((col, row).into()) {
-                    // Scroll up on stream = show older events
                     state.stream_scroll = state.stream_scroll.saturating_add(3)
                         .min(state.recent_events.len().saturating_sub(1));
+                } else if state.rect_sphere.contains((col, row).into()) {
+                    // Scroll on sphere = change rotation speed
+                    state.sphere.orbit_tilt = (state.sphere.orbit_tilt + 0.15).min(1.5);
                 }
             }
             MouseEventKind::ScrollDown => {
                 if state.rect_activity.contains((col, row).into()) {
-                    // Scroll down on activity = pan forward in time (toward present)
                     state.time_offset = (state.time_offset - 3).max(0);
                     state.rebuild_activity();
                 } else if state.rect_stream.contains((col, row).into()) {
-                    // Scroll down on stream = show newer events
                     state.stream_scroll = state.stream_scroll.saturating_sub(3);
+                } else if state.rect_sphere.contains((col, row).into()) {
+                    state.sphere.orbit_tilt = (state.sphere.orbit_tilt - 0.15).max(0.0);
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if state.rect_status.contains((col, row).into()) {
-                    // Click on status bar — detect which parameter was clicked
-                    // Build a rough column map from the status spans
                     handle_status_click(col, state);
+                } else if state.rect_sphere.contains((col, row).into()) {
+                    // Click on sphere = nudge it away from click point
+                    let cx = state.rect_sphere.x as f32 + state.rect_sphere.width as f32 / 2.0;
+                    let cy = state.rect_sphere.y as f32 + state.rect_sphere.height as f32 / 2.0;
+                    let dx = (col as f32 - cx) / (state.rect_sphere.width as f32 / 2.0);
+                    let dy = (row as f32 - cy) / (state.rect_sphere.height as f32 / 2.0);
+                    // Push sphere away from click
+                    state.sphere.x -= dx * 0.4;
+                    state.sphere.y += dy * 0.4; // invert y (screen y is down)
                 }
             }
             _ => {}
@@ -8642,17 +8660,24 @@ mod tui_app {
     fn ui(frame: &mut ratatui::Frame, state: &mut TuiState) {
         let area = frame.area();
         let show_repos = state.sidebar_visible;
-        let repo_height = if show_repos { 5u16 } else { 0 };
-
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),                       // status bar
-                Constraint::Length(state.activity_height),   // activity (resizable)
-                Constraint::Length(repo_height),             // repos (full width)
-                Constraint::Min(6),                         // stream + sphere PiP
-                Constraint::Length(1),                       // keybind footer
-            ])
+            .constraints(if show_repos {
+                vec![
+                    Constraint::Length(3),                       // status bar
+                    Constraint::Length(state.activity_height),   // activity (resizable)
+                    Constraint::Min(6),                         // repos (fills available)
+                    Constraint::Length(8),                       // stream + sphere PiP (compact)
+                    Constraint::Length(1),                       // keybind footer
+                ]
+            } else {
+                vec![
+                    Constraint::Length(3),
+                    Constraint::Length(state.activity_height),
+                    Constraint::Min(6),                         // stream fills when no repos
+                    Constraint::Length(1),
+                ]
+            })
             .split(area);
 
         // Store rects for mouse hit-testing
@@ -8691,6 +8716,7 @@ mod tui_app {
             ])
             .split(chunks[bottom_idx]);
         state.rect_stream = bottom_chunks[0];
+        state.rect_sphere = bottom_chunks[1];
         render_stream(frame, state, bottom_chunks[0], &theme);
         render_sphere_panel(frame, state, bottom_chunks[1], &theme);
 
@@ -8964,13 +8990,13 @@ mod tui_app {
                     Span::styled(branch_display, Style::default().fg(branch_color)),
                 ]));
 
-                // Last action line (smaller, dimmer, indented further)
+                // Last action with context (already enriched in rebuild_repo_tree)
                 if let Some(action) = last_action {
                     if lines.len() < max_lines {
-                        let action_display = truncate_pad(action, inner_w.saturating_sub(6));
+                        let detail_display = truncate_pad(action, inner_w.saturating_sub(6));
                         lines.push(Line::from(vec![
                             Span::raw("      "),
-                            Span::styled(action_display, Style::default().fg(theme.dim_text)),
+                            Span::styled(detail_display, Style::default().fg(theme.normal_text)),
                         ]));
                     }
                 }
@@ -9198,13 +9224,17 @@ mod tui_app {
         let fixed = 2 + 7 + 1 + 9; // dot+space + type + space + timestamp
         let context_w = inner_w.saturating_sub(fixed);
 
+        let is_scrolled = state.stream_scroll > 0;
         let lines: Vec<Line> = visible_events.iter().enumerate().map(|(i, evt)| {
-            let recency = i as f32 / (visible_events.len().max(1) as f32);
             let is_newest = i == visible_events.len() - 1 && flash_active;
 
-            let type_color = if is_newest { theme.bright_text } else if recency > 0.3 { evt.type_color() } else { theme.dim_text };
+            // When scrolled, show everything at full color (no recency fade)
+            let type_color = if is_newest { theme.bright_text } else { evt.type_color() };
             let br_col = branch_color_for(&evt.repo, &evt.branch, &state.daemon.active_voices, &theme.voice_colors);
-            let dot_color = if is_newest { theme.bright_text } else if recency > 0.3 { br_col } else { scale_rgb(br_col, 0.5) };
+            let dot_color = if is_newest { theme.bright_text } else if is_scrolled { br_col } else {
+                let recency = i as f32 / (visible_events.len().max(1) as f32);
+                if recency > 0.3 { br_col } else { scale_rgb(br_col, 0.5) }
+            };
 
             // Context: tool-specific info, or tool badge, or event type
             let context = if let Some(ref ctx) = evt.context {
@@ -9231,11 +9261,11 @@ mod tui_app {
                 ),
                 Span::styled(
                     format!("{}", context_display),
-                    Style::default().fg(if is_newest { theme.bright_text } else { theme.normal_text }),
+                    Style::default().fg(if is_newest { theme.bright_text } else { theme.bright_text }),
                 ),
                 Span::styled(
                     format!(" {}", time_str),
-                    Style::default().fg(if is_newest { theme.bright_text } else { theme.dim_text }),
+                    Style::default().fg(if is_newest { theme.bright_text } else { theme.time_color }),
                 ),
             ])
         }).collect();
@@ -9287,9 +9317,9 @@ mod tui_app {
     }
 
     fn render_footer(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, theme: &ResolvedTheme) {
-        let mute_key = if state.muted { "[m]unmute" } else { "[m]ute" };
-        let drone_key = if state.drone_muted { "[d]rone on" } else { "[d]rone off" };
-        let daemon_key = if state.daemon.running { "[S]top" } else { "[s]tart" };
+        let mute_key = if state.muted { "[m]unmute " } else { "[m]ute    " };
+        let drone_key = if state.drone_muted { "[d]rone on " } else { "[d]rone off" };
+        let daemon_key = if state.daemon.running { "[S]top  " } else { "[s]tart " };
         let sep_s = "│";
         let sep = Style::default().fg(theme.dim_text);
         let key = Style::default().fg(theme.normal_text);
