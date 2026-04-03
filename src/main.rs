@@ -9345,7 +9345,7 @@ mod tui_app {
                 state.anim.tick();
                 state.sphere.update(state.anim.dt());
                 terminal.draw(|frame| ui(frame, &mut state))?;
-                if crossterm::event::poll(Duration::from_millis(16))? {
+                if crossterm::event::poll(Duration::from_millis(33))? {
                     match crossterm::event::read()? {
                         crossterm::event::Event::Key(key) => {
                             if key.kind != crossterm::event::KeyEventKind::Press { continue; }
